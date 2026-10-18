@@ -379,7 +379,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             .resizable(false)
             .exact_size(270.0)
             .show_separator_line(true)
-            .show(ui, |ui| properties(app, ui, &layout, li));
+            .show(ui, |ui| egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| properties(app, ui, &layout, li)));
     }
     let area = ui.available_rect_before_wrap();
     // A stable id: dragging an element selects it and opens the properties beside the page,
@@ -936,19 +936,26 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
             set(app, json!({"hemisphere": hemi}));
         }
         ui.end_row();
-        ui.label(tl!("Edges"));
-        ui.horizontal(|ui| {
-            let e = g.edges;
-            let all = [("Top", "top", e.top), ("Bottom", "bottom", e.bottom), ("Left", "left", e.left), ("Right", "right", e.right)];
-            for (i, (label, _, shown)) in all.iter().enumerate() {
-                if ui.selectable_label(*shown, tl!(label)).clicked() {
-                    let names: Vec<&str> =
-                        all.iter().enumerate().filter(|(j, (_, _, s))| if *j == i { !*s } else { *s }).map(|(_, (_, n, _))| *n).collect();
-                    set(app, json!({"edges": names}));
+        // Two rows, so the four edges fit the panel's width.
+        let e = g.edges;
+        let all = [("Top", "top", e.top), ("Bottom", "bottom", e.bottom), ("Left", "left", e.left), ("Right", "right", e.right)];
+        for (row, label) in [(0, tl!("Edges")), (2, "")] {
+            ui.label(label);
+            ui.horizontal(|ui| {
+                for (i, (label, _, shown)) in all.iter().enumerate().skip(row).take(2) {
+                    if ui.selectable_label(*shown, tl!(label)).clicked() {
+                        let names: Vec<&str> = all
+                            .iter()
+                            .enumerate()
+                            .filter(|(j, (_, _, s))| if *j == i { !*s } else { *s })
+                            .map(|(_, (_, n, _))| *n)
+                            .collect();
+                        set(app, json!({"edges": names}));
+                    }
                 }
-            }
-        });
-        ui.end_row();
+            });
+            ui.end_row();
+        }
         ui.label(tl!("Side labels"));
         ui.horizontal(|ui| {
             let vertical = g.label_orientation == Orientation::Vertical;
