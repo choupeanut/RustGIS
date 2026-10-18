@@ -148,7 +148,13 @@ fn stretch_range(s: &Session, name: &str) -> Result<(f64, f64), String> {
     let rl = s.map().layer_by_name(name).and_then(|l| l.raster.as_ref()).ok_or_else(|| format!("no raster layer '{name}'"))?;
     let r = rl.data.as_ref().ok_or_else(|| format!("{name}: the raster's data couldn't be read"))?;
     let band = rl.style.renderer.bands().first().copied().unwrap_or(0);
-    let stats = r.bands.get(band).map(|b| &b.stats).ok_or_else(|| format!("{name} has no bands"))?;
+    // Without the values its mask hides, as its own stretch is drawn.
+    let masked = rl.masked_stats();
+    let stats = masked
+        .as_ref()
+        .and_then(|m| m.first())
+        .or_else(|| r.bands.get(band).map(|b| &b.stats))
+        .ok_or_else(|| format!("{name} has no bands"))?;
     let n = rustgis_map::raster::Normalizer::new(rl.style.stretch, stats, &r.data_type);
     if !(n.lo.is_finite() && n.hi.is_finite() && n.lo < n.hi) {
         return Err(format!("{name} has no range of values to share"));

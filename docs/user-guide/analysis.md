@@ -168,7 +168,8 @@ The Analyze tab's imagery groups open their tools in the Workflows pane:
   written to a GeoTIFF: `{"inputs": ["dgm_1.tif", "dgm_2.tif", …], "path": "dem.tif"}`. Inputs
   are layers or file paths; where they overlap, the first one with data wins. Tiles in different
   coordinate systems or cell sizes, or opened from an overview, are refused rather than quietly
-  resampled, and the mosaic has to fit in memory (120 million cells).
+  resampled, as are tiles whose cells don't line up; the mosaic has to fit in memory (120 million
+  values: cells times bands).
 - **Classification Wizard** (unsupervised k-means) and **Classification Tools** (minimum distance
   from training polygons).
 - **Mensuration**: distances along the surface, heights between two points, areas, and volumes

@@ -450,10 +450,19 @@ fn process(s: &mut Session, p: &Value) -> CmdResult {
 /// coordinate system and cell size; where they overlap, the first input with data wins.
 fn raster_mosaic(s: &mut Session, p: &Value) -> CmdResult {
     let inputs = p.get("inputs").and_then(Value::as_array).ok_or("inputs is a list of raster layers or file paths")?;
+    if inputs.len() < 2 {
+        return Err("a mosaic needs two or more rasters".into());
+    }
     if inputs.len() > 10_000 {
         return Err("a mosaic takes at most 10000 inputs".into());
     }
+    let max = rustgis_data::raster::MAX_SAMPLES as i64;
     let mut rs: Vec<Arc<Raster>> = Vec::with_capacity(inputs.len());
+    // Each input's place on the first one's grid, and the bounds of them all so far.
+    let mut places: Vec<(i64, i64)> = Vec::with_capacity(inputs.len());
+    let (mut c0, mut r0, mut c1, mut r1) = (0i64, 0i64, 0i64, 0i64);
+    // Each input is checked as it is read, so a mismatched or oversized set fails before the
+    // rest are loaded.
     for v in inputs {
         let n = v.as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or("each input is a raster layer's name or a file path")?;
         let r = match raster_named(s, n) {
@@ -463,15 +472,6 @@ fn raster_mosaic(s: &mut Session, p: &Value) -> CmdResult {
             }
             Err(e) => return Err(e),
         };
-        rs.push(r);
-    }
-    let [first, ..] = rs.as_slice() else { return Err("inputs is a list of raster layers or file paths".into()) };
-    if rs.len() < 2 {
-        return Err("a mosaic needs two or more rasters".into());
-    }
-    let (pw, ph) = (first.transform.pixel_width, first.transform.pixel_height);
-    let same = |a: f64, b: f64| (a - b).abs() <= 1e-6 * a.abs().max(b.abs());
-    for r in &rs {
         // An overview would quietly coarsen the whole mosaic.
         if let Some((fw, fh)) = r.overview {
             return Err(format!(
@@ -479,49 +479,35 @@ fn raster_mosaic(s: &mut Session, p: &Value) -> CmdResult {
                 r.name, r.width, r.height
             ));
         }
-        if r.crs != first.crs {
+        let first = rs.first().unwrap_or(&r);
+        mosaic_matches(first, &r)?;
+        // Snapped to whole cells only when it is already within a hundredth of one.
+        let (c, rr) = first.transform.to_pixel(r.transform.to_world(0.0, 0.0));
+        let limit = f64::from(u32::MAX);
+        if !(c.is_finite() && rr.is_finite() && c.abs() < limit && rr.abs() < limit) {
+            return Err(format!("{} is too far from {} to mosaic", r.name, first.name));
+        }
+        if (c - c.round()).abs() > 0.01 || (rr - rr.round()).abs() > 0.01 {
+            return Err(format!("{}'s cells don't line up with {}'s: resample them onto one grid first", r.name, first.name));
+        }
+        let (pc, pr) = (c.round() as i64, rr.round() as i64);
+        (c0, r0) = if rs.is_empty() { (pc, pr) } else { (c0.min(pc), r0.min(pr)) };
+        (c1, r1) = (c1.max(pc + i64::from(r.width)), r1.max(pr + i64::from(r.height)));
+        let (w, h) = (c1 - c0, r1 - r0);
+        let samples = w.saturating_mul(h).saturating_mul(r.band_count().max(1) as i64);
+        if samples > max || w > i64::from(u32::MAX) || h > i64::from(u32::MAX) {
             return Err(format!(
-                "{} is in {}, {} in {}: reproject them to one coordinate system first",
-                r.name,
-                r.crs.label(),
-                first.name,
-                first.crs.label()
+                "the mosaic would be {w} × {h} cells × {} bands, more than the {max} values that fit in memory: clip the tiles or mosaic fewer at a time",
+                r.band_count()
             ));
         }
-        if !same(r.transform.pixel_width, pw) || !same(r.transform.pixel_height, ph) {
-            return Err(format!(
-                "{} has {} × {} cells, {} {} × {}: resample them to one cell size first",
-                r.name,
-                r.transform.pixel_width,
-                r.transform.pixel_height.abs(),
-                first.name,
-                pw,
-                ph.abs()
-            ));
-        }
-        if r.band_count() != first.band_count() {
-            return Err(format!("{} has {} bands, {} {}", r.name, r.band_count(), first.name, first.band_count()));
-        }
+        places.push((pc, pr));
+        rs.push(r);
     }
-    // Each input's place on the first one's grid (snapped to whole cells).
-    let places: Vec<(i64, i64)> = rs
-        .iter()
-        .map(|r| {
-            let (c, rr) = first.transform.to_pixel(r.transform.to_world(0.0, 0.0));
-            (c.round() as i64, rr.round() as i64)
-        })
-        .collect();
-    let c0 = places.iter().map(|p| p.0).min().unwrap_or(0);
-    let r0 = places.iter().map(|p| p.1).min().unwrap_or(0);
-    let c1 = rs.iter().zip(&places).map(|(r, p)| p.0 + i64::from(r.width)).max().unwrap_or(0);
-    let r1 = rs.iter().zip(&places).map(|(r, p)| p.1 + i64::from(r.height)).max().unwrap_or(0);
-    let (w, h) = ((c1 - c0).max(0), (r1 - r0).max(0));
-    let cells = w.saturating_mul(h);
-    let max = rustgis_data::raster::MAX_SAMPLES as i64;
-    if cells == 0 || cells.saturating_mul(first.band_count().max(1) as i64) > max || w > i64::from(u32::MAX) || h > i64::from(u32::MAX) {
-        return Err(format!(
-            "the mosaic would be {w} × {h} cells, more than the {max} that fit in memory: clip the tiles or mosaic fewer at a time"
-        ));
+    let first = rs.first().ok_or("a mosaic needs two or more rasters")?;
+    let (w, h) = (c1 - c0, r1 - r0);
+    if w <= 0 || h <= 0 {
+        return Err("the mosaic would be empty".into());
     }
     let (w, h) = (w as u32, h as u32);
     let nodata = first.nodata.or(Some(NODATA as f64));
@@ -571,6 +557,36 @@ fn raster_mosaic(s: &mut Session, p: &Value) -> CmdResult {
         o.insert("path".into(), json!(path));
     }
     Ok(v)
+}
+
+/// Whether `r` can join a mosaic on `first`'s grid: one coordinate system, cell size and band count.
+fn mosaic_matches(first: &Raster, r: &Raster) -> Result<(), String> {
+    let (pw, ph) = (first.transform.pixel_width, first.transform.pixel_height);
+    let same = |a: f64, b: f64| (a - b).abs() <= 1e-6 * a.abs().max(b.abs());
+    if r.crs != first.crs {
+        return Err(format!(
+            "{} is in {}, {} in {}: reproject them to one coordinate system first",
+            r.name,
+            r.crs.label(),
+            first.name,
+            first.crs.label()
+        ));
+    }
+    if !same(r.transform.pixel_width, pw) || !same(r.transform.pixel_height, ph) {
+        return Err(format!(
+            "{} has {} × {} cells, {} {} × {}: resample them to one cell size first",
+            r.name,
+            r.transform.pixel_width,
+            r.transform.pixel_height.abs(),
+            first.name,
+            pw,
+            ph.abs()
+        ));
+    }
+    if r.band_count() != first.band_count() {
+        return Err(format!("{} has {} bands, {} {}", r.name, r.band_count(), first.name, first.band_count()));
+    }
+    Ok(())
 }
 
 /// The cells of `r` in a column and row window, as a new raster on the same grid. With a mask

@@ -7502,15 +7502,25 @@ fn dem_tiles_mosaic_clip_by_polygon_share_a_stretch_and_report_overviews() {
         ("east", tile("east", 361_000.0, 200.0, 100.0, 99)),
         ("over", tile("over", 360_000.0, 900.0, 100.0, 0)),
         ("coarse", tile("coarse", 362_000.0, 0.0, 200.0, 0)),
+        // Half a cell off the others' grid.
+        ("shifted", tile("shifted", 362_050.0, 0.0, 100.0, 0)),
     ] {
         let data = base64::engine::general_purpose::STANDARD.encode(geotiff::write(&r, 0).unwrap());
         s.run("layer.addDataBytes", &json!({"fileName": format!("{name}.tif"), "data": data})).unwrap();
+    }
+    // Tiny cells far apart: more columns between them than a raster can have.
+    for (name, x0) in [("near", 0.0), ("far", 100.0)] {
+        let gt = GeoTransform { origin_x: x0, origin_y: 1e-6, pixel_width: 1e-9, pixel_height: -1e-9 };
+        let r = Raster::new(name, 10, 10, vec![vec![1.0; 100]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let bytes = geotiff::write(&r, 0).unwrap();
+        crate::cmd::raster::add_raster(&mut s, name, rustgis_map::RasterLayer::from_bytes(r, format!("{name}.tif"), bytes)).unwrap();
     }
     let raster =
         |s: &Session, v: &Value| s.map().layer(v["layer"].as_u64().unwrap() as u32).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
 
     // Mosaic: one grid in the tiles' own CRS and cell size; the first input wins where they overlap.
     let dir = std::env::temp_dir().join(format!("rustgis-mosaic-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dem.tif").display().to_string();
     let v = s.run("raster.mosaic", &json!({"inputs": ["west", "over", "east"], "name": "dem", "path": path})).unwrap();
@@ -7524,9 +7534,13 @@ fn dem_tiles_mosaic_clip_by_polygon_share_a_stretch_and_report_overviews() {
     let written = rustgis_data::raster::read_path(std::path::Path::new(&path)).unwrap();
     assert_eq!((written.width, written.height, written.crs), (20, 10, utm));
     std::fs::remove_dir_all(&dir).ok();
+    // Bare file names read files too: tasks and notebooks from elsewhere may not run it.
+    assert!(crate::cmd::items::touches_files("raster.mosaic", &json!({"inputs": ["a.tif", "b.tif"]})));
     for (bad, why) in [
         (json!({"inputs": ["west"]}), "two or more"),
         (json!({"inputs": ["west", "coarse"]}), "cell size"),
+        (json!({"inputs": ["west", "shifted"]}), "line up"),
+        (json!({"inputs": ["near", "far"]}), "too far"),
         (json!({"inputs": ["west", "Countries"]}), "no raster layer"),
         (json!({"inputs": ["west", 3]}), "file path"),
     ] {
@@ -7551,10 +7565,10 @@ fn dem_tiles_mosaic_clip_by_polygon_share_a_stretch_and_report_overviews() {
     assert_eq!((c.width, c.height, c.crs), (9, 5, utm));
     assert_eq!(c.bands[0].stats.count, 25);
     assert_eq!((c.value(0, 8, 0), c.value(0, 0, 0), c.value(0, 0, 4)), (Some(204.0), Some(106.0), None));
-    s.run("layer.template", &json!({"template": "polygons", "name": "Far"})).unwrap();
+    s.run("layer.template", &json!({"template": "polygons", "name": "Elsewhere"})).unwrap();
     let far = json!([[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]);
-    s.run("edit.addFeature", &json!({"layer": "Far", "geometry": {"type": "Polygon", "coordinates": far}})).unwrap();
-    let e = s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "Far"})).unwrap_err();
+    s.run("edit.addFeature", &json!({"layer": "Elsewhere", "geometry": {"type": "Polygon", "coordinates": far}})).unwrap();
+    let e = s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "Elsewhere"})).unwrap_err();
     assert!(e.to_string().contains("no cell"), "{e}");
     assert!(s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "west"})).is_err());
 
@@ -7566,6 +7580,10 @@ fn dem_tiles_mosaic_clip_by_polygon_share_a_stretch_and_report_overviews() {
     s.run("raster.stretch", &json!({"layer": "west", "type": "minMax"})).unwrap();
     s.run("raster.stretch", &json!({"layer": "east", "like": "west"})).unwrap();
     assert_eq!(st(&s, "east"), rustgis_map::Stretch::Custom { min: 100.0, max: 109.0 });
+    // A mask on the source narrows its range, and the shared one with it.
+    s.run("raster.mask", &json!({"layer": "west", "values": [100]})).unwrap();
+    s.run("raster.stretch", &json!({"layer": "east", "like": "west"})).unwrap();
+    assert_eq!(st(&s, "east"), rustgis_map::Stretch::Custom { min: 101.0, max: 109.0 });
     assert!(s.run("raster.stretch", &json!({"layer": "east", "like": "Countries"})).is_err());
 
     // A raster opened from an overview says so in its results, not only in a notice.
@@ -7575,6 +7593,7 @@ fn dem_tiles_mosaic_clip_by_polygon_share_a_stretch_and_report_overviews() {
     let v = crate::cmd::raster::add_raster(&mut s, "big", rustgis_map::RasterLayer::from_bytes(ov, "big.tif", bytes)).unwrap();
     assert_eq!(v["overviewOf"], json!([20, 20]));
     let out = std::env::temp_dir().join(format!("rustgis-overview-{}.tif", std::process::id()));
+    std::fs::remove_file(&out).ok();
     let v = s.run("share.exportRaster", &json!({"layer": "big", "path": out.display().to_string()})).unwrap();
     assert_eq!(v["overviewOf"], json!([20, 20]));
     std::fs::remove_file(&out).ok();
