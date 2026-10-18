@@ -895,12 +895,21 @@ pub(crate) fn text_graphic_at(app: &RustGisApp, ctx: &egui::Context, rect: Rect,
     let (map, scale) = (app.session.map(), app.session.scale());
     let tokens = graphics::TokenValues::of(map, scale);
     // Only what is drawn, as render_frame draws it: the first layer on top, and in a layer the
-    // last row.
-    map.layers.iter().filter(|l| l.graphics && map.draws_at(l, scale)).find_map(|l| {
+    // last row. Fully transparent layers and rows beyond the view clipping distance are not drawn.
+    let clip = map.view.clip_distance.map(|d| (map.camera.center_lonlat(), d));
+    map.layers.iter().filter(|l| l.graphics && map.draws_at(l, scale) && map.layer_opacity(l) > 0.0).find_map(|l| {
         let drawn = l.drawn_rows(scale);
         (0..l.dataset.features.len()).rev().filter(|r| drawn.get(*r) == Some(&true)).find_map(|row| {
+            let g = l.dataset.features.get(row)?.geometry.as_ref()?;
+            if let Some((centre, d)) = clip {
+                let e = g.extent();
+                let near = Coord::new(centre.x.clamp(e.min_x, e.max_x), centre.y.clamp(e.min_y, e.max_y));
+                if e.is_empty() || rustgis_engine::geom::haversine_m(centre, near) > d {
+                    return None;
+                }
+            }
             let text = graphics::expand(graphics::label(&l.dataset, row)?, &tokens);
-            let at = lonlat_to_screen(app, rect, l.dataset.features.get(row)?.geometry.as_ref()?.label_point()?)?;
+            let at = lonlat_to_screen(app, rect, g.label_point()?)?;
             let font = regular(graphics::font_size(&l.dataset, row) * 1.33);
             let size = ctx.fonts_mut(|f| f.layout_no_wrap(text, font, Color32::WHITE).size());
             Rect::from_center_size(at, size).expand(3.0).contains(p).then_some((l.id, row))
@@ -2401,5 +2410,24 @@ mod tests {
             assert_eq!(text_graphic_at(&app, ui.ctx(), rect, at), None);
         });
         out.textures_delta.clear();
+        // Nor text clipped away by the view's clipping distance (it sits ~3,300 km from the
+        // centre), or on a fully transparent layer.
+        app.run("group.set", json!({"group": "Notes", "visible": true})).unwrap();
+        let probe = |app: &RustGisApp| {
+            let mut found = None;
+            let mut out = egui::Context::default().run_ui(Default::default(), |ui| {
+                let at = lonlat_to_screen(app, rect, Coord::new(c.x, c.y - 30.0)).unwrap();
+                found = text_graphic_at(app, ui.ctx(), rect, at + vec2(50.0, 0.0));
+            });
+            out.textures_delta.clear();
+            found
+        };
+        assert_eq!(probe(&app), hit);
+        app.run("map.clipping", json!({"distance": 1_000_000.0})).unwrap();
+        assert_eq!(probe(&app), None, "beyond the clipping distance");
+        app.run("map.clipping", json!({"mode": "none"})).unwrap();
+        assert_eq!(probe(&app), hit);
+        app.run("group.set", json!({"group": "Notes", "transparency": 100})).unwrap();
+        assert_eq!(probe(&app), None, "on a fully transparent layer");
     }
 }
