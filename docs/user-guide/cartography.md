@@ -145,4 +145,7 @@ the map, and the text starts with its token (`{map}`, `{scale}`, `{date}`, `{tim
 `{layers}` or `{center}`); the dialog's buttons add more. Picture: drag a rectangle,
 then pick a PNG or JPEG image to stretch over it. Tools return to Explore after each graphic
 unless Keep Tool is on. Each graphic keeps its own fill, outline, width and text size in the
-layer's attributes, so you can edit them in the attribute table or with `graphics.style`.
+layer's attributes, so you can edit them in the attribute table or with `graphics.style`. To
+change a text once it is placed, double-click it (with Explore or Select) or right-click it ›
+**Edit Text…**: the dialog opens with its text and size, and **Save** changes that text only, as
+one undo step (`graphics.edit` does the same by layer and row).

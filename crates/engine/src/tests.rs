@@ -1141,7 +1141,9 @@ fn graphics_draw_shapes_text_and_pictures() {
     assert!(s.run("graphics.add", &json!({"shape": "blob", "points": [[0, 0]]})).is_err());
     assert!(s.run("graphics.add", &json!({"shape": "point", "points": [[0, 0]], "layer": "Cities"})).is_err(), "not a graphics layer");
     // Dynamic text expands when drawn.
-    s.run("graphics.add", &json!({"shape": "text", "points": [[10, 50]], "text": "{map} {scale}", "fontSize": 20})).unwrap();
+    let text =
+        s.run("graphics.add", &json!({"shape": "text", "points": [[10, 50]], "text": "{map} {scale}", "fontSize": 20})).unwrap()["row"]
+            .clone();
     let view = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera: s.map().camera, sky: false };
     let r = crate::render::render(s.map_mut(), &view).unwrap();
     assert!(
@@ -1167,6 +1169,26 @@ fn graphics_draw_shapes_text_and_pictures() {
     assert!(s.run("graphics.style", &json!({})).is_err(), "nothing to change");
     s.run("graphics.style", &json!({"text": "not on a rectangle"})).unwrap();
     assert!(rustgis_map::graphics::label(&s.map().layer(id).unwrap().dataset, 0).is_none(), "text only goes on text graphics");
+    // Edit one text graphic by layer and row (#420): the selected rectangle stays as it was, and
+    // undo takes the edit back.
+    s.run("graphics.edit", &json!({"layer": id, "row": text, "text": "Edited", "fontSize": 30})).unwrap();
+    let row = text.as_u64().unwrap() as usize;
+    let ds = &s.map().layer(id).unwrap().dataset;
+    assert_eq!((rustgis_map::graphics::label(ds, row), rustgis_map::graphics::font_size(ds, row)), (Some("Edited"), 30.0));
+    assert_eq!(rustgis_map::graphics::font_size(ds, 0), 14.0, "only the graphic named");
+    s.run("edit.undo", &Value::Null).unwrap();
+    let ds = &s.map().layer(id).unwrap().dataset;
+    assert_eq!((rustgis_map::graphics::label(ds, row), rustgis_map::graphics::font_size(ds, row)), (Some("{map} {scale}"), 20.0));
+    for bad in [
+        json!({"layer": id, "row": text, "text": "  "}),
+        json!({"layer": id, "row": 999, "text": "x"}),
+        json!({"layer": id, "row": 0.5, "text": "x"}),
+        json!({"layer": id, "text": "x"}),
+        json!({"layer": id, "row": text}),
+        json!({"layer": "Cities", "row": 0, "text": "x"}),
+    ] {
+        assert!(s.run("graphics.edit", &bad).is_err(), "{bad}");
+    }
     assert_eq!(rustgis_render::picture_size(&b64), Some((2, 2)));
     assert!(s.run("graphics.keepTool", &Value::Null).unwrap()["keepTool"].as_bool().unwrap());
     s.run("tool.set", &json!({"tool": "graphicRectangle"})).unwrap();

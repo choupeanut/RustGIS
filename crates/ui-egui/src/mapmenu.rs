@@ -113,6 +113,13 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, c: Coord) {
         ui.close();
     }
     ui.separator();
+    if let Some((layer, row)) = app.map.menu_text {
+        if menu_row(ui, "g_text", tl!("Edit Text…"), "", true).clicked() {
+            run(app, "ui.dialog", json!({"name": "graphicText", "layer": layer, "row": row}));
+            ui.close();
+        }
+        ui.separator();
+    }
     ui.label(egui::RichText::new(tl!("Quick actions")).small().weak());
     if menu_row(ui, "copy", tl!("Copy As GeoJSON"), "", true).clicked() {
         ui.ctx().copy_text(point_geojson(c));

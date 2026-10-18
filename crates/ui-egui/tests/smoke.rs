@@ -1034,6 +1034,40 @@ fn delimited_text_dialog_lists_the_picked_files_columns() {
     assert_eq!((h.state().dialogs.a.as_str(), h.state().dialogs.b.as_str()), ("Lon", "Lat"));
 }
 
+/// Edit Text (#420) opens with a placed text's text and size, and Save changes that text only,
+/// whatever is selected, as one undo step.
+#[test]
+fn a_placed_text_is_edited_in_its_dialog() {
+    use rustgis_ui_egui::rustgis_engine::map::graphics;
+    let mut h = harness();
+    let first = h.state_mut().run("graphics.add", json!({"shape": "text", "points": [[10, 50]], "text": "First", "fontSize": 20})).unwrap();
+    let second = h.state_mut().run("graphics.add", json!({"shape": "text", "points": [[20, 40]], "text": "Second"})).unwrap();
+    let (layer, row) = (first["layer"].clone(), second["row"].clone());
+    h.state_mut().run("select.rows", json!({"layer": layer, "rows": [first["row"]]})).unwrap();
+    h.state_mut().run("ui.dialog", json!({"name": "graphicText", "layer": layer, "row": row})).unwrap();
+    let d = &h.state().dialogs;
+    assert_eq!((d.open, d.mode, d.text.as_str(), d.c.as_str()), (Some("graphicText"), "edit", "Second", "14"));
+    h.step();
+    (h.state_mut().dialogs.text, h.state_mut().dialogs.c) = ("Second, edited".into(), "24".into());
+    h.step();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Save").click();
+    h.step();
+    h.step();
+    assert_eq!(h.state().dialogs.open, None);
+    let s = &h.state().session;
+    let ds = &s.map().layer(layer.as_u64().unwrap() as u32).unwrap().dataset;
+    let text = |r: &serde_json::Value| {
+        let r = r.as_u64().unwrap() as usize;
+        (graphics::label(ds, r).unwrap().to_string(), graphics::font_size(ds, r))
+    };
+    assert_eq!(text(&row), ("Second, edited".into(), 24.0));
+    assert_eq!(text(&first["row"]), ("First".into(), 20.0), "the selected text is left alone");
+    assert_eq!(s.undo_label(), Some("Edit Graphic"));
+    // A row that isn't a text graphic opens nothing.
+    assert!(h.state_mut().run("ui.dialog", json!({"name": "graphicText", "layer": layer, "row": 99})).is_err());
+    assert_eq!(h.state().dialogs.open, None);
+}
+
 /// Add Data From URL downloads off the frame and adds the file when it lands; a failed download
 /// is said.
 #[test]

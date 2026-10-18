@@ -7,7 +7,7 @@ use rustgis_geom::{Coord, lonlat_to_merc, merc_to_lonlat};
 use rustgis_map::{Rgba, graphics};
 use serde_json::{Value, json};
 
-use super::{b, f, ps};
+use super::{b, f, ps, uint};
 use crate::{CmdResult, CommandSpec as C, Session};
 
 /// Largest picture accepted (16 MiB).
@@ -29,6 +29,9 @@ pub fn commands() -> Vec<C> {
         C::new("graphics.style", "Graphic Style", "Edit › Graphics", style)
             .when(super::need_selection)
             .params(r##"{"fill"?: "#RRGGBBAA", "outline"?: "#RRGGBBAA", "width"?: number, "size"?: number, "fontSize"?: number, "text"?: string}"##),
+        C::new("graphics.edit", "Edit Graphic", "Edit › Graphics", edit).params(
+            r##"{"layer": graphics layer, "row": number, "text"?: string, "fontSize"?: number, "fill"?: "#RRGGBBAA", "outline"?: "#RRGGBBAA", "width"?: number, "size"?: number}"##,
+        ),
         C::new("graphics.keepTool", "Keep the last tool active", "Edit › Graphics", |s, p| {
             s.keep_tool = b(p, "on").unwrap_or(!s.keep_tool);
             Ok(json!({"keepTool": s.keep_tool}))
@@ -263,6 +266,22 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn style(s: &mut Session, p: &Value) -> CmdResult {
+    restyle(s, p, None)
+}
+
+/// Changes one graphic, named by layer and row, as `graphics.style` changes the selected ones.
+fn edit(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    let n = s.map().layer(id).filter(|l| l.graphics).map(|l| l.dataset.features.len()).ok_or("that isn't a graphics layer")?;
+    let row = uint(p, "row").and_then(|r| usize::try_from(r).ok()).filter(|r| *r < n).ok_or("no graphic at that row")?;
+    if ps(p, "text").is_some_and(|t| t.trim().is_empty()) {
+        return Err("text is required".into());
+    }
+    restyle(s, p, Some((id, row)))
+}
+
+/// Sets the style (and a text graphic's text) of one graphic, or else of the selected ones.
+fn restyle(s: &mut Session, p: &Value, one: Option<(u32, usize)>) -> CmdResult {
     let (fill, outline) = (color(p, "fill")?, color(p, "outline")?);
     let text = ps(p, "text").map(|t| t.chars().take(2000).collect::<String>());
     let nums = [("width", "width", 50.0), ("size", "size", 200.0), ("font_size", "fontSize", 200.0)];
@@ -270,7 +289,8 @@ fn style(s: &mut Session, p: &Value) -> CmdResult {
         return Err("give a fill, outline, width, size, fontSize or text".into());
     }
     let mut n = 0;
-    for l in s.map_mut().layers.iter_mut().filter(|l| l.graphics && !l.selection.is_empty()) {
+    let targeted = |l: &rustgis_map::Layer| one.map_or(!l.selection.is_empty(), |(id, _)| l.id == id);
+    for l in s.map_mut().layers.iter_mut().filter(|l| l.graphics && targeted(l)) {
         let mut sets: Vec<(&str, Attr)> = Vec::new();
         if let Some(c) = &fill {
             sets.push(("fill", Attr::Text(c.clone())));
@@ -285,7 +305,8 @@ fn style(s: &mut Session, p: &Value) -> CmdResult {
         }
         let sets: Vec<(Option<usize>, Attr)> = sets.into_iter().map(|(k, v)| (l.dataset.field_index(k), v)).collect();
         let text_field = l.dataset.field_index("text");
-        for r in l.selection.clone() {
+        let rows = one.map_or_else(|| l.selection.clone(), |(_, row)| vec![row]);
+        for r in rows {
             let is_text = graphics::kind(&l.dataset, r) == "text";
             let Some(ft) = l.dataset.features.get_mut(r) else { continue };
             for (fi, v) in &sets {

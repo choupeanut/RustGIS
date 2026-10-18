@@ -2531,6 +2531,20 @@ impl RustGisApp {
                     if let Some(t) = p.get("text").and_then(Value::as_str) {
                         self.dialogs.text = t.chars().take(2000).collect();
                     }
+                    // A placed text to edit (its layer and row), starting from its text and size.
+                    if let (Some(layer), Some(row)) = (p.get("layer").and_then(Value::as_u64), p.get("row").and_then(Value::as_u64)) {
+                        use rustgis_engine::map::graphics;
+                        let l = u32::try_from(layer).ok().and_then(|id| self.session.map().layer(id)).filter(|l| l.graphics);
+                        let found = l
+                            .zip(usize::try_from(row).ok())
+                            .and_then(|(l, r)| Some((graphics::label(&l.dataset, r)?.to_string(), graphics::font_size(&l.dataset, r))));
+                        let Some((text, size)) = found else {
+                            self.dialogs.open = None;
+                            return Err(tl!("no text graphic there").to_string());
+                        };
+                        (self.dialogs.mode, self.dialogs.a, self.dialogs.b) = ("edit", layer.to_string(), row.to_string());
+                        (self.dialogs.text, self.dialogs.c) = (text, size.to_string());
+                    }
                 }
                 // Rename Map / Rename Layout remember which one (`target`, by name; default the
                 // one in view), so renaming another from the Browser leaves the view alone.
