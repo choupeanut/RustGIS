@@ -361,7 +361,13 @@ pub(crate) fn parse_link(text: &str) -> Option<MapLink> {
     // Cut on a character boundary: a hostile link is long and need not be ASCII.
     let end = (0..=MAX_LINK.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
     let text = text.get(..end).unwrap_or("");
-    let fragment = text.split_once('#').map_or(text, |(_, f)| f);
+    // A web address's position is in its fragment; text with no `#` is a bare position only when
+    // it isn't an address (`https://x/?a=1/2/3` is none).
+    let fragment = match text.split_once('#') {
+        Some((_, f)) => f,
+        None if text.contains([':', '?', '=']) => return None,
+        None => text,
+    };
     // MapLibre's own parameter (`map=`, or the fragment alone) before any other.
     let parts: Vec<(Option<&str>, &str)> =
         fragment.split('&').map(|part| part.split_once('=').map_or((None, part), |(k, v)| (Some(k), v))).collect();

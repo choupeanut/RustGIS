@@ -134,12 +134,12 @@ pub fn start() {
                     let links = if project.is_some() { "" } else { q.as_str() };
                     // `#zoom/lat/lon/bearing/pitch` (a MapLibre map link) places the map; without
                     // it, `?extent=` or `?data=`, the first `?style=` opens at the style's own view.
-                    let hash = hash();
+                    let fragment = hash();
                     // A fragment that is no map position (`#about`) is left alone.
-                    let linked = project.is_none() && rustgis_engine::cmd::navigate::is_map_link(&hash) && {
-                        let r = app.run("map.goToLink", serde_json::json!({"url": hash}));
+                    let linked = project.is_none() && rustgis_engine::cmd::navigate::is_map_link(&fragment) && {
+                        let r = app.run("map.goToLink", serde_json::json!({"url": fragment}));
                         if let Err(e) = &r {
-                            log::warn!("{hash}: {e}");
+                            log::warn!("{fragment}: {e}");
                         }
                         r.is_ok()
                     };
@@ -175,11 +175,12 @@ pub fn start() {
                                 p["kind"] = serde_json::json!(kind);
                                 if style_view {
                                     p["view"] = serde_json::json!(true);
-                                    style_view = false;
                                 }
                             }
-                            if let Err(e) = app.run("map.addTiles", p) {
-                                app.session.notify(format!("?{key}={url}: {e}"), true);
+                            match app.run("map.addTiles", p) {
+                                // The first style added opens at its view, not one that failed.
+                                Ok(_) => style_view &= kind.is_none(),
+                                Err(e) => app.session.notify(format!("?{key}={url}: {e}"), true),
                             }
                         }
                     }

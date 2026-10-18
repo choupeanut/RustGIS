@@ -990,10 +990,10 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
     if nodes.is_empty() {
         return Err("the map has no features to put in a scene".into());
     }
-    let (camera, node) = viewpoint(m, view);
     // As drawn: a camera set from outside a command may not be clamped yet.
     let mut at = m.camera;
     at.clamp();
+    let (camera, node) = viewpoint(m, &at, view);
     nodes.push(node);
     let n = nodes.len();
     let doc = json!({
@@ -1014,14 +1014,11 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
 }
 
 /// The glTF camera of a scene and the node placing it: looking at the map's centre (the scene's
-/// origin) from its bearing and pitch, with MapLibre's field of view, at the distance that shows
+/// origin) from camera `at` (clamped), with MapLibre's field of view, at the distance that shows
 /// the map's scale across a view `view` points in size.
-fn viewpoint(m: &Map, view: (f64, f64)) -> (Value, Value) {
+fn viewpoint(m: &Map, at: &rustgis_map::Camera, view: (f64, f64)) -> (Value, Value) {
     let size = |v: f64| if v.is_finite() { v.clamp(1.0, 1e6) } else { 1.0 };
     let (w, h) = (size(view.0), size(view.1));
-    // As drawn: a camera set from outside a command may not be clamped yet.
-    let mut at = m.camera;
-    at.clamp();
     let ground = at.res * m.flat().ground_per_unit(at.center);
     let distance = h / 2.0 / rustgis_map::camera::TAN_HALF_FOV * ground;
     let distance = if distance.is_finite() { distance.clamp(1.0, 1e9) } else { 1e6 };

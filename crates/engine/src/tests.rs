@@ -3543,6 +3543,8 @@ fn map_links() {
     let before = s.map().camera;
     for bad in [
         json!({"url": "https://example.com/#about"}),
+        json!({"url": "https://example.com/?a=1/2/3"}),
+        json!({"url": "map=1/2/3"}),
         json!({"url": "#4/95/0"}),
         json!({"url": "#4/0/200"}),
         json!({"url": "#99/0/0"}),
