@@ -1176,6 +1176,11 @@ fn graphics_draw_shapes_text_and_pictures() {
     let ds = &s.map().layer(id).unwrap().dataset;
     assert_eq!((rustgis_map::graphics::label(ds, row), rustgis_map::graphics::font_size(ds, row)), (Some("Edited"), 30.0));
     assert_eq!(rustgis_map::graphics::font_size(ds, 0), 14.0, "only the graphic named");
+    // A size is kept within the range it is drawn at, so Edit Text shows what the map draws.
+    s.run("graphics.edit", &json!({"layer": id, "row": text, "fontSize": 0})).unwrap();
+    let ds = &s.map().layer(id).unwrap().dataset;
+    assert_eq!(ds.value(row, ds.field_index("font_size").unwrap()), &rustgis_data::Value::Float(4.0));
+    s.run("edit.undo", &Value::Null).unwrap();
     s.run("edit.undo", &Value::Null).unwrap();
     let ds = &s.map().layer(id).unwrap().dataset;
     assert_eq!((rustgis_map::graphics::label(ds, row), rustgis_map::graphics::font_size(ds, row)), (Some("{map} {scale}"), 20.0));

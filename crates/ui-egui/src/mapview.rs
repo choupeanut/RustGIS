@@ -826,11 +826,13 @@ pub(crate) fn lonlat_to_screen(app: &RustGisApp, rect: Rect, c: Coord) -> Option
 /// with its dynamic values filled in as drawn, covers the point.
 pub(crate) fn text_graphic_at(app: &RustGisApp, ctx: &egui::Context, rect: Rect, p: Pos2) -> Option<(u32, usize)> {
     use rustgis_engine::map::graphics;
-    let map = app.session.map();
-    let tokens = graphics::TokenValues::of(map, app.session.scale());
-    // The first layer is drawn on top, and in a layer the last row.
-    map.layers.iter().filter(|l| l.graphics && l.visible).find_map(|l| {
-        (0..l.dataset.features.len()).rev().find_map(|row| {
+    let (map, scale) = (app.session.map(), app.session.scale());
+    let tokens = graphics::TokenValues::of(map, scale);
+    // Only what is drawn, as render_frame draws it: the first layer on top, and in a layer the
+    // last row.
+    map.layers.iter().filter(|l| l.graphics && map.draws_at(l, scale)).find_map(|l| {
+        let drawn = l.drawn_rows(scale);
+        (0..l.dataset.features.len()).rev().filter(|r| drawn.get(*r) == Some(&true)).find_map(|row| {
             let text = graphics::expand(graphics::label(&l.dataset, row)?, &tokens);
             let at = lonlat_to_screen(app, rect, l.dataset.features.get(row)?.geometry.as_ref()?.label_point()?)?;
             let font = regular(graphics::font_size(&l.dataset, row) * 1.33);
@@ -2252,6 +2254,15 @@ mod tests {
         let mut out = egui::Context::default().run_ui(Default::default(), |ui| {
             let at = lonlat_to_screen(&app, rect, Coord::new(c.x, c.y - 30.0)).unwrap();
             assert_eq!(text_graphic_at(&app, ui.ctx(), rect, at + vec2(50.0, 0.0)), hit, "on the scale it shows");
+        });
+        out.textures_delta.clear();
+        // Text that isn't drawn (its layer's group is hidden) can't be hit.
+        let layer = r["layer"].clone();
+        app.run("group.add", json!({"name": "Notes", "layers": [layer]})).unwrap();
+        app.run("group.set", json!({"group": "Notes", "visible": false})).unwrap();
+        let mut out = egui::Context::default().run_ui(Default::default(), |ui| {
+            let at = lonlat_to_screen(&app, rect, Coord::new(c.x, c.y - 30.0)).unwrap();
+            assert_eq!(text_graphic_at(&app, ui.ctx(), rect, at), None);
         });
         out.textures_delta.clear();
     }

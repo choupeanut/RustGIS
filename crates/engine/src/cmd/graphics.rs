@@ -247,16 +247,16 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     let (fill, outline) = (color(p, "fill")?, color(p, "outline")?);
     let id = target(s, p)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-    let num = |k: &str, max: f64| f(p, k).map(|v| Attr::Float(v.clamp(0.0, max))).unwrap_or(Attr::Null);
+    let num = |k: &str, min: f64, max: f64| f(p, k).map(|v| Attr::Float(v.clamp(min, max))).unwrap_or(Attr::Null);
     let opt = |v: Option<String>| v.map(Attr::Text).unwrap_or(Attr::Null);
     let attrs = vec![
         Attr::Text(shape.clone()),
         opt(text),
         opt(fill),
         opt(outline),
-        num("width", 50.0),
-        num("size", 200.0),
-        num("fontSize", 200.0),
+        num("width", 0.0, 50.0),
+        num("size", 0.0, 200.0),
+        num("fontSize", 4.0, 200.0),
         opt(image),
     ];
     l.dataset.push(Some(g), attrs);
@@ -294,8 +294,9 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
 fn restyle(s: &mut Session, p: &Value, one: Option<(u32, usize)>) -> CmdResult {
     let (fill, outline) = (color(p, "fill")?, color(p, "outline")?);
     let text = ps(p, "text").map(|t| t.chars().take(2000).collect::<String>());
-    let nums = [("width", "width", 50.0), ("size", "size", 200.0), ("font_size", "fontSize", 200.0)];
-    if fill.is_none() && outline.is_none() && text.is_none() && nums.iter().all(|(_, k, _)| f(p, k).is_none()) {
+    // Font sizes are kept within the range they are drawn at (graphics::font_size).
+    let nums = [("width", "width", 0.0, 50.0), ("size", "size", 0.0, 200.0), ("font_size", "fontSize", 4.0, 200.0)];
+    if fill.is_none() && outline.is_none() && text.is_none() && nums.iter().all(|(_, k, _, _)| f(p, k).is_none()) {
         return Err("give a fill, outline, width, size, fontSize or text".into());
     }
     let mut n = 0;
@@ -308,9 +309,9 @@ fn restyle(s: &mut Session, p: &Value, one: Option<(u32, usize)>) -> CmdResult {
         if let Some(c) = &outline {
             sets.push(("outline", Attr::Text(c.clone())));
         }
-        for (field, k, max) in nums {
+        for (field, k, min, max) in nums {
             if let Some(v) = f(p, k) {
-                sets.push((field, Attr::Float(v.clamp(0.0, max))));
+                sets.push((field, Attr::Float(v.clamp(min, max))));
             }
         }
         let sets: Vec<(Option<usize>, Attr)> = sets.into_iter().map(|(k, v)| (l.dataset.field_index(k), v)).collect();
