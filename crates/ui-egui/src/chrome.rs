@@ -453,6 +453,19 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
         if id == "edit.paste" && !p.get("text").and_then(Value::as_str).is_some_and(|t| t.trim_start().starts_with('{')) {
             continue;
         }
+        // A command that can't run now says why, as its greyed ribbon button does (#456).
+        // Running out of undo or redo needs no word.
+        if !matches!(id, "edit.undo" | "edit.redo")
+            && let Some(why) = why_disabled(app, id)
+        {
+            let label = app.session.registry.get(id).map_or(id, |s| s.label);
+            let text = crate::i18n::fmt("{command}: {reason}", &[("command", tl!(label)), ("reason", tl!(why))]);
+            // Once while it shows: a held key repeats, and each repeat comes here.
+            if !app.map.toasts.iter().any(|t| t.text == text) {
+                app.session.notify(text, true);
+            }
+            continue;
+        }
         let _ = app.run(id, p);
     }
 }

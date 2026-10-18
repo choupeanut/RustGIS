@@ -1872,3 +1872,69 @@ fn dynamic_text_is_a_menu_of_values_that_starts_the_text() {
     h.state_mut().run("tool.set", json!({"tool": "graphicText"})).unwrap();
     assert_eq!(h.state().ui.dynamic_text, None);
 }
+
+#[test]
+fn the_popup_closes_when_its_feature_is_deleted() {
+    let mut h = harness();
+    h.step();
+    let graphics = || json!({"shape": "point", "points": [[-30.0, -40.0]]});
+    h.state_mut().run("graphics.add", graphics()).unwrap();
+    h.state_mut().run("ui.identify", json!({"lon": -30.0, "lat": -40.0})).unwrap();
+    h.step();
+    // The feature the popup shows, by its feature id.
+    let shown = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+        h.state().map.popup.as_ref().and_then(|p| p.info["results"].get(p.index).unwrap_or(&p.info)["fid"].as_u64())
+    };
+    let fid = shown(&h);
+    assert!(fid.is_some());
+    // Another feature deleted: the popup stays.
+    h.state_mut().run("graphics.add", json!({"shape": "point", "points": [[30.0, -40.0]]})).unwrap();
+    h.state_mut().run("select.rows", json!({"layer": "Graphics", "rows": [1]})).unwrap();
+    h.state_mut().run("edit.delete", json!(null)).unwrap();
+    h.step();
+    assert_eq!(shown(&h), fid, "another feature's deletion leaves it on its feature");
+    // Its own feature deleted: it closes.
+    h.state_mut().run("select.rows", json!({"layer": "Graphics", "rows": [0]})).unwrap();
+    h.state_mut().run("edit.delete", json!(null)).unwrap();
+    h.step();
+    assert!(h.state().map.popup.is_none(), "the popup outlived its feature");
+    // Another map in view: a duplicate has the same layer and feature ids, but it's not the
+    // map the popup was opened on.
+    h.state_mut().run("graphics.add", graphics()).unwrap();
+    h.state_mut().run("ui.identify", json!({"lon": -30.0, "lat": -40.0})).unwrap();
+    h.step();
+    assert!(h.state().map.popup.is_some());
+    h.state_mut().run("map.duplicate", json!({})).unwrap();
+    h.step();
+    assert!(h.state().map.popup.is_none(), "the popup stayed on another map");
+}
+
+#[test]
+fn a_shortcut_that_cannot_run_says_why() {
+    let mut h = harness();
+    h.step();
+    h.state_mut().run("edit.enable", json!({"on": false})).unwrap();
+    h.state_mut().run("select.rows", json!({"layer": "Countries", "rows": [0]})).unwrap();
+    let rows =
+        |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer_by_name("Countries").map(|l| l.dataset.features.len());
+    let before = rows(&h);
+    let mark = h.state().session.notice_mark();
+    h.key_press(egui::Key::Delete);
+    h.step();
+    assert_eq!(rows(&h), before, "nothing deleted");
+    let said = h.state().session.notices_since(mark);
+    assert!(said.iter().any(|n| n.error && n.text.contains("editing is turned off")), "{said:?}");
+    // Pressed again (or held) while it shows: no second notice.
+    let mark = h.state().session.notice_mark();
+    h.key_press(egui::Key::Delete);
+    h.step();
+    assert!(h.state().session.notices_since(mark).is_empty());
+    // Nothing left to undo isn't worth a notice.
+    while h.state().session.can_undo() {
+        h.state_mut().run("edit.undo", json!(null)).unwrap();
+    }
+    let mark = h.state().session.notice_mark();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.step();
+    assert!(h.state().session.notices_since(mark).is_empty());
+}
