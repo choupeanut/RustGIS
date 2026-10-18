@@ -267,12 +267,15 @@ document parsed when it is a JSON object or array.
 
 - Only `http://` and `https://` addresses on the internet: not this computer, the local network
   or cloud metadata addresses, and no redirect may lead there or from `https` to `http`. Names
-  are judged as written, not resolved. Requests carry no credentials (an S3 connection's
-  included) and no headers of the plugin's.
+  are checked as written and again where they resolve, on every redirect too, so a name that
+  resolves to this computer or the local network is refused on the desktop and the command line
+  (in the web app, the browser decides what it may reach). Requests carry no credentials (an
+  S3 connection's included) and no headers of the plugin's.
 - At most 2 MB, in UTF-8 (a byte-order mark is dropped). An answer that isn't a success (404,
   500…) is an error ending in `HTTP <status>`.
 - Answers are kept for 10 minutes (up to 256 documents and 16 MB in all) while RustGIS runs,
-  so asking for the same address again costs nothing. Errors are given once, never kept.
+  so asking for the same address again costs nothing. Errors are kept for 30 seconds,
+  so every command waiting for an address sees its error; after that it is fetched again.
 - On the desktop and the command line the request waits for the answer: at most 20 seconds for
   one, and 60 seconds for all the fetches of one plugin call. A call makes at most 64 fetches.
 - In the web app nothing may wait. A fetch that isn't kept yet answers

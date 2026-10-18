@@ -32,6 +32,9 @@ pub const CALL_BUDGET: Duration = Duration::from_secs(60);
 pub const MAX_PER_CALL: usize = 64;
 /// How long a fetched answer is kept.
 pub const TTL: Duration = Duration::from_secs(10 * 60);
+/// How long a failed fetch's error is kept: long enough for every command waiting for it to
+/// see it (the browser), short enough that a later try fetches again.
+pub const ERROR_TTL: Duration = Duration::from_secs(30);
 /// The most answers kept, and their bytes.
 const CACHE_ENTRIES: usize = 256;
 const CACHE_BYTES: usize = 16 << 20;
@@ -59,17 +62,15 @@ struct Cache {
 }
 
 impl Cache {
-    /// The kept answer for `url`. A failed fetch's error is given once, then forgotten (a later
-    /// call fetches again).
+    /// The kept answer for `url`. A failed fetch's error is kept for [`ERROR_TTL`], so every
+    /// command waiting for it sees it, and fetched again after that.
     fn get(&mut self, url: &str) -> Option<Result<Value, String>> {
-        self.entries.retain(|e| e.at.elapsed() < TTL);
+        self.entries.retain(|e| e.at.elapsed() < if e.answer.is_ok() { TTL } else { ERROR_TTL });
         let i = self.entries.iter().position(|e| e.url == url)?;
         let e = self.entries.remove(i)?;
         let answer = e.answer.clone();
         // Kept answers move to the back: the least recently used go first.
-        if answer.is_ok() {
-            self.entries.push_back(e);
-        }
+        self.entries.push_back(e);
         Some(answer)
     }
 
@@ -227,8 +228,15 @@ impl Calls {
         if left.is_zero() {
             return Err(format!("{url}: this plugin call's fetches took longer than {} s in all", CALL_BUDGET.as_secs()));
         }
-        let bytes = crate::render::rustgis_tiles::cache::download_blocking_within(&s3::anonymous(url), MAX_BYTES, TIMEOUT.min(left))
-            .map_err(|e| format!("{url}: {e}"))?;
+        // Names are checked again where they resolve: a public-looking name for a local address
+        // (or a redirect to one) is refused there. Tests fetch from a server on this computer.
+        let (fetched, within) = (&s3::anonymous(url), TIMEOUT.min(left));
+        let bytes = if allow_local() {
+            crate::render::rustgis_tiles::cache::download_blocking_within(fetched, MAX_BYTES, within)
+        } else {
+            crate::render::rustgis_tiles::cache::download_public_within(fetched, MAX_BYTES, within)
+        }
+        .map_err(|e| format!("{url}: {e}"))?;
         let answer = answer(url, &bytes)?;
         cache().keep(url, Ok(answer.clone()));
         Ok(answer)
@@ -329,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_is_bounded_and_gives_errors_once() {
+    fn the_cache_is_bounded_and_keeps_errors_briefly() {
         let mut c = Cache::default();
         for i in 0..CACHE_ENTRIES + 10 {
             c.keep(&format!("https://cache.test/{i}"), Ok(json!({"text": ""})));
@@ -341,7 +349,12 @@ mod tests {
         assert!(!c.landed("https://cache.test/err"));
         c.keep("https://cache.test/err", Err("HTTP 500".into()));
         assert!(c.landed("https://cache.test/err"));
+        // Every command waiting for it sees the error, until it expires.
         assert_eq!(c.get("https://cache.test/err"), Some(Err("HTTP 500".into())));
+        assert_eq!(c.get("https://cache.test/err"), Some(Err("HTTP 500".into())));
+        if let Some(e) = c.entries.iter_mut().find(|e| e.url == "https://cache.test/err") {
+            e.at = e.at.checked_sub(ERROR_TTL).unwrap_or(e.at);
+        }
         assert_eq!(c.get("https://cache.test/err"), None);
         // Large answers count by their bytes.
         let big = "x".repeat(MAX_BYTES / 2);
