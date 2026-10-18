@@ -3511,6 +3511,132 @@ fn web_shares_carry_every_feature_of_a_streamed_layer() {
     let _ = std::fs::remove_file(path);
 }
 
+/// MapLibre map links: read with their bearing and pitch (or without), written back the same,
+/// and junk refused without moving the map.
+#[test]
+fn map_links() {
+    let mut s = world();
+    let r = s.run("map.goToLink", &json!({"url": "https://example.com/map/#15.5/40.7484/-73.9857/30/60"})).unwrap();
+    assert_eq!((r["bearing"].as_f64(), r["pitch"].as_f64()), (Some(30.0), Some(60.0)));
+    let c = s.map().center_lonlat();
+    assert!((c.x + 73.9857).abs() < 1e-6 && (c.y - 40.7484).abs() < 1e-6, "{c:?}");
+    assert_eq!(s.run("map.link", &Value::Null).unwrap()["hash"], "#15.5/40.7484/-73.9857/30/60");
+    // MapLibre's zoom 0 shows the world's 40,075 km across 512 pixels.
+    s.run("map.goToLink", &json!({"url": "0/0/0"})).unwrap();
+    let ground = s.map().camera.res * s.map().flat().ground_per_unit(s.map().camera.center);
+    assert!((ground - 2.0 * std::f64::consts::PI * 6_378_137.0 / 512.0).abs() < 1.0, "{ground}");
+    assert_eq!((s.map().camera.bearing, s.map().camera.pitch), (0.0, 0.0), "left out, they are zero");
+    // A named hash among other parameters, and bearing without pitch.
+    s.run("map.goToLink", &json!({"url": "https://example.com/#layers=a&map=4/10/20/-45"})).unwrap();
+    assert_eq!(s.map().camera.bearing, -45.0);
+    assert_eq!(s.run("map.link", &Value::Null).unwrap()["hash"], "#4/10/20/-45");
+    let before = s.map().camera;
+    for bad in [
+        json!({"url": "https://example.com/#about"}),
+        json!({"url": "#4/95/0"}),
+        json!({"url": "#4/0/200"}),
+        json!({"url": "#99/0/0"}),
+        json!({"url": "#4/0"}),
+        json!({"url": "#4/0/0/1/2/3"}),
+        json!({"url": "#NaN/0/0"}),
+        json!({"url": "#inf/0/0"}),
+        json!({"url": "#4/0/0/1e400"}),
+        json!({"url": "/".repeat(100_000)}),
+        json!({"url": 3}),
+        json!({}),
+    ] {
+        assert!(s.run("map.goToLink", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(s.map().camera, before);
+}
+
+/// A MapLibre style added with `"view": true` takes the map to its root center, zoom, bearing
+/// and pitch once it has loaded; without it the map stays where it is.
+#[test]
+fn style_root_view_moves_the_map() {
+    const STYLE: &[u8] = br#"{"version": 8, "center": [2.2945, 48.8584], "zoom": 16, "bearing": -20, "pitch": 55, "sources": {}, "layers": [{"id": "bg", "type": "background"}]}"#;
+    let base = serve(STYLE, 4);
+    let mut s = world();
+    let before = s.map().camera;
+    s.run("map.addTiles", &json!({"url": format!("{base}/plain/style.json")})).unwrap();
+    assert!(s.style_view.is_none());
+    assert_eq!(s.map().camera, before);
+    s.run("map.addTiles", &json!({"url": format!("{base}/view/style.json"), "view": true})).unwrap();
+    // Loaded in the background; followed once it is.
+    let start = std::time::Instant::now();
+    while s.style_view.is_some() && start.elapsed() < std::time::Duration::from_secs(20) {
+        crate::cmd::tiles::follow_style_view(&mut s, web_time::Duration::from_secs(5));
+    }
+    assert!(s.style_view.is_none());
+    let m = s.map();
+    let c = m.center_lonlat();
+    assert!((c.x - 2.2945).abs() < 1e-6 && (c.y - 48.8584).abs() < 1e-6, "{c:?}");
+    assert_eq!((m.camera.bearing, m.camera.pitch), (-20.0, 55.0));
+    assert_eq!(s.run("map.link", &Value::Null).unwrap()["hash"], "#16/48.8584/2.2945/-20/55");
+    // Only a style has a view of its own.
+    let e = s.run("map.addTiles", &json!({"url": "https://tiles.example.com/{z}/{x}/{y}.png", "view": true})).unwrap_err();
+    assert!(e.contains("style"), "{e}");
+    // A style that can't load is said, and forgotten.
+    s.run("map.addTiles", &json!({"url": format!("{base}/missing/style.json"), "view": true})).unwrap();
+    let start = std::time::Instant::now();
+    while s.style_view.is_some() && start.elapsed() < std::time::Duration::from_secs(20) {
+        crate::cmd::tiles::follow_style_view(&mut s, web_time::Duration::from_secs(5));
+    }
+    assert!(s.style_view.is_none());
+    assert!(s.notices.iter().any(|n| n.error && n.text.contains("missing")), "{:?}", s.notices);
+}
+
+/// A web scene carries a camera at the map's viewpoint: straight down when the map is flat, and
+/// from its bearing and pitch when it is turned and tilted.
+#[test]
+fn web_scene_camera() {
+    let dir = std::env::temp_dir().join(format!("rustgis_scene_camera_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scene.gltf").display().to_string();
+    let mut s = world();
+    s.view_size = (800.0, 600.0);
+    let scene = |s: &mut Session| -> Value {
+        s.run("share.webScene", &json!({"path": path})).unwrap();
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+    };
+    // Where a node's camera looks (-z turned by its rotation) and its up (+y).
+    let axes = |n: &Value| {
+        let q: Vec<f64> = n["rotation"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+        let turn = |v: [f64; 3]| {
+            let t = [2.0 * (y * v[2] - z * v[1]), 2.0 * (z * v[0] - x * v[2]), 2.0 * (x * v[1] - y * v[0])];
+            [v[0] + w * t[0] + (y * t[2] - z * t[1]), v[1] + w * t[1] + (z * t[0] - x * t[2]), v[2] + w * t[2] + (x * t[1] - y * t[0])]
+        };
+        (turn([0.0, 0.0, -1.0]), turn([0.0, 1.0, 0.0]))
+    };
+    let near = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-9);
+    let g = scene(&mut s);
+    let cam = g["nodes"].as_array().unwrap().iter().find(|n| n.get("camera").is_some()).unwrap().clone();
+    assert_eq!(g["cameras"][0]["type"], "perspective");
+    assert!((g["cameras"][0]["perspective"]["aspectRatio"].as_f64().unwrap() - 800.0 / 600.0).abs() < 1e-9);
+    let (look, up) = axes(&cam);
+    assert!(near(look, [0.0, -1.0, 0.0]) && near(up, [0.0, 0.0, -1.0]), "down, north up: {look:?} {up:?}");
+    let t: Vec<f64> = cam["translation"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    // As far up as the map's scale needs: 300 points of ground under half the field of view.
+    let ground = s.map().camera.res * s.map().flat().ground_per_unit(s.map().camera.center);
+    assert!(t[0].abs() < 1e-6 && t[2].abs() < 1e-6 && (t[1] - 300.0 * 3.0 * ground).abs() < 1e-3 * t[1], "{t:?}");
+    // Facing east, tilted 60°: behind the centre to the west, looking east and down.
+    s.run("map.setBearing", &json!({"bearing": 90})).unwrap();
+    s.run("map.setPitch", &json!({"pitch": 60})).unwrap();
+    let g = scene(&mut s);
+    assert_eq!((g["extras"]["bearing"].as_f64(), g["extras"]["pitch"].as_f64()), (Some(90.0), Some(60.0)));
+    let cam = g["nodes"].as_array().unwrap().iter().find(|n| n.get("camera").is_some()).unwrap().clone();
+    let (look, _) = axes(&cam);
+    let (s60, c60) = (60f64.to_radians().sin(), 60f64.to_radians().cos());
+    assert!(near(look, [s60, -c60, 0.0]), "{look:?}");
+    let t: Vec<f64> = cam["translation"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    assert!(t[0] < 0.0 && t[1] > 0.0 && t[2].abs() < 1e-6 * t[1], "{t:?}");
+    // The camera looks at the centre (the origin).
+    let d = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+    assert!(near([-t[0] / d, -t[1] / d, -t[2] / d], look), "{t:?} {look:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn reloading_web_layers_clears_the_tile_cache() {
     use crate::render::rustgis_tiles::cache;

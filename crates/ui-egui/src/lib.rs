@@ -2543,6 +2543,14 @@ impl RustGisApp {
                 self.session.notify(e, true);
             }
         }
+        // A style added with `"view": true` moves the map once it has loaded.
+        if self.session.style_view.is_some() {
+            if self.session.follow_style_view() {
+                self.map.invalidate();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
         sqlpane::poll(self, ctx);
         self.poll_service();
         serviceui::poll(self, ctx);

@@ -154,11 +154,27 @@ pub fn start() {
                     if stac.len() > 1 {
                         app.session.notify(format!("only the first ?stac= link is opened ({} more were left out)", stac.len() - 1), false);
                     }
+                    // `#zoom/lat/lon/bearing/pitch` (a MapLibre map link) places the map; without
+                    // it, `?extent=` or `?data=`, the first `?style=` opens at the style's own view.
+                    let hash = hash();
+                    let linked = project.is_none() && !hash.trim_start_matches('#').is_empty() && {
+                        let r = app.run("map.goToLink", serde_json::json!({"url": hash}));
+                        if let Err(e) = &r {
+                            log::warn!("{hash}: {e}");
+                        }
+                        r.is_ok()
+                    };
+                    let placed = linked || param(&q, "extent").is_some_and(|e| !e.is_empty()) || !params(links, "data", 1).is_empty();
+                    let mut style_view = project.is_none() && !placed;
                     for (key, kind) in [("style", Some("style")), ("tiles", None)] {
                         for url in params(links, key, 8) {
                             let mut p = serde_json::json!({"url": url});
                             if let Some(kind) = kind {
                                 p["kind"] = serde_json::json!(kind);
+                                if style_view {
+                                    p["view"] = serde_json::json!(true);
+                                    style_view = false;
+                                }
                             }
                             if let Err(e) = app.run("map.addTiles", p) {
                                 app.session.notify(format!("?{key}={url}: {e}"), true);
@@ -232,6 +248,11 @@ fn flag(q: &str, key: &str) -> bool {
 
 fn query() -> String {
     web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
+}
+
+/// The page address's fragment (`#…`), as MapLibre's map links carry a position.
+fn hash() -> String {
+    web_sys::window().and_then(|w| w.location().hash().ok()).unwrap_or_default()
 }
 
 /// Reads dropped files asynchronously (browsers can't read them synchronously) into the inbox,

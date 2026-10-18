@@ -278,6 +278,9 @@ pub struct Session {
     pub active_layer: Option<u32>,
     /// Map view size in logical points (set by the UI each frame).
     pub view_size: (f64, f64),
+    /// A MapLibre style tile layer (by its address) whose own view the map goes to once it loads
+    /// (`map.addTiles` with `"view": true`).
+    pub style_view: Option<String>,
     pub notices: Vec<Notice>,
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]).
     notices_given: u64,
@@ -418,6 +421,7 @@ impl Session {
             tool: Tool::Explore,
             active_layer: None,
             view_size: (1200.0, 720.0),
+            style_view: None,
             notices: Vec::new(),
             notices_given: 0,
             table_layer: None,
@@ -539,9 +543,19 @@ impl Session {
         self.project.map_mut()
     }
 
+    /// Moves the map to the view of a style added with `"view": true` once the style has loaded
+    /// (the UI asks each frame). True when the map moved.
+    pub fn follow_style_view(&mut self) -> bool {
+        cmd::tiles::follow_style_view(self, web_time::Duration::ZERO)
+    }
+
     /// Runs a command by id. Mutating commands snapshot the project for undo; an error or a
     /// panic restores it.
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
+        // A style that loaded since: its view first, so the command sees where the map is.
+        if self.style_view.is_some() {
+            self.follow_style_view();
+        }
         if id.starts_with(rustgis_plugins::PREFIX) {
             return self.run_plugin(id, params);
         }
