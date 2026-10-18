@@ -35,6 +35,7 @@ mod mapview;
 mod navui;
 mod opendataui;
 mod panes;
+mod pluginpanel;
 mod pluginsui;
 mod portalsui;
 mod reportpane;
@@ -357,6 +358,8 @@ pub enum RightPane {
     Sql,
     Directions,
     Bookmarks,
+    /// A plugin's panel: the one `UiState::plugin_panel` names.
+    Plugin,
 }
 
 pub struct UiState {
@@ -463,6 +466,8 @@ pub struct UiState {
     pub nav: navui::State,
     /// The Bookmarks pane: its filter and the bookmark being edited.
     pub bookmarks: bookmarkpane::State,
+    /// The plugin panel pane: whose panel it shows, and a slider being dragged.
+    pub plugin_panel: pluginpanel::State,
     /// The search box at the foot of the left pane.
     pub search: searchbox::State,
     /// The Data Sources pane's boxes, and the sources' generation last kept in the preferences.
@@ -563,6 +568,7 @@ impl Default for UiState {
             geocode: Default::default(),
             nav: Default::default(),
             bookmarks: Default::default(),
+            plugin_panel: Default::default(),
             search: Default::default(),
             sources: Default::default(),
             sources_saved: 0,
@@ -1228,6 +1234,8 @@ impl RustGisApp {
             "ui.pane.directions" if p.get("from").is_some() || p.get("to").is_some() => navui::open_with(self, p),
             "ui.pane.directions" => toggle_right(&mut self.ui, RightPane::Directions),
             "ui.pane.bookmarks" => toggle_right(&mut self.ui, RightPane::Bookmarks),
+            // A plugin's panel: `{"id": plugin}`.
+            "ui.pane.plugin" => return pluginpanel::open(self, p),
             // The SQL pane; with "sql" (and "database"), opened on that query, run with "run".
             "ui.pane.sql" => match p.get("sql").and_then(Value::as_str) {
                 Some(sql) => {

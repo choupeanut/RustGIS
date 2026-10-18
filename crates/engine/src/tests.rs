@@ -2503,6 +2503,69 @@ fn plugin_edits_are_one_undo_step() {
 }
 
 #[test]
+fn plugin_panels_keep_their_state_between_calls() {
+    let mut s = world();
+    let pkg = rustgis_plugins::Package::from_zip(&rustgis_plugins::testing::panel_package("eng-panel")).unwrap();
+    rustgis_plugins::load(pkg, "test").unwrap();
+    // Opening it runs its state command, whose answer the session keeps.
+    let st = s.run("plugin.panel", &json!({"id": "eng-panel", "refresh": true})).unwrap();
+    assert_eq!(st["values"]["release"], 12);
+    assert_eq!(st["items"]["release"]["labels"][12], "2025-12-18");
+    assert_eq!(st["items"]["newer"]["enabled"], false);
+    assert!(!s.can_undo(), "a state command that changes nothing is no undo step");
+    // A widget's command gets the values, the one it set among them, and not as a parameter.
+    let got = s.run("plugin:eng-panel/q", &json!({"panel": {"release": 4, "nope": 1}, "keep": true})).unwrap();
+    assert_eq!(got["panel"], json!({"values": {"local": false, "release": 4}, "changed": ["release"]}));
+    assert_eq!(got["params"], json!({"keep": true}));
+    assert_eq!(s.plugin_panels["eng-panel"].slider("release"), 4);
+    // Any command gets them, from the ribbon or a script, and widgets that run nothing set them.
+    s.run("plugin.panel", &json!({"id": "eng-panel", "values": {"local": true, "release": 99}})).unwrap();
+    let got = s.run("plugin:eng-panel/h", &json!({})).unwrap();
+    assert_eq!(got, json!({"hello": "world"}));
+    let got = s.run("plugin:eng-panel/q", &json!({})).unwrap();
+    assert_eq!(got["panel"], json!({"values": {"local": true, "release": 12}, "changed": []}), "kept within the slider's ends");
+    // A failed command leaves the values as they were.
+    assert!(s.run("plugin:eng-panel/e", &json!({"panel": {"release": 1}})).is_err());
+    assert_eq!(s.plugin_panels["eng-panel"].slider("release"), 12);
+    // Hostile values and answers never panic, and never leave the slider outside its ends.
+    for junk in [json!(null), json!(7), json!("x"), json!([1]), json!({"release": "1"}), json!({"release": 1e300}), json!({"local": {}})] {
+        let _ = s.run("plugin:eng-panel/q", &json!({"panel": junk.clone()}));
+        let _ = s.run("plugin.panel", &json!({"id": "eng-panel", "values": junk}));
+        let st = &s.plugin_panels["eng-panel"];
+        assert!((0..=12).contains(&st.slider("release")));
+    }
+    // Plugins without a panel get no `panel`, and keep a `panel` parameter of their own.
+    plugin("eng-nopanel", &[]);
+    assert!(s.run("plugin.panel", &json!({"id": "eng-nopanel"})).unwrap_err().contains("no panel"));
+    assert!(s.plugin_panel("eng-nopanel").is_none());
+    assert_eq!(forward(&mut s, "eng-nopanel", "host.info", json!({})).unwrap()["plugin"], "eng-nopanel");
+    assert!(s.run("plugin.panel", &json!({"id": "nope"})).is_err());
+    assert!(s.run("plugin.panel", &json!({})).is_err());
+    // A plugin can't drive panels.
+    let e = forward(&mut s, "eng-nopanel", "plugin.panel", json!({"id": "eng-panel"})).unwrap_err();
+    assert!(e.contains("can't run"), "{e}");
+    // A disabled plugin's panel is gone.
+    rustgis_plugins::set_enabled("eng-panel", false).unwrap();
+    assert!(s.plugin_panel("eng-panel").is_none());
+    assert!(s.run("plugin.panel", &json!({"id": "eng-panel"})).unwrap_err().contains("disabled"));
+    rustgis_plugins::unload("eng-panel");
+    rustgis_plugins::unload("eng-nopanel");
+}
+
+#[test]
+fn plugin_commands_that_change_nothing_are_no_undo_step() {
+    let mut s = world();
+    plugin("eng-noop", &["edit"]);
+    assert_eq!(s.run("plugin:eng-noop/h", &Value::Null).unwrap(), json!({"hello": "world"}));
+    forward(&mut s, "eng-noop", "host.layers", json!({})).unwrap();
+    forward(&mut s, "eng-noop", "map.zoomIn", json!({})).unwrap();
+    assert!(!s.can_undo(), "it only read the map and moved the view");
+    forward(&mut s, "eng-noop", "layer.rename", json!({"layer": "Rivers", "name": "Streams"})).unwrap();
+    assert_eq!(s.undo_label(), Some("Forward"));
+    rustgis_plugins::unload("eng-noop");
+}
+
+#[test]
 fn plugin_tile_layers_need_network() {
     let mut s = world();
     let osm = json!({"url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "attribution": "© OpenStreetMap contributors"});
