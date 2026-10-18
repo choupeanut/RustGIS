@@ -1310,6 +1310,93 @@ fn layout_legends_list_what_the_frame_draws() {
     assert!(matches!(old, rustgis_map::layout::ElementKind::Legend { all_classes: false, hide_other: false, .. }));
 }
 
+/// Grids, north arrows and scale bars take their cartographic options through commands (#327):
+/// checked before anything changes, kept when other options change, and saved with the layout.
+#[test]
+fn layout_surrounds_take_cartographic_options() {
+    use rustgis_map::Rgba;
+    use rustgis_map::layout::{ArrowStyle, CoordFormat, ElementKind, GridEdges, GridStyle, ScaleBarStyle, ScaleUnits};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    let find = |s: &Session, code: &str| s.project.layouts[0].elements.iter().find(|e| e.kind.code() == code).unwrap().clone();
+    let frame = find(&s, "mapFrame").id;
+    let grid = |s: &Session| match &s.project.layouts[0].element(frame).unwrap().kind {
+        ElementKind::MapFrame { grid, .. } => grid.clone(),
+        k => panic!("{k:?}"),
+    };
+    // A grid with ticks along the top and right edges, in degrees and minutes.
+    s.run(
+        "layout.addElement",
+        &json!({"kind": "grid", "step": 0.5, "style": "ticks", "tickLength": 3, "format": "dms", "edges": ["top", "right"], "labelOrientation": "vertical"}),
+    )
+    .unwrap();
+    let g = grid(&s).unwrap();
+    assert_eq!((g.step, g.style, g.tick_length, g.format), (0.5, GridStyle::Ticks, 3.0, CoordFormat::Dms));
+    assert_eq!(g.edges, GridEdges { top: true, bottom: false, left: false, right: true });
+    // Adding it again changes only what is named; a bad value changes nothing.
+    s.run("layout.addElement", &json!({"kind": "grid", "width": 1.5, "hemisphere": false})).unwrap();
+    let g2 = grid(&s).unwrap();
+    assert_eq!((g2.width, g2.hemisphere, g2.style, g2.step), (1.5, false, GridStyle::Ticks, 0.5));
+    for bad in [json!({"style": "dotted"}), json!({"format": "utm"}), json!({"edges": ["middle"]}), json!({"labelOrientation": "diagonal"})]
+    {
+        let mut p = bad.clone();
+        p["kind"] = json!("grid");
+        assert!(s.run("layout.addElement", &p).is_err(), "{bad}");
+        assert!(s.run("layout.update", &json!({"element": frame, "grid": bad})).is_err(), "{bad}");
+    }
+    assert_eq!(grid(&s).unwrap(), g2);
+    // The frame's properties edit, remove and restore its grid; sizes are clamped.
+    s.run("layout.update", &json!({"element": frame, "grid": {"style": "linesAndTicks", "tickLength": 1e9, "edges": "bottom, left"}}))
+        .unwrap();
+    let g3 = grid(&s).unwrap();
+    assert_eq!((g3.style, g3.tick_length, g3.edges), (GridStyle::LinesAndTicks, rustgis_map::layout::MAX_TICK_MM, GridEdges::default()));
+    s.run("layout.update", &json!({"element": frame, "grid": false})).unwrap();
+    assert!(grid(&s).is_none());
+    s.run("layout.update", &json!({"element": frame, "grid": true})).unwrap();
+    assert_eq!(grid(&s), Some(rustgis_map::layout::Grid::default()));
+    let arrow = find(&s, "northArrow").id;
+    assert!(s.run("layout.update", &json!({"element": arrow, "grid": true})).is_err(), "only frames have grids");
+    // North arrows: a style and colours.
+    s.run("layout.update", &json!({"element": arrow, "style": "compass", "fill": "#AA0000"})).unwrap();
+    assert!(matches!(
+        find(&s, "northArrow").kind,
+        ElementKind::NorthArrow { style: ArrowStyle::Compass, fill, outline, .. } if fill == Rgba::rgb(0xAA, 0, 0) && outline == Rgba::rgb(0x22, 0x22, 0x22)
+    ));
+    assert!(s.run("layout.update", &json!({"element": arrow, "style": "sundial"})).is_err());
+    assert!(s.run("layout.update", &json!({"element": arrow, "outline": "red"})).is_err());
+    assert!(matches!(find(&s, "northArrow").kind, ElementKind::NorthArrow { style: ArrowStyle::Compass, .. }));
+    let star = s.run("layout.addElement", &json!({"kind": "northArrow", "style": "STAR"})).unwrap()["element"].as_u64().unwrap() as u32;
+    assert!(matches!(s.project.layouts[0].element(star).unwrap().kind, ElementKind::NorthArrow { style: ArrowStyle::Star, .. }));
+    // Scale bars: units, divisions and a style; divisions are clamped.
+    let bar = find(&s, "scaleBar").id;
+    s.run("layout.update", &json!({"element": bar, "units": "mi", "divisions": 99, "style": "stepped"})).unwrap();
+    assert!(matches!(
+        find(&s, "scaleBar").kind,
+        ElementKind::ScaleBar { units: ScaleUnits::Miles, divisions: 10, style: ScaleBarStyle::Stepped, .. }
+    ));
+    s.run("layout.update", &json!({"element": bar, "divisions": "2"})).unwrap();
+    assert!(matches!(find(&s, "scaleBar").kind, ElementKind::ScaleBar { units: ScaleUnits::Miles, divisions: 2, .. }));
+    for bad in [json!({"units": "parsecs"}), json!({"divisions": "many"}), json!({"style": "zigzag"})] {
+        let mut p = bad.clone();
+        p["element"] = json!(bar);
+        assert!(s.run("layout.update", &p).is_err(), "{bad}");
+    }
+    let added = s.run("layout.addElement", &json!({"kind": "scaleBar", "units": "feet", "style": "line"})).unwrap()["element"]
+        .as_u64()
+        .unwrap() as u32;
+    assert!(matches!(
+        s.project.layouts[0].element(added).unwrap().kind,
+        ElementKind::ScaleBar { units: ScaleUnits::Feet, divisions: 4, style: ScaleBarStyle::Line, .. }
+    ));
+    // The page draws with them all, and they survive a save.
+    let out = std::env::temp_dir().join(format!("rustgis-surrounds-{}.png", std::process::id()));
+    s.run("layout.export", &json!({"path": out.to_string_lossy()})).unwrap();
+    let _ = std::fs::remove_file(&out);
+    let text = serde_json::to_string(&s.project.layouts[0]).unwrap();
+    let back: rustgis_map::layout::Layout = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, s.project.layouts[0]);
+}
+
 /// A colorbar shows a raster's colour scale on a layout (#326): added and edited through
 /// commands, checked against the frame's map, and saved with the layout.
 #[test]
