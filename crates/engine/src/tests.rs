@@ -3530,6 +3530,16 @@ fn map_links() {
     s.run("map.goToLink", &json!({"url": "https://example.com/#layers=a&map=4/10/20/-45"})).unwrap();
     assert_eq!(s.map().camera.bearing, -45.0);
     assert_eq!(s.run("map.link", &Value::Null).unwrap()["hash"], "#4/10/20/-45");
+    // MapLibre's own `map=` before other parameters that look like positions.
+    s.run("map.goToLink", &json!({"url": "#other=1/2/3&map=4/10/20"})).unwrap();
+    assert_eq!(s.run("map.link", &Value::Null).unwrap()["hash"], "#4/10/20");
+    // A view wider than zoom 0 gives a link that reads back; no "-0".
+    s.map_mut().camera.res = rustgis_map::camera::MAX_RES;
+    s.map_mut().camera.center = rustgis_geom::lonlat_to_merc(rustgis_geom::Coord::new(-1e-9, 0.0));
+    let hash = s.run("map.link", &Value::Null).unwrap()["hash"].as_str().unwrap().to_string();
+    assert_eq!(hash, "#0/0/0");
+    s.run("map.goToLink", &json!({"url": hash})).unwrap();
+    assert!(rustgis_engine_is_map_link("#map=4/10/20") && !rustgis_engine_is_map_link("#about"));
     let before = s.map().camera;
     for bad in [
         json!({"url": "https://example.com/#about"}),
@@ -3542,12 +3552,18 @@ fn map_links() {
         json!({"url": "#inf/0/0"}),
         json!({"url": "#4/0/0/1e400"}),
         json!({"url": "/".repeat(100_000)}),
+        json!({"url": format!("#4/0/0{}", "é".repeat(100_000))}),
+        json!({"url": format!("{}#4/0/0", "€".repeat(2000))}),
         json!({"url": 3}),
         json!({}),
     ] {
         assert!(s.run("map.goToLink", &bad).is_err(), "{bad}");
     }
     assert_eq!(s.map().camera, before);
+}
+
+fn rustgis_engine_is_map_link(text: &str) -> bool {
+    crate::cmd::navigate::is_map_link(text)
 }
 
 /// A MapLibre style added with `"view": true` takes the map to its root center, zoom, bearing
@@ -3584,6 +3600,11 @@ fn style_root_view_moves_the_map() {
     }
     assert!(s.style_view.is_none());
     assert!(s.notices.iter().any(|n| n.error && n.text.contains("missing")), "{:?}", s.notices);
+    // A style still loading when another project opens doesn't move that one.
+    s.run("map.addTiles", &json!({"url": "https://tiles.example.invalid/style.json", "view": true})).unwrap();
+    assert!(s.style_view.is_some());
+    s.run("project.new", &Value::Null).unwrap();
+    assert!(s.style_view.is_none());
 }
 
 /// A web scene carries a camera at the map's viewpoint: straight down when the map is flat, and

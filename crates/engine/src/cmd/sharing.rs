@@ -991,6 +991,9 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
         return Err("the map has no features to put in a scene".into());
     }
     let (camera, node) = viewpoint(m, view);
+    // As drawn: a camera set from outside a command may not be clamped yet.
+    let mut at = m.camera;
+    at.clamp();
     nodes.push(node);
     let n = nodes.len();
     let doc = json!({
@@ -1005,7 +1008,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
         "buffers": [{"byteLength": buffer.len(), "uri": format!("data:application/octet-stream;base64,{}", base64::engine::general_purpose::STANDARD.encode(&buffer))}],
         "cameras": [camera],
         "extras": {"origin": [c.x, c.y], "units": "metres east, up and south of origin (longitude, latitude)",
-            "bearing": m.camera.bearing, "pitch": m.camera.pitch},
+            "bearing": at.bearing, "pitch": at.pitch},
     });
     serde_json::to_vec(&doc).map_err(|e| e.to_string())
 }
@@ -1014,10 +1017,15 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
 /// origin) from its bearing and pitch, with MapLibre's field of view, at the distance that shows
 /// the map's scale across a view `view` points in size.
 fn viewpoint(m: &Map, view: (f64, f64)) -> (Value, Value) {
-    let (w, h) = (view.0.max(1.0), view.1.max(1.0));
-    let ground = m.camera.res * m.flat().ground_per_unit(m.camera.center);
-    let distance = (h / 2.0 / rustgis_map::camera::TAN_HALF_FOV * ground).clamp(1.0, 1e9);
-    let (bearing, pitch) = (m.camera.bearing.to_radians(), m.camera.pitch.to_radians());
+    let size = |v: f64| if v.is_finite() { v.clamp(1.0, 1e6) } else { 1.0 };
+    let (w, h) = (size(view.0), size(view.1));
+    // As drawn: a camera set from outside a command may not be clamped yet.
+    let mut at = m.camera;
+    at.clamp();
+    let ground = at.res * m.flat().ground_per_unit(at.center);
+    let distance = h / 2.0 / rustgis_map::camera::TAN_HALF_FOV * ground;
+    let distance = if distance.is_finite() { distance.clamp(1.0, 1e9) } else { 1e6 };
+    let (bearing, pitch) = (at.bearing.to_radians(), at.pitch.to_radians());
     // Backed off from the centre against the heading, and raised.
     let (heading_x, heading_z) = (bearing.sin(), -bearing.cos());
     let position = [-heading_x * distance * pitch.sin(), distance * pitch.cos(), -heading_z * distance * pitch.sin()];

@@ -717,6 +717,8 @@ impl Session {
         self.downloading.clear();
         self.downloaded.clear();
         self.url_requests.clear();
+        // A style of the last project still loading doesn't move this one.
+        self.style_view = None;
         #[cfg(not(target_arch = "wasm32"))]
         self.sql_results.clear();
     }

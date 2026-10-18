@@ -358,10 +358,16 @@ pub(crate) struct MapLink {
 /// parameters. Text without a `#` is read as the fragment itself.
 pub(crate) fn parse_link(text: &str) -> Option<MapLink> {
     let text = text.trim();
-    let text = text.get(..MAX_LINK).unwrap_or(text);
+    // Cut on a character boundary: a hostile link is long and need not be ASCII.
+    let end = (0..=MAX_LINK.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+    let text = text.get(..end).unwrap_or("");
     let fragment = text.split_once('#').map_or(text, |(_, f)| f);
-    fragment.split('&').find_map(|part| {
-        let value = part.split_once('=').map_or(part, |(_, v)| v);
+    // MapLibre's own parameter (`map=`, or the fragment alone) before any other.
+    let parts: Vec<(Option<&str>, &str)> =
+        fragment.split('&').map(|part| part.split_once('=').map_or((None, part), |(k, v)| (Some(k), v))).collect();
+    let ours = parts.iter().filter(|(k, _)| matches!(k, None | Some("map")));
+    let others = parts.iter().filter(|(k, _)| !matches!(k, None | Some("map")));
+    ours.chain(others).find_map(|&(_, value)| {
         let nums: Vec<f64> = value.split('/').map(|n| n.trim().parse::<f64>().ok().filter(|v| v.is_finite())).collect::<Option<_>>()?;
         let (&zoom, &lat, &lon) = (nums.first()?, nums.get(1)?, nums.get(2)?);
         if nums.len() > 5 || !(0.0..=30.0).contains(&zoom) || !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
@@ -370,6 +376,12 @@ pub(crate) fn parse_link(text: &str) -> Option<MapLink> {
         let (bearing, pitch) = (nums.get(3).copied().unwrap_or(0.0), nums.get(4).copied().unwrap_or(0.0));
         Some(MapLink { zoom, lat, lon, bearing, pitch })
     })
+}
+
+/// Whether `text` holds a map position [`parse_link`] reads (the web app asks before going to
+/// its own address's fragment, which may be something else).
+pub fn is_map_link(text: &str) -> bool {
+    parse_link(text).is_some()
 }
 
 /// Ground metres per pixel at MapLibre zoom `zoom` and latitude `lat`.
@@ -385,14 +397,16 @@ pub(crate) fn link_of(map: &Map) -> Option<String> {
     let c = flat.inverse(map.camera.center)?;
     let ground = map.camera.res * flat.ground_per_unit(map.camera.center);
     let merc = ground / c.y.clamp(-rustgis_geom::MAX_LAT, rustgis_geom::MAX_LAT).to_radians().cos().abs().max(1e-9);
-    let zoom = (std::f64::consts::TAU * rustgis_geom::MERCATOR_R / (512.0 * merc)).log2();
+    // Within what a link is read back with (a large window shows the world below zoom 0).
+    let zoom = (std::f64::consts::TAU * rustgis_geom::MERCATOR_R / (512.0 * merc)).log2().clamp(0.0, 30.0);
     if !(zoom.is_finite() && c.x.is_finite() && c.y.is_finite()) {
         return None;
     }
     let (bearing, pitch) = (map.camera.bearing, map.camera.pitch);
     let round = |v: f64, places: i32| {
         let k = 10f64.powi(places);
-        (v * k).round() / k
+        // + 0.0 turns a rounded -0 into 0.
+        (v * k).round() / k + 0.0
     };
     let mut hash = format!("#{}/{}/{}", round(zoom, 2), round(c.y, 5), round(c.x, 5));
     if bearing.abs() >= 0.05 || pitch.abs() >= 0.05 {

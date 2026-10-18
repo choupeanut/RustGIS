@@ -132,12 +132,25 @@ pub fn start() {
                         }
                     }
                     let links = if project.is_some() { "" } else { q.as_str() };
+                    // `#zoom/lat/lon/bearing/pitch` (a MapLibre map link) places the map; without
+                    // it, `?extent=` or `?data=`, the first `?style=` opens at the style's own view.
+                    let hash = hash();
+                    // A fragment that is no map position (`#about`) is left alone.
+                    let linked = project.is_none() && rustgis_engine::cmd::navigate::is_map_link(&hash) && {
+                        let r = app.run("map.goToLink", serde_json::json!({"url": hash}));
+                        if let Err(e) = &r {
+                            log::warn!("{hash}: {e}");
+                        }
+                        r.is_ok()
+                    };
+                    let placed = linked || param(&q, "extent").is_some_and(|e| !e.is_empty()) || !params(links, "data", 1).is_empty();
                     // `?data=<url>` (repeatable) adds data by web address, downloaded in the
                     // background, the map zoomed to the first file that lands with something to
-                    // show; `?style=<url>` adds a MapLibre style; `?tiles=<template>` a tile
-                    // layer. Links that share a map. What fails is said in a notice.
+                    // show (unless a `#` map link placed it); `?style=<url>` adds a MapLibre style;
+                    // `?tiles=<template>` a tile layer. Links that share a map. What fails is said
+                    // in a notice.
                     for url in params(links, "data", 16) {
-                        if let Err(e) = app.run("ui.addUrl", serde_json::json!({"url": url, "zoom": true})) {
+                        if let Err(e) = app.run("ui.addUrl", serde_json::json!({"url": url, "zoom": !linked})) {
                             app.session.notify(format!("?data={url}: {e}"), true);
                         }
                     }
@@ -154,17 +167,6 @@ pub fn start() {
                     if stac.len() > 1 {
                         app.session.notify(format!("only the first ?stac= link is opened ({} more were left out)", stac.len() - 1), false);
                     }
-                    // `#zoom/lat/lon/bearing/pitch` (a MapLibre map link) places the map; without
-                    // it, `?extent=` or `?data=`, the first `?style=` opens at the style's own view.
-                    let hash = hash();
-                    let linked = project.is_none() && !hash.trim_start_matches('#').is_empty() && {
-                        let r = app.run("map.goToLink", serde_json::json!({"url": hash}));
-                        if let Err(e) = &r {
-                            log::warn!("{hash}: {e}");
-                        }
-                        r.is_ok()
-                    };
-                    let placed = linked || param(&q, "extent").is_some_and(|e| !e.is_empty()) || !params(links, "data", 1).is_empty();
                     let mut style_view = project.is_none() && !placed;
                     for (key, kind) in [("style", Some("style")), ("tiles", None)] {
                         for url in params(links, key, 8) {
