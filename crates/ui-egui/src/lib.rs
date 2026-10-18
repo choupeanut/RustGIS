@@ -2517,6 +2517,9 @@ impl RustGisApp {
                 self.session.notify(e, true);
             }
         }
+        // Plugin commands that waited for `host.fetch` answers (the browser) run again once
+        // they are in; their errors are notices already.
+        let _ = self.session.poll_plugin_retries();
         sqlpane::poll(self, ctx);
         self.poll_service();
         serviceui::poll(self, ctx);

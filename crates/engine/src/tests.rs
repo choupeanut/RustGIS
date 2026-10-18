@@ -2541,6 +2541,146 @@ fn plugin_tile_layers_need_network() {
     rustgis_plugins::unload("eng-tiles-net");
 }
 
+/// Serves documents for `host.fetch` on a local port, counting the requests: `/json`, `/text`,
+/// `/latin1` (not UTF-8), `/big` (over the size cap), `/inward` (a redirect to a forbidden
+/// address) and `/missing` (404). Returns the base address and the count.
+fn serve_documents() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = count.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let read = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..read]).to_string();
+            let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let (status, extra, body): (&str, String, Vec<u8>) = match path.as_str() {
+                p if p.starts_with("/json") => {
+                    ("200 OK", String::new(), br#"{"data":[1],"select":[49059],"size":[17053],"valid":true}"#.to_vec())
+                }
+                "/text" => ("200 OK", String::new(), b"plain text".to_vec()),
+                "/latin1" => ("200 OK", String::new(), b"caf\xe9".to_vec()),
+                "/big" => ("200 OK", String::new(), vec![b'x'; crate::cmd::plugins::fetch::MAX_BYTES + 10]),
+                "/inward" => ("302 Found", "Location: http://169.254.169.254/latest/meta-data/\r\n".into(), Vec::new()),
+                _ => ("404 Not Found", String::new(), b"no".to_vec()),
+            };
+            let _ = write!(s, "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = s.write_all(&body);
+        }
+    });
+    (format!("http://{addr}"), count)
+}
+
+/// Lets this thread's plugin calls fetch from this computer (the test server) and, when `wait`
+/// is off, fetch as the browser does.
+fn fetch_mode(local: bool, wait: bool) {
+    crate::cmd::plugins::fetch::TEST.with(|t| t.set((local, wait)));
+}
+
+/// `host.fetch` needs `network`, takes only public http(s) addresses (redirects too), caps the
+/// size, wants UTF-8, answers JSON parsed, and keeps answers.
+#[test]
+fn plugins_fetch_documents_with_network() {
+    let mut s = world();
+    plugin("eng-fetch-none", &["edit"]);
+    let e = forward(&mut s, "eng-fetch-none", "host.fetch", json!({"url": "https://example.com/x.json"})).unwrap_err();
+    assert!(e.contains("'network' permission"), "{e}");
+    rustgis_plugins::unload("eng-fetch-none");
+
+    plugin("eng-fetch", &["network"]);
+    // Never this computer or the local network, by default; never another scheme.
+    for bad in [
+        json!({}),
+        json!({"url": 7}),
+        json!({"url": "file:///etc/passwd"}),
+        json!({"url": "s3://bucket/key"}),
+        json!({"url": "ftp://example.com/"}),
+        json!({"url": "http://127.0.0.1:9/x"}),
+        json!({"url": "http://localhost/x"}),
+        json!({"url": "http://192.168.0.1/"}),
+        json!({"url": "http://169.254.169.254/latest/meta-data/"}),
+    ] {
+        assert!(forward(&mut s, "eng-fetch", "host.fetch", bad.clone()).is_err(), "{bad}");
+    }
+    // Hostile parameters are errors, never a crash.
+    for junk in [Value::Null, json!([1, 2]), json!({"url": null}), json!({"url": {"nested": 1}}), json!({"url": "x".repeat(100_000)})] {
+        assert!(forward(&mut s, "eng-fetch", "host.fetch", junk.clone()).is_err(), "{junk}");
+    }
+
+    let (base, count) = serve_documents();
+    fetch_mode(true, true);
+    let a = forward(&mut s, "eng-fetch", "host.fetch", json!({"url": format!("{base}/json?r=1")})).unwrap();
+    assert_eq!(a["json"]["select"][0], 49059);
+    assert!(a["text"].as_str().unwrap().starts_with('{'));
+    let n = count.load(std::sync::atomic::Ordering::SeqCst);
+    // Asked again: the cache answers.
+    let again = forward(&mut s, "eng-fetch", "host.fetch", json!({"url": format!("{base}/json?r=1#ignored")})).unwrap();
+    assert_eq!(again, a);
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), n, "answered from the cache");
+    let t = forward(&mut s, "eng-fetch", "host.fetch", json!({"url": format!("{base}/text")})).unwrap();
+    assert_eq!(t["text"], "plain text");
+    assert!(t.get("json").is_none());
+    for (path, why) in [("/latin1", "UTF-8"), ("/big", "larger than"), ("/missing", "404"), ("/inward", "never fetched")] {
+        let e = forward(&mut s, "eng-fetch", "host.fetch", json!({"url": format!("{base}{path}")})).unwrap_err();
+        assert!(e.contains(why), "{path}: {e}");
+    }
+    fetch_mode(false, true);
+    rustgis_plugins::unload("eng-fetch");
+}
+
+/// Where nothing may wait (the browser), `host.fetch` answers pending: the command is undone,
+/// quietly, and runs again once the answer is in, when the cache answers.
+#[test]
+fn plugin_fetches_run_the_command_again_when_they_land() {
+    let mut s = world();
+    plugin("eng-fetch-web", &["network", "edit"]);
+    let (base, _) = serve_documents();
+    fetch_mode(true, false);
+    let url = format!("{base}/json?web=1");
+    let notices = s.notice_mark();
+    let undo = s.undo.len();
+    let r = forward(&mut s, "eng-fetch-web", "host.fetch", json!({"url": url})).unwrap();
+    assert_eq!(r["pending"], true);
+    assert_eq!(r["fetching"][0], url.as_str());
+    assert_eq!(s.undo.len(), undo, "no undo step for a run that waits");
+    assert!(s.notices_since(notices).is_empty(), "{:?}", s.notices_since(notices));
+    let t0 = std::time::Instant::now();
+    let ran = loop {
+        let ran = s.poll_plugin_retries();
+        if !ran.is_empty() || t0.elapsed() > std::time::Duration::from_secs(10) {
+            break ran;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(ran.len(), 1);
+    assert_eq!(ran[0].0, "plugin:eng-fetch-web/f");
+    assert_eq!(ran[0].1.as_ref().unwrap()["json"]["valid"], true);
+    assert!(s.poll_plugin_retries().is_empty(), "run once");
+    // A failed fetch is given to the run again as its error.
+    let r = forward(&mut s, "eng-fetch-web", "host.fetch", json!({"url": format!("{base}/missing")})).unwrap();
+    assert_eq!(r["pending"], true);
+    let t0 = std::time::Instant::now();
+    let ran = loop {
+        let ran = s.poll_plugin_retries();
+        if !ran.is_empty() || t0.elapsed() > std::time::Duration::from_secs(10) {
+            break ran;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(ran[0].1.as_ref().unwrap_err().contains("404"), "{:?}", ran[0].1);
+    // A command forever waiting gives up.
+    s.retry_tries = crate::cmd::plugins::fetch::MAX_RETRIES;
+    let e = forward(&mut s, "eng-fetch-web", "host.fetch", json!({"url": format!("{base}/json?web=2")})).unwrap_err();
+    assert!(e.contains("gave up"), "{e}");
+    s.retry_tries = 0;
+    fetch_mode(false, true);
+    rustgis_plugins::unload("eng-fetch-web");
+}
+
 #[test]
 fn plugin_tools_run_in_the_geoprocessing_pane() {
     let mut s = world();

@@ -344,14 +344,20 @@ pub fn download_blocking(url: &str) -> Result<Vec<u8>, String> {
 /// Like [`download_blocking`], but reads at most `max` bytes plus one overflow sentinel.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn download_blocking_limited(url: &str, max: usize) -> Result<Vec<u8>, String> {
-    crate::address::check(url, None)?;
-    native::get(&native::download_agent(BLOCKING_TIMEOUT), &download_address(url, max)).map_err(|e| {
+    download_blocking_within(url, max, BLOCKING_TIMEOUT).map_err(|e| {
         if e.contains("timeout") || e.contains("timed out") {
             format!("{e} (a large file: add it with Add Data › From URL, which downloads in the background)")
         } else {
             e
         }
     })
+}
+
+/// Like [`download_blocking_limited`], giving up after `timeout` (with the bare error).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn download_blocking_within(url: &str, max: usize, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
+    crate::address::check(url, None)?;
+    native::get(&native::download_agent(timeout), &download_address(url, max))
 }
 
 /// Fetches an address's bytes, uncached (through the browser's fetcher, or the worker threads).

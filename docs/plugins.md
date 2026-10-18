@@ -55,11 +55,12 @@ described below, and RustGIS checks each one:
   if the command fails.
 - With the **`files`** permission, it can run commands that read or write files the user names,
   and its tools can take a file the user picks (a [`file` parameter](#file-parameters)).
-- With the **`network`** permission (and `edit`), it can add web tile layers (`map.addTiles`).
-  The map then loads tiles from the addresses the plugin gave, and an address can carry what the
-  plugin read from the project, so this is a permission of its own. A command that would bring
-  in a tile layer some other way (importing a map file) has it taken out again without
-  `network`.
+- With the **`network`** permission, it can reach the web: read a small document from a web
+  address ([`host.fetch`](#fetching-a-document)) and run the commands that fetch (adding data
+  or services by their address). With `edit` too, it can add web tile layers (`map.addTiles`).
+  The addresses are the plugin's choice and can carry what it read from the project, so this is
+  a permission of its own. A command that would bring in a tile layer some other way (importing
+  a map file) has it taken out again without `network`.
 - No plugin may run the user's scripts, tasks or models, install or locate other software,
   manage plugins, replace the project, or step through undo history.
 
@@ -245,6 +246,7 @@ Inside a request, `host::call(op, params)` sends one of these to RustGIS:
 | `host.view` | `{center: [lon, lat], scale, projection}` |
 | `host.notify` `{text, error?}` | shows a message in the status bar |
 | `host.addLayer` `{name, geojson}` | adds a layer (`edit`) |
+| `host.fetch` `{url}` | `{url, text, json?}`: the document at a web address (`network`; see [Fetching a document](#fetching-a-document)) |
 | `map.addTiles` `{url, kind?, name?, attribution?, maxZoom?, overlay?, replace?, blend?}` | adds a web tile layer (`edit` and `network`) |
 | any command id (`layer.zoomTo`, `select.byAttributes`, `layer.symbology`…) | what the command returns, within the plugin's permissions |
 
@@ -255,6 +257,34 @@ archive, a cloud-optimised GeoTIFF or a FlatGeobuf or GeoParquet read in place i
 as elsewhere.
 
 `rustgis-cli commands` lists every command id and its parameters.
+
+#### Fetching a document
+
+`host.fetch {"url": "https://…"}` reads a small text document, such as a web API's JSON
+answer, with a GET request. It needs the `network` permission. The answer is
+`{"url", "text", "json"?}`: `url` is the address fetched, `text` the document, and `json` the
+document parsed when it is a JSON object or array.
+
+- Only `http://` and `https://` addresses on the internet: not this computer, the local network
+  or cloud metadata addresses, and no redirect may lead there or from `https` to `http`. Names
+  are judged as written, not resolved. Requests carry no credentials (an S3 connection's
+  included) and no headers of the plugin's.
+- At most 2 MB, in UTF-8 (a byte-order mark is dropped). An answer that isn't a success (404,
+  500…) is an error ending in `HTTP <status>`.
+- Answers are kept for 10 minutes (up to 256 documents and 16 MB in all) while RustGIS runs,
+  so asking for the same address again costs nothing. Errors are given once, never kept.
+- On the desktop and the command line the request waits for the answer: at most 20 seconds for
+  one, and 60 seconds for all the fetches of one plugin call. A call makes at most 64 fetches.
+- In the web app nothing may wait. A fetch that isn't kept yet answers
+  `{"pending": true, "url"}` and starts in the background. The command should then return
+  straight away: RustGIS undoes what the call did (its notices stay), and runs the command
+  again with the same parameters once every pending answer has landed (up to 8 per call), when
+  `host.fetch` answers from what was kept. A command that walks a chain of documents, each
+  address taken from the one before, runs once per step, up to 64 times. The browser follows
+  redirects itself, and the server must allow requests from web pages (CORS).
+
+The plugins SDK may offer this as a `host::fetch` helper; until then, use
+`host::call("host.fetch", json!({"url": url}))`.
 
 Tools work differently. A tool receives its layer parameters' features as GeoJSON (only the
 selected features when a layer has a selection), and its `file` parameters' files. It returns new layers, standalone tables or a

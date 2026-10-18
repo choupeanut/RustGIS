@@ -3,7 +3,8 @@
 //! A plugin command (`plugin:<plugin>/<command>`) runs through [`Session::run`] like any other:
 //! one undo step, restored if it fails. While it runs, the plugin reaches the project through
 //! the requests [`Bridge`] answers: RustGIS commands by id, and a few `host.*` requests for
-//! reading layers. What it may run depends on the permissions it declared.
+//! reading layers and fetching documents (`host.fetch`, see [`fetch`]). What it may run depends
+//! on the permissions it declared.
 
 use std::sync::Arc;
 
@@ -12,6 +13,9 @@ use serde_json::{Value, json};
 
 use super::{b, ps, uint};
 use crate::{CmdResult, CommandSpec as C, Session};
+
+#[path = "plugin_fetch.rs"]
+pub mod fetch;
 
 pub fn commands() -> Vec<C> {
     vec![
@@ -314,6 +318,8 @@ fn refused(plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
 struct Bridge<'a> {
     s: &'a mut Session,
     plugin: Arc<Plugin>,
+    /// What this call fetched (`host.fetch`).
+    fetches: fetch::Calls,
 }
 
 impl Bridge<'_> {
@@ -449,6 +455,11 @@ impl Host for Bridge<'_> {
                 Ok(Value::Null)
             }
             "host.addLayer" => self.add_layer(params),
+            "host.fetch" => {
+                // The address, and what the plugin answers, can carry what it read from the project.
+                self.need(Permission::Network, "fetch from the web")?;
+                self.fetches.fetch(params)
+            }
             _ if op.starts_with("host.") => Err(format!("unknown request '{op}'")),
             _ => self.command(op, params),
         }
@@ -471,6 +482,26 @@ impl Session {
         let label = leak(&cmd.decl.label);
         let mutates = cmd.mutates();
         let plugin = cmd.plugin.clone();
-        self.guarded(label, mutates, |s| rustgis_plugins::run_command(&cmd, &mut Bridge { s, plugin }, params))
+        let mut pending = Vec::new();
+        let res = self.guarded(label, mutates, |s| {
+            let mut bridge = Bridge { s, plugin, fetches: fetch::Calls::default() };
+            let res = rustgis_plugins::run_command(&cmd, &mut bridge, params);
+            if bridge.fetches.pending.is_empty() {
+                return res;
+            }
+            // Waiting for a fetch (the browser): whatever the call did is undone, quietly, and
+            // the command runs again from the start once the answers are in.
+            pending = std::mem::take(&mut bridge.fetches.pending);
+            bridge.s.quiet_failure = true;
+            Err(String::new())
+        });
+        if pending.is_empty() {
+            return res;
+        }
+        let res = self.retry_plugin(id, params, pending);
+        if let Err(e) = &res {
+            self.notify(e.clone(), true);
+        }
+        res
     }
 }

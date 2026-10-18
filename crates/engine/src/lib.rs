@@ -342,6 +342,13 @@ pub struct Session {
     /// Set by [`Session::request_url`] for [`Session::guarded`]: the command running changed
     /// nothing, it only left a request (a plugin's own answer can't claim that).
     request_only: bool,
+    /// Plugin commands waiting for their `host.fetch` answers to run again (the browser).
+    pub(crate) plugin_retries: Vec<cmd::plugins::fetch::Retry>,
+    /// How many times the plugin command running now has been run again for its fetches.
+    pub(crate) retry_tries: u32,
+    /// Set for [`Session::guarded`] by a command whose failure is no news (a plugin command
+    /// undone to run again once its fetches land): no error notice.
+    pub(crate) quiet_failure: bool,
     /// Query results the app ran off the frame (the SQL pane), waiting for `layer.addSql {"ran"}`:
     /// the id, the query and database (label) they came from, and the result.
     #[cfg(not(target_arch = "wasm32"))]
@@ -448,6 +455,9 @@ impl Session {
             downloaded: Vec::new(),
             url_requests: Vec::new(),
             request_only: false,
+            plugin_retries: Vec::new(),
+            retry_tries: 0,
+            quiet_failure: false,
             #[cfg(not(target_arch = "wasm32"))]
             sql_results: Vec::new(),
         }
@@ -635,7 +645,10 @@ impl Session {
         if res.is_err() {
             self.url_requests.truncate(requests);
         }
-        if let Err(e) = &res {
+        let quiet = std::mem::take(&mut self.quiet_failure);
+        if let Err(e) = &res
+            && !quiet
+        {
             self.notify(e.clone(), true);
         }
         self.fix_active_layer();
@@ -699,6 +712,7 @@ impl Session {
         self.downloading.clear();
         self.downloaded.clear();
         self.url_requests.clear();
+        self.plugin_retries.clear();
         #[cfg(not(target_arch = "wasm32"))]
         self.sql_results.clear();
     }
