@@ -271,11 +271,21 @@ fn style(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Changes one graphic, named by layer and row, as `graphics.style` changes the selected ones.
 fn edit(s: &mut Session, p: &Value) -> CmdResult {
+    // Never the active layer: a row means nothing without the layer it was read from.
+    if !p.get("layer").is_some_and(|v| v.is_number() || v.is_string()) {
+        return Err("layer is required".into());
+    }
     let id = s.layer_id(p)?;
-    let n = s.map().layer(id).filter(|l| l.graphics).map(|l| l.dataset.features.len()).ok_or("that isn't a graphics layer")?;
-    let row = uint(p, "row").and_then(|r| usize::try_from(r).ok()).filter(|r| *r < n).ok_or("no graphic at that row")?;
-    if ps(p, "text").is_some_and(|t| t.trim().is_empty()) {
-        return Err("text is required".into());
+    let l = s.map().layer(id).filter(|l| l.graphics).ok_or("that isn't a graphics layer")?;
+    let row =
+        uint(p, "row").and_then(|r| usize::try_from(r).ok()).filter(|r| *r < l.dataset.features.len()).ok_or("no graphic at that row")?;
+    if let Some(t) = ps(p, "text") {
+        if graphics::kind(&l.dataset, row) != "text" {
+            return Err("only a text graphic has text".into());
+        }
+        if t.chars().take(2000).all(char::is_whitespace) {
+            return Err("text is required".into());
+        }
     }
     restyle(s, p, Some((id, row)))
 }

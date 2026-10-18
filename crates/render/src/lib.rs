@@ -1513,14 +1513,7 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
     let distance = viewing_distance(map.ground_res_at(&view.camera), view.height);
     // Graphics text: always drawn, and other labels keep clear of it.
     let mut fixed_labels: Vec<PlacedLabel> = Vec::new();
-    let tokens = rustgis_map::graphics::TokenValues {
-        map: map.name.clone(),
-        scale,
-        crs: map.projection.label(),
-        layers: map.layers.iter().filter(|l| !l.graphics).count(),
-        center: map.center_lonlat(),
-        now: web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-    };
+    let tokens = rustgis_map::graphics::TokenValues::of(map, scale);
     let n_layers = map.layers.len();
     // Masks: layers shown only inside another layer's polygons, or left of the swipe divider.
     let masks = layer_masks(map, &ctx, w, h, &flat, &key);

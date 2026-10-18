@@ -147,5 +147,5 @@ then pick a PNG or JPEG image to stretch over it. Tools return to Explore after 
 unless Keep Tool is on. Each graphic keeps its own fill, outline, width and text size in the
 layer's attributes, so you can edit them in the attribute table or with `graphics.style`. To
 change a text once it is placed, double-click it (with Explore or Select) or right-click it ›
-**Edit Text…**: the dialog opens with its text and size, and **Save** changes that text only, as
-one undo step (`graphics.edit` does the same by layer and row).
+**Edit Text…**: the dialog opens with its text and size, and **Save** changes that graphic's text
+and size only, as one undo step (`graphics.edit` does the same by layer and row).

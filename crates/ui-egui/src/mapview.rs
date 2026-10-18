@@ -822,17 +822,19 @@ pub(crate) fn lonlat_to_screen(app: &RustGisApp, rect: Rect, c: Coord) -> Option
     Some(pos2(rect.min.x + x as f32, rect.min.y + y as f32))
 }
 
-/// The text graphic drawn on top under the screen point `p`, as (layer id, row): one whose text
-/// covers the point (measured before dynamic text is filled in).
+/// The text graphic drawn on top under the screen point `p`, as (layer id, row): one whose text,
+/// with its dynamic values filled in as drawn, covers the point.
 pub(crate) fn text_graphic_at(app: &RustGisApp, ctx: &egui::Context, rect: Rect, p: Pos2) -> Option<(u32, usize)> {
     use rustgis_engine::map::graphics;
     let map = app.session.map();
+    let tokens = graphics::TokenValues::of(map, app.session.scale());
+    // The first layer is drawn on top, and in a layer the last row.
     map.layers.iter().filter(|l| l.graphics && l.visible).find_map(|l| {
         (0..l.dataset.features.len()).rev().find_map(|row| {
-            let text = graphics::label(&l.dataset, row)?;
+            let text = graphics::expand(graphics::label(&l.dataset, row)?, &tokens);
             let at = lonlat_to_screen(app, rect, l.dataset.features.get(row)?.geometry.as_ref()?.label_point()?)?;
             let font = regular(graphics::font_size(&l.dataset, row) * 1.33);
-            let size = ctx.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font, Color32::WHITE).size());
+            let size = ctx.fonts_mut(|f| f.layout_no_wrap(text, font, Color32::WHITE).size());
             Rect::from_center_size(at, size).expand(3.0).contains(p).then_some((l.id, row))
         })
     })
@@ -2241,6 +2243,15 @@ mod tests {
             assert_eq!(text_graphic_at(&app, ui.ctx(), rect, at), hit);
             assert_eq!(text_graphic_at(&app, ui.ctx(), rect, at + vec2(60.0, 0.0)), hit, "on the text, off its anchor");
             assert_eq!(text_graphic_at(&app, ui.ctx(), rect, at + vec2(0.0, 40.0)), None);
+        });
+        out.textures_delta.clear();
+        // Dynamic text is measured as drawn ("1:20,000,000"), wider than its token ("{scale}").
+        let r =
+            app.run("graphics.add", json!({"shape": "text", "points": [[c.x, c.y - 30.0]], "text": "{scale}", "fontSize": 20})).unwrap();
+        let hit = r["layer"].as_u64().zip(r["row"].as_u64()).map(|(l, r)| (l as u32, r as usize));
+        let mut out = egui::Context::default().run_ui(Default::default(), |ui| {
+            let at = lonlat_to_screen(&app, rect, Coord::new(c.x, c.y - 30.0)).unwrap();
+            assert_eq!(text_graphic_at(&app, ui.ctx(), rect, at + vec2(50.0, 0.0)), hit, "on the scale it shows");
         });
         out.textures_delta.clear();
     }

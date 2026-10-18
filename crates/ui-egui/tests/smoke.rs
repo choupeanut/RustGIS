@@ -1048,6 +1048,14 @@ fn a_placed_text_is_edited_in_its_dialog() {
     let d = &h.state().dialogs;
     assert_eq!((d.open, d.mode, d.text.as_str(), d.c.as_str()), (Some("graphicText"), "edit", "Second", "14"));
     h.step();
+    // A mistyped size is said and changes nothing.
+    h.state_mut().dialogs.c = "big".into();
+    h.step();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Save").click();
+    h.step();
+    assert_eq!(h.state().dialogs.open, Some("graphicText"));
+    assert!(h.state().dialogs.error.as_deref().is_some_and(|e| e.contains("Size")), "{:?}", h.state().dialogs.error);
+    assert!(!h.state().session.can_undo() || h.state().session.undo_label() != Some("Edit Graphic"));
     (h.state_mut().dialogs.text, h.state_mut().dialogs.c) = ("Second, edited".into(), "24".into());
     h.step();
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Save").click();

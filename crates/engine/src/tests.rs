@@ -1184,6 +1184,10 @@ fn graphics_draw_shapes_text_and_pictures() {
         json!({"layer": id, "row": 999, "text": "x"}),
         json!({"layer": id, "row": 0.5, "text": "x"}),
         json!({"layer": id, "text": "x"}),
+        json!({"row": text, "text": "x"}),
+        json!({"layer": null, "row": text, "text": "x"}),
+        json!({"layer": id, "row": 0, "text": "not on a rectangle"}),
+        json!({"layer": id, "row": text, "text": format!("{}x", " ".repeat(2000))}),
         json!({"layer": id, "row": text}),
         json!({"layer": "Cities", "row": 0, "text": "x"}),
     ] {

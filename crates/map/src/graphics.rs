@@ -99,6 +99,20 @@ pub struct TokenValues {
     pub now: u64,
 }
 
+impl TokenValues {
+    /// The values a map's dynamic text shows at `scale`, now.
+    pub fn of(map: &crate::Map, scale: f64) -> Self {
+        TokenValues {
+            map: map.name.clone(),
+            scale,
+            crs: map.projection.label(),
+            layers: map.layers.iter().filter(|l| !l.graphics).count(),
+            center: map.center_lonlat(),
+            now: web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        }
+    }
+}
+
 /// Expands dynamic text tokens.
 pub fn expand(text: &str, v: &TokenValues) -> String {
     if !text.contains('{') {
