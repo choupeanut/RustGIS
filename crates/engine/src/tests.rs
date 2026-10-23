@@ -12599,6 +12599,7 @@ fn layer_color_leaves_the_outline_alone() {
     assert_eq!(rgb(symbol(&s).fill), (0x99, 0x66, 0x33), "changing the fill must set the requested RGB");
 }
 
+/// No Fill preserves renderer classes and outlines across persistence and one-step undo/redo.
 #[test]
 fn polygon_no_fill_keeps_classes_and_outlines_and_undoes_as_one_step() {
     use rustgis_map::Symbol;
@@ -12632,6 +12633,7 @@ fn polygon_no_fill_keeps_classes_and_outlines_and_undoes_as_one_step() {
     }
 }
 
+/// Unsupported or missing layers are refused without changing the project.
 #[test]
 fn polygon_no_fill_refuses_other_layers() {
     let mut s = with_raster();

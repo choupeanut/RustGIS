@@ -27,6 +27,7 @@ fn search_layer_command(h: &mut egui_kittest::Harness<'_, RustGisApp>, command: 
     assert!(h.state().ui.command_search.is_none());
 }
 
+/// Both No Fill controls preserve unique-value styling and undo, and stay hidden for points.
 #[test]
 fn polygon_no_fill_is_reachable_from_the_pane_and_the_ribbon() {
     for pane in [true, false] {

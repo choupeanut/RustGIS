@@ -3733,6 +3733,7 @@ pub(crate) fn live_drag(
     }
 }
 
+/// Style ribbon controls for the layer's renderer, fill, outline and marker size.
 fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map::Layer) {
     group(ui, "Drawing", |ui| {
         big(
