@@ -12600,6 +12600,51 @@ fn layer_color_leaves_the_outline_alone() {
 }
 
 #[test]
+fn polygon_no_fill_keeps_classes_and_outlines_and_undoes_as_one_step() {
+    use rustgis_map::Symbol;
+
+    for kind in ["single", "unique", "graduated"] {
+        let mut s = world();
+        let field = if kind == "unique" { "continent" } else { "pop_est" };
+        s.run("layer.symbology", &json!({"layer": "Countries", "type": kind, "field": field})).unwrap();
+        s.run("layer.outline", &json!({"layer": "Countries", "color": "#2376A9CC", "width": 2.5})).unwrap();
+        let renderer = |s: &Session| s.map().layer_by_name("Countries").unwrap().renderer.clone();
+        let before = renderer(&s);
+        // The named polygon layer works even while a point layer is active.
+        s.run("layer.select", &json!({"layer": "Cities"})).unwrap();
+        s.run("layer.noFill", &json!({"layer": "Countries"})).unwrap();
+        let after = renderer(&s);
+        assert_eq!(after.kind_label(), before.kind_label(), "{kind}: classification stays in place");
+        let (old, new) = (before.legend(), after.legend());
+        assert_eq!(new.len(), old.len());
+        for (old, new) in old.iter().zip(&new) {
+            assert_eq!(new.label, old.label);
+            assert_eq!(new.symbol, Symbol { fill: old.symbol.fill.with_alpha(0), ..old.symbol });
+        }
+        let reopened = Project::from_json(&serde_json::to_string(&s.project).unwrap()).unwrap();
+        assert_eq!(reopened.map().layer_by_name("Countries").unwrap().renderer, after);
+        s.run("edit.undo", &Value::Null).unwrap();
+        assert_eq!(renderer(&s), before, "{kind}: one undo restores every symbol");
+        s.run("edit.redo", &Value::Null).unwrap();
+        assert_eq!(renderer(&s), after);
+        s.run("layer.noFill", &json!({"layer": "Countries"})).unwrap();
+        assert_eq!(renderer(&s), after, "No Fill is idempotent");
+    }
+}
+
+#[test]
+fn polygon_no_fill_refuses_other_layers() {
+    let mut s = with_raster();
+    let raster = s.active_layer.unwrap();
+    for layer in [json!("Cities"), json!("Rivers"), json!(raster), json!(99999)] {
+        let before = serde_json::to_value(&s.project).unwrap();
+        assert!(s.run("layer.noFill", &json!({"layer": layer})).is_err());
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+    }
+    assert!(Session::new(Project::default()).run("layer.noFill", &Value::Null).is_err());
+}
+
+#[test]
 fn buffer_point_adds_only_the_buffer() {
     let mut s = world();
     let before = s.map().layers.len();

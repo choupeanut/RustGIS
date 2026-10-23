@@ -3354,6 +3354,12 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
     });
     ui.add_space(8.0);
+    if g == GeometryType::Polygon && !l.graphics {
+        if ui.button(tl!("No Fill")).on_hover_text(tl!("Draw only polygon outlines, keeping their colors and widths.")).clicked() {
+            let _ = app.run("layer.noFill", Value::Null);
+        }
+        ui.add_space(6.0);
+    }
     let numeric: Vec<String> = l.dataset.fields.iter().filter(|f| f.ty.is_numeric()).map(|f| f.name.clone()).collect();
     let all: Vec<String> = l.dataset.fields.iter().map(|f| f.name.clone()).collect();
     match &l.renderer {

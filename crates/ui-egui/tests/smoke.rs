@@ -28,6 +28,37 @@ fn search_layer_command(h: &mut egui_kittest::Harness<'_, RustGisApp>, command: 
 }
 
 #[test]
+fn polygon_no_fill_is_reachable_from_the_pane_and_the_ribbon() {
+    for pane in [true, false] {
+        let mut h = harness();
+        h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+        h.state_mut().run("layer.symbology", json!({"type": "unique", "field": "continent"})).unwrap();
+        h.state_mut().run("layer.outline", json!({"color": "#2E6B4F", "width": 2})).unwrap();
+        let symbol =
+            |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer_by_name("Countries").unwrap().renderer.base_symbol();
+        let before = symbol(&h);
+        if pane {
+            h.state_mut().run("ui.pane.symbology", json!(null)).unwrap();
+        } else {
+            h.state_mut().ui.tab = "Style".into();
+        }
+        h.run_steps(6);
+        h.get_by_label("No Fill").click();
+        h.run_steps(3);
+        let after = symbol(&h);
+        assert_eq!(after.fill.a(), 0);
+        assert_eq!(after.stroke, before.stroke);
+        assert_eq!(after.stroke_width, before.stroke_width);
+        assert_eq!(h.state().session.map().layer_by_name("Countries").unwrap().renderer.kind_label(), "Unique Values");
+        h.state_mut().run("edit.undo", json!(null)).unwrap();
+        assert_eq!(symbol(&h), before);
+        h.state_mut().run("layer.select", json!({"layer": "Cities"})).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("No Fill").is_none(), "points must keep their fill");
+    }
+}
+
+#[test]
 fn command_search_adds_tiles_only_after_valid_dialog_submission() {
     let mut h = harness();
     search_layer_command(&mut h, "map.addTiles");

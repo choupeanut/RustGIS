@@ -3804,6 +3804,17 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                     }
                     ui.label(egui::RichText::new(tl!("Size")).size(11.5));
                 });
+            } else if layer.geometry_type() == GeometryType::Polygon && !layer.graphics {
+                small(
+                    ui,
+                    app,
+                    "no_fill",
+                    "No Fill",
+                    "Draw only polygon outlines, keeping their colors and widths.",
+                    "layer.noFill",
+                    Value::Null,
+                    false,
+                );
             }
         });
     });
