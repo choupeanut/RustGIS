@@ -4,6 +4,7 @@ use egui_kittest::kittest::Queryable;
 use rustgis_ui_egui::RustGisApp;
 use serde_json::json;
 
+/// Builds a headless World Atlas UI for interaction tests.
 fn harness() -> egui_kittest::Harness<'static, RustGisApp> {
     egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 860.0)).with_max_steps(64).build_ui_state(
         |ui, app: &mut RustGisApp| {
@@ -15,6 +16,7 @@ fn harness() -> egui_kittest::Harness<'static, RustGisApp> {
     )
 }
 
+/// Runs a layer command through Command Search and checks that the search closes.
 fn search_layer_command(h: &mut egui_kittest::Harness<'_, RustGisApp>, command: &str) {
     h.state_mut().ui.command_search = Some(command.into());
     for _ in 0..3 {
