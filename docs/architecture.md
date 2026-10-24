@@ -60,8 +60,9 @@ browser and the CLI, where callers keep a secret for the session only, as before
   thread, never every frame, and keep the value in memory for the session. Don't access one
   account from two threads at once.
   The Assistant queues legacy API-key migrations once at startup and serializes its keychain
-  reads, writes and deletions on a worker. It removes a legacy preference only after a
-  successful write, and never writes new API keys to desktop preferences.
+  reads, writes and deletions on a worker. An existing keychain key takes precedence over a
+  legacy preference. The preference is removed only after a successful read of that key or a
+  successful migration write; new API keys are never written to desktop preferences.
 - **macOS.** The system asks again for access when the app's code signature changes, which
   happens with unsigned or re-signed builds.
 - **Tests.** Use `MemorySecrets`, and `MemorySecrets::failing(..)` for error paths. The desktop

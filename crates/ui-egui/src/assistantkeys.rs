@@ -77,13 +77,13 @@ fn perform(job: Job) -> Completed {
     let reading = matches!(job.action, Action::Load) && job.legacy.is_none();
     let migrating = matches!(job.action, Action::Load) && job.legacy.is_some();
     let (result, key) = match job.action {
-        Action::Load => match &job.legacy {
-            Some(key) => (job.store.save(&account, key).map(|_| Status::Stored), Some(key.clone())),
-            None => match job.store.load(&account) {
-                Ok(Some(key)) => (Ok(Status::Stored), Some(key)),
-                Ok(None) => (Ok(Status::Session), None),
-                Err(error) => (Err(error), None),
+        Action::Load => match job.store.load(&account) {
+            Ok(Some(key)) => (Ok(Status::Stored), Some(key)),
+            Ok(None) => match &job.legacy {
+                Some(key) => (job.store.save(&account, key).map(|_| Status::Stored), Some(key.clone())),
+                None => (Ok(Status::Session), None),
             },
+            Err(error) => (Err(error), None),
         },
         Action::Save(Some(key)) => (job.store.save(&account, &key).map(|_| Status::Stored), None),
         Action::Save(None) => (job.store.delete(&account).map(|_| Status::Session), None),
@@ -318,6 +318,46 @@ mod tests {
         }
     }
 
+    /// A stale plaintext copy must never replace a key already saved in the system store.
+    #[test]
+    fn migration_prefers_an_existing_stored_key_over_a_legacy_copy() {
+        let ctx = egui::Context::default();
+        let store = Arc::new(MemorySecrets::new());
+        store.save("assistant/custom", &Secret::new("stored-newer")).unwrap();
+        let mut keys = Keys::default();
+        assert_eq!(keys.load("custom", "", Some("legacy-older".into()), true, Some(store.clone()), &ctx), "legacy-older");
+        assert_eq!(settle(&mut keys, "custom"), vec![("custom".into(), Secret::new("legacy-older"))]);
+        assert_eq!(keys.key("custom"), Some("stored-newer"));
+        assert_eq!(store.load("assistant/custom").unwrap(), Some(Secret::new("stored-newer")));
+        assert!(matches!(keys.status("custom"), Some(Status::Stored)));
+    }
+
+    /// A successful empty read does not authorize clearing plaintext when its migration write fails.
+    #[test]
+    fn migration_preserves_legacy_when_the_write_is_denied() {
+        struct RejectsWrites;
+        impl SecretStore for RejectsWrites {
+            fn load(&self, _account: &str) -> Result<Option<Secret>, SecretError> {
+                Ok(None)
+            }
+
+            fn save(&self, _account: &str, _key: &Secret) -> Result<(), SecretError> {
+                Err(SecretError::Denied)
+            }
+
+            fn delete(&self, _account: &str) -> Result<(), SecretError> {
+                Ok(())
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut keys = Keys::default();
+        keys.load("custom", "", Some("legacy".into()), true, Some(Arc::new(RejectsWrites)), &ctx);
+        assert!(settle(&mut keys, "custom").is_empty());
+        assert_eq!(keys.key("custom"), Some("legacy"));
+        assert!(matches!(keys.status("custom"), Some(Status::Failed { error: SecretError::Denied, legacy: true, .. })));
+    }
+
     /// New keys stay in memory on failure, while environment values are never saved.
     #[test]
     fn remembering_excludes_environment_and_empty_keys_and_handles_missing_stores() {
@@ -407,8 +447,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut keys = Keys::default();
         assert_eq!(keys.load("custom", "environment", None, true, Some(store.clone()), &ctx), "environment");
+        assert!(keys.loading("custom"));
         keys.edit("custom", "new");
+        assert!(!keys.loading("custom"), "typing a session key must unblock requests before the read finishes");
         keys.save("custom", Some(Secret::new("new")), None, Some(store.clone()), &ctx);
+        assert!(!keys.loading("custom"), "a queued save must not block requests with the edited key");
         keys.edit("custom", "new");
         keys.save("custom", None, None, Some(store.clone()), &ctx);
         release.send(()).unwrap();

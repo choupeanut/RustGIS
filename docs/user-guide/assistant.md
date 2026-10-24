@@ -279,9 +279,10 @@ keychain (macOS Keychain, Windows Credential Manager, or the Secret Service on L
 the key or unticking **Remember** deletes the saved key; a failed deletion is shown in settings.
 Keys from the environment are never saved. If the keychain is unavailable, locked, or access
 is refused, a new key stays in memory for this session and the settings explain why it was not
-remembered. Existing keys in the preferences keep working: they move into the keychain when
-the app starts after upgrading, and each plaintext preference is cleared only after the store
-accepts it. If migration fails, the old preference is retained and the unencrypted-storage
+remembered. On upgrade, an existing keychain key takes precedence over an old key in the
+preferences; otherwise the app moves the old key into the keychain. The plaintext preference
+is cleared only after the keychain key is read or the old key is saved successfully. If either
+operation fails, the old preference is retained and the unencrypted-storage
 warning stays visible. In the web app, **Remember** still saves the key unencrypted in the
 browser's storage, with a note in settings.
 A ChatGPT sign-in is kept in `chatgpt-auth.json` in the app's settings folder (owner-only on
