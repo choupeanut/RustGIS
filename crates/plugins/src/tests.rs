@@ -162,6 +162,54 @@ fn bad_packages_are_refused() {
     assert!(crate::load(Package::from_zip(&e).unwrap(), "t").unwrap_err().contains("doesn't provide"));
 }
 
+/// Catalog plugins can cross the old limit, reach the new one and run their last command.
+#[test]
+fn plugins_accept_up_to_256_commands() {
+    let wasm = testing::wasm();
+    let with_commands = |count: usize| {
+        json!({"id": "unit-command-limit", "name": "Catalog", "version": "1.0.0",
+            "commands": (0..count).map(|i| json!({"id": format!("h{i}"), "label": format!("Layer {i}")})).collect::<Vec<_>>()})
+    };
+    for count in [64, 65, 256] {
+        let text = with_commands(count).to_string();
+        let zip = testing::zip_of(&[("plugin.json", text.as_bytes()), ("plugin.wasm", &wasm)]);
+        let pkg = Package::from_zip(&zip).unwrap();
+        assert_eq!(pkg.manifest.commands.len(), count);
+        if count == 256 {
+            crate::load(pkg, "test").unwrap();
+            let cmd = crate::command("plugin:unit-command-limit/h255").unwrap();
+            assert_eq!(crate::run_command(&cmd, &mut Recorder::default(), &json!({})).unwrap(), json!({"hello": "world"}));
+            assert!(crate::unload("unit-command-limit"));
+        }
+    }
+    let e = Manifest::parse(&with_commands(257).to_string()).unwrap_err();
+    assert!(e.contains("at most 256 commands and 64 tools"), "{e}");
+
+    // Even a large catalog still needs unique command ids.
+    let mut repeated = with_commands(256);
+    repeated["commands"][255]["id"] = json!("h0");
+    let e = Manifest::parse(&repeated.to_string()).unwrap_err();
+    assert!(e.contains("command id 'h0' is invalid or repeated"), "{e}");
+}
+
+/// More commands do not raise the limits on tools or their parameters.
+#[test]
+fn plugin_tool_and_parameter_limits_stay_bounded() {
+    let mut m = json!({"id": "bounded", "name": "Bounded", "version": "1.0.0",
+        "commands": (0..256).map(|i| json!({"id": format!("c{i}"), "label": "Layer"})).collect::<Vec<_>>(),
+        "tools": (0..64).map(|i| json!({"id": format!("t{i}"), "name": "Tool"})).collect::<Vec<_>>()});
+    m["tools"][0]["params"] =
+        json!((0..32).map(|i| json!({"name": format!("p{i}"), "label": "Parameter", "kind": "text"})).collect::<Vec<_>>());
+    assert!(Manifest::parse(&m.to_string()).is_ok());
+    let mut too_many_tools = m.clone();
+    too_many_tools["tools"].as_array_mut().unwrap().push(json!({"id": "t64", "name": "Tool"}));
+    let e = Manifest::parse(&too_many_tools.to_string()).unwrap_err();
+    assert!(e.contains("at most 256 commands and 64 tools"), "{e}");
+    m["tools"][0]["params"].as_array_mut().unwrap().push(json!({"name": "p32", "label": "Parameter", "kind": "text"}));
+    let e = Manifest::parse(&m.to_string()).unwrap_err();
+    assert!(e.contains("more than 32 parameters"), "{e}");
+}
+
 #[test]
 fn tools_join_the_geoprocessing_tools() {
     crate::tools::register();
@@ -318,10 +366,13 @@ fn plugin_tabs_are_checked() {
         (json!({"label": "publish", "groups": [{"label": "G", "items": ["h"]}]}), "RustGIS's tabs"),
         (json!({"label": "", "groups": [{"label": "G", "items": ["h"]}]}), "label"),
         (json!({"label": "T", "groups": []}), "groups"),
+        (json!({"label": "T", "groups": vec![json!({"label": "G", "items": ["h"]}); 9]}), "1 to 8 groups"),
         (json!({"label": "T", "groups": [{"label": "G", "items": []}]}), "items"),
+        (json!({"label": "T", "groups": [{"label": "G", "items": vec!["h"; 17]}]}), "1 to 16 items"),
         (json!({"label": "T", "groups": [{"label": "G", "items": ["nope"]}]}), "isn't one of"),
         (json!({"label": "T", "groups": [{"label": "G", "items": ["tool:h"]}]}), "isn't one of"),
         (json!({"label": "T", "groups": [{"label": "G", "items": [{"menu": "M", "items": []}]}]}), "needs 1 to"),
+        (json!({"label": "T", "groups": [{"label": "G", "items": [{"menu": "M", "items": vec!["h"; 33]}]}]}), "1 to 32 items"),
         (json!({"label": "T", "groups": [{"label": "G", "items": [{"menu": "M", "items": ["zz"]}]}]}), "isn't one of"),
         (json!({"label": "T", "groups": [{"label": "G", "items": [7]}]}), "plugin.json"),
     ] {
