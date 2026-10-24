@@ -27,6 +27,7 @@ struct Cached {
     status: Status,
     saved: Option<Option<Secret>>,
     changed: bool,
+    requested: bool,
 }
 
 enum Action {
@@ -51,11 +52,30 @@ struct Completed {
     clear: Option<Secret>,
 }
 
+impl Completed {
+    /// A backend panic becomes a failure without exposing its payload or discarding a legacy key.
+    fn panicked(job: &Job) -> Self {
+        Self {
+            provider: job.provider.clone(),
+            revision: job.revision,
+            key: None,
+            status: Status::Failed {
+                error: SecretError::Failed("the keychain backend stopped unexpectedly".into()),
+                legacy: matches!(job.action, Action::Load) && job.legacy.is_some(),
+                deleting: matches!(job.action, Action::Save(None)),
+                reading: matches!(job.action, Action::Load) && job.legacy.is_none(),
+            },
+            clear: None,
+        }
+    }
+}
+
 /// Executes one operation without ever putting a secret in diagnostics.
 fn perform(job: Job) -> Completed {
     let account = format!("assistant/{}", job.provider);
     let deleting = matches!(job.action, Action::Save(None));
     let reading = matches!(job.action, Action::Load) && job.legacy.is_none();
+    let migrating = matches!(job.action, Action::Load) && job.legacy.is_some();
     let (result, key) = match job.action {
         Action::Load => match &job.legacy {
             Some(key) => (job.store.save(&account, key).map(|_| Status::Stored), Some(key.clone())),
@@ -69,7 +89,7 @@ fn perform(job: Job) -> Completed {
         Action::Save(None) => (job.store.delete(&account).map(|_| Status::Session), None),
     };
     let clear = result.is_ok().then(|| job.legacy.clone()).flatten();
-    let status = result.unwrap_or_else(|error| Status::Failed { error, legacy: job.legacy.is_some(), deleting, reading });
+    let status = result.unwrap_or_else(|error| Status::Failed { error, legacy: migrating, deleting, reading });
     Completed { provider: job.provider, revision: job.revision, key, status, clear }
 }
 
@@ -88,7 +108,8 @@ impl Worker {
             .spawn(move || {
                 for job in requests {
                     let ctx = job.ctx.clone();
-                    let completed = perform(job);
+                    let failure = Completed::panicked(&job);
+                    let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| perform(job))).unwrap_or(failure);
                     let _ = replies.send(completed);
                     ctx.request_repaint();
                 }
@@ -116,8 +137,14 @@ impl Keys {
         store: Option<Arc<dyn SecretStore>>,
         ctx: &egui::Context,
     ) -> String {
-        if let Some(cached) = self.entries.get(provider) {
-            return cached.key.expose().to_string();
+        if let Some(cached) = self.entries.get_mut(provider) {
+            let key = cached.key.expose().to_string();
+            let read = remember && !cached.requested && !cached.changed;
+            cached.requested |= remember;
+            if read {
+                self.submit(provider, legacy.map(Secret::new), Action::Load, store, ctx);
+            }
+            return key;
         }
         let key = Secret::new(legacy.as_deref().unwrap_or(environment));
         self.entries.insert(
@@ -128,6 +155,7 @@ impl Keys {
                 status: if legacy.is_some() { Status::Legacy } else { Status::Session },
                 saved: None,
                 changed: false,
+                requested: remember,
             },
         );
         // An unticked Remember must not re-open a key left behind by a failed deletion.
@@ -135,6 +163,18 @@ impl Keys {
             self.submit(provider, legacy.map(Secret::new), Action::Load, store, ctx);
         }
         key.expose().to_string()
+    }
+
+    /// Opting in reads an unedited key first, rather than deleting an empty/environment fallback.
+    pub fn enable(&mut self, provider: &str, legacy: Option<String>, store: Option<Arc<dyn SecretStore>>, ctx: &egui::Context) -> bool {
+        let Some(cached) = self.entries.get_mut(provider) else { return false };
+        if cached.changed {
+            return false;
+        }
+        cached.revision = cached.revision.saturating_add(1);
+        cached.requested = true;
+        self.submit(provider, legacy.map(Secret::new), Action::Load, store, ctx);
+        true
     }
 
     /// Invalidates an old load before a typed key or Remember change can be overwritten.
@@ -174,7 +214,8 @@ impl Keys {
         let Some(cached) = self.entries.get_mut(provider) else { return };
         let deleting = matches!(action, Action::Save(None));
         let reading = matches!(action, Action::Load) && legacy.is_none();
-        let failure = |error| Status::Failed { error, legacy: legacy.is_some(), deleting, reading };
+        let migrating = matches!(action, Action::Load) && legacy.is_some();
+        let failure = |error| Status::Failed { error, legacy: migrating, deleting, reading };
         let Some(store) = store else {
             cached.status = failure(SecretError::Unavailable("no system keychain in this build".into()));
             return;
@@ -390,5 +431,86 @@ mod tests {
         settle(&mut keys, "custom");
         assert_eq!(keys.key("custom"), Some("saved"));
         assert_eq!(store.store.load("assistant/custom").unwrap(), Some(Secret::new("saved")));
+    }
+
+    /// Opting in after an off startup reads the stored value before any empty/environment save.
+    #[test]
+    fn enabling_remember_reads_an_unedited_key_without_deleting_it() {
+        let ctx = egui::Context::default();
+        for fallback in ["", "environment"] {
+            let store = Arc::new(MemorySecrets::new());
+            store.save("assistant/custom", &Secret::new("saved")).unwrap();
+            let mut keys = Keys::default();
+            keys.load("custom", fallback, None, false, Some(store.clone()), &ctx);
+            assert!(keys.enable("custom", None, Some(store.clone()), &ctx));
+            keys.save("custom", remembered(fallback, true, fallback), None, Some(store.clone()), &ctx);
+            settle(&mut keys, "custom");
+            assert_eq!(keys.key("custom"), Some("saved"));
+            assert_eq!(store.load("assistant/custom").unwrap(), Some(Secret::new("saved")));
+            // A global Remember change also applies when returning to a cached provider.
+            let mut cached = Keys::default();
+            cached.load("custom", fallback, None, false, Some(store.clone()), &ctx);
+            cached.load("custom", fallback, None, true, Some(store.clone()), &ctx);
+            settle(&mut cached, "custom");
+            assert_eq!(cached.key("custom"), Some("saved"));
+            let mut typed = Keys::default();
+            typed.load("custom", fallback, None, false, Some(store.clone()), &ctx);
+            typed.edit("custom", "typed");
+            assert!(!typed.enable("custom", None, Some(store.clone()), &ctx));
+            typed.save("custom", Some(Secret::new("typed")), None, Some(store.clone()), &ctx);
+            settle(&mut typed, "custom");
+            assert_eq!(store.load("assistant/custom").unwrap(), Some(Secret::new("typed")));
+        }
+    }
+
+    /// A synthetic backend panics on its first operation, then behaves like the real trait.
+    struct Panics {
+        first: std::sync::atomic::AtomicBool,
+        store: MemorySecrets,
+    }
+
+    impl Panics {
+        /// Exercises an escaped dependency panic without putting a key in its payload.
+        fn check(&self) {
+            assert!(!self.first.swap(false, std::sync::atomic::Ordering::SeqCst), "synthetic backend panic");
+        }
+    }
+
+    impl SecretStore for Panics {
+        /// The first read may panic instead of returning a contract error.
+        fn load(&self, account: &str) -> Result<Option<Secret>, SecretError> {
+            self.check();
+            self.store.load(account)
+        }
+        /// The first migration write may also panic.
+        fn save(&self, account: &str, key: &Secret) -> Result<(), SecretError> {
+            self.check();
+            self.store.save(account, key)
+        }
+        /// Subsequent deletes still run on the surviving worker.
+        fn delete(&self, account: &str) -> Result<(), SecretError> {
+            self.check();
+            self.store.delete(account)
+        }
+    }
+
+    /// Panics produce failures, preserve legacy copies, and leave the worker able to handle edits.
+    #[test]
+    fn backend_panics_fail_the_operation_without_stalling_or_losing_keys() {
+        let ctx = egui::Context::default();
+        for legacy in [None, Some("legacy".to_string())] {
+            let store = Arc::new(Panics { first: std::sync::atomic::AtomicBool::new(true), store: MemorySecrets::new() });
+            let mut keys = Keys::default();
+            keys.load("custom", "environment", legacy.clone(), true, Some(store.clone()), &ctx);
+            assert!(settle(&mut keys, "custom").is_empty());
+            assert!(!keys.loading("custom"));
+            assert_eq!(keys.key("custom"), Some(legacy.as_deref().unwrap_or("environment")));
+            assert!(matches!(keys.status("custom"), Some(Status::Failed { .. })));
+            keys.edit("custom", "replacement");
+            keys.save("custom", Some(Secret::new("replacement")), legacy.clone(), Some(store.clone()), &ctx);
+            let clear = settle(&mut keys, "custom");
+            assert_eq!(clear.len(), usize::from(legacy.is_some()));
+            assert_eq!(store.store.load("assistant/custom").unwrap(), Some(Secret::new("replacement")));
+        }
     }
 }
