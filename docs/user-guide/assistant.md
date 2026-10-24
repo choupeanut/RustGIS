@@ -274,8 +274,16 @@ Assistant requests go directly to the provider and address you chose, using your
 ChatGPT sign-in. They carry your messages, the map's layer names, fields and extent, and tool
 results such as rows the assistant reads. Local agents use their own providers and tools,
 with their own data handling. A key typed in the settings is used for the session only unless
-you tick **Remember the key on this computer**, which saves it unencrypted in the app's
-preferences (in the browser's storage on the web); keys from the environment are never saved.
+you tick **Remember the key on this computer**. On the desktop, this saves it in the system
+keychain (macOS Keychain, Windows Credential Manager, or the Secret Service on Linux). Clearing
+the key or unticking **Remember** deletes the saved key; a failed deletion is shown in settings.
+Keys from the environment are never saved. If the keychain is unavailable, locked, or access
+is refused, a new key stays in memory for this session and the settings explain why it was not
+remembered. Existing keys in the preferences keep working: they move into the keychain when
+the app starts after upgrading, and each plaintext preference is cleared only after the store
+accepts it. If migration fails, the old preference is retained and the unencrypted-storage
+warning stays visible. In the web app, **Remember** still saves the key unencrypted in the
+browser's storage, with a note in settings.
 A ChatGPT sign-in is kept in `chatgpt-auth.json` in the app's settings folder (owner-only on
 macOS and Linux; on Windows, protected like the rest of your user profile), never in the
 preferences or a project file, and its tokens are never logged; RustGIS renews them as they expire.
