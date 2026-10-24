@@ -59,6 +59,7 @@ fn plugins_reach_the_host_through_requests() {
     crate::unload("unit-forward");
 }
 
+/// Skills packages carry validated skills without code; coded plugins may carry skills too.
 #[test]
 fn plugins_ship_skills_and_skills_packages_have_no_code() {
     // A skills package: no module and no commands; its skills come from the package.
@@ -108,6 +109,7 @@ fn plugins_ship_skills_and_skills_packages_have_no_code() {
     }
 }
 
+/// Fuel, memory and reply bounds stop hostile modules and return errors to the host.
 #[test]
 fn hostile_modules_are_stopped_not_crashes() {
     load("unit-hostile", &[]);
@@ -120,6 +122,7 @@ fn hostile_modules_are_stopped_not_crashes() {
     crate::unload("unit-hostile");
 }
 
+/// Invalid manifests, archives and module exports are refused during package loading.
 #[test]
 fn bad_packages_are_refused() {
     let wasm = testing::wasm();
@@ -210,6 +213,7 @@ fn plugin_tool_and_parameter_limits_stay_bounded() {
     assert!(e.contains("more than 32 parameters"), "{e}");
 }
 
+/// Enabled plugin tools register with geoprocessing and return layers or selections.
 #[test]
 fn tools_join_the_geoprocessing_tools() {
     crate::tools::register();
@@ -246,6 +250,7 @@ fn tools_join_the_geoprocessing_tools() {
     crate::unload("unit-tools");
 }
 
+/// Registry and blocklist parsing validates entries and resolves package addresses safely.
 #[test]
 fn registries_and_blocklists_are_read_defensively() {
     let sha = "a".repeat(64);
@@ -303,6 +308,7 @@ fn registries_and_blocklists_are_read_defensively() {
     assert!(registry::blocked(&list, "y", &"b".repeat(64)).is_none());
 }
 
+/// Blocklisting unloads affected plugins and prevents them from being loaded again.
 #[test]
 fn blocked_plugins_are_unloaded_and_refused() {
     load("unit-blocked", &[]);
@@ -323,6 +329,7 @@ fn blocked_plugins_are_unloaded_and_refused() {
     assert!(crate::blocked("unit-blocked", "any").is_some(), "an empty list from another registry unblocks nothing");
 }
 
+/// Version comparisons and translation fallbacks preserve the plugin's declared behavior.
 #[test]
 fn versions_and_translations() {
     assert!(version_cmp("1.10.0", "1.9.3").is_gt());
@@ -344,6 +351,7 @@ fn versions_and_translations() {
     assert_eq!(crate::translate("de", "Not a plugin string"), None);
 }
 
+/// Ribbon tabs accept declared entries and enforce reserved names, shapes and size limits.
 #[test]
 fn plugin_tabs_are_checked() {
     let with_tab = |tab: Value| {
