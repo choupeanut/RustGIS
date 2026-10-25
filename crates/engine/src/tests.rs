@@ -16025,6 +16025,65 @@ fn scans_have_no_coordinates_to_give_away() {
 }
 
 #[test]
+fn zonal_statistics_reads_projected_zone_files_without_reprojecting_twice() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+    use rustgis_data::{Dataset, Geometry, GeometryType, Value};
+    let dir = std::env::temp_dir().join(format!("rustgis-zonal-crs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::new(Project::default());
+    let gt = GeoTransform { origin_x: 622_000.0, origin_y: 5_164_000.0, pixel_width: 100.0, pixel_height: -100.0 };
+    let tr = Crs::Epsg(25832).transformer().unwrap();
+    let mut zones = Dataset::new("zones", GeometryType::Polygon, vec![]);
+    let ring = [(1.0, 1.0), (3.0, 1.0), (3.0, 3.0), (1.0, 3.0), (1.0, 1.0)]
+        .into_iter()
+        .map(|(x, y)| tr.to_lonlat(gt.to_world(x, y)).unwrap())
+        .collect();
+    zones.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+    s.map_mut().add_layer(rustgis_map::Layer::new(0, zones));
+    let nw = tr.to_lonlat(gt.to_world(0.0, 0.0)).unwrap();
+    let se = tr.to_lonlat(gt.to_world(4.0, 4.0)).unwrap();
+    let geographic = GeoTransform { origin_x: nw.x, origin_y: nw.y, pixel_width: (se.x - nw.x) / 4.0, pixel_height: (se.y - nw.y) / 4.0 };
+    for (name, transform, crs) in [("utm", gt, Crs::Epsg(25832)), ("geographic", geographic, Crs::LonLat)] {
+        let raster =
+            Raster::new(name, 4, 4, vec![(1..=16).map(|v| v as f32).collect()], transform, crs, None, ColorHint::Gray, "Float32").unwrap();
+        s.map_mut().add_raster(name, rustgis_map::RasterLayer::from_path(raster, format!("{name}.tif")));
+    }
+    for epsg in [4326, 25832, 32632, 3003, 3857] {
+        for ext in ["gpkg", "shp"] {
+            let path = dir.join(format!("zones_{epsg}.{ext}")).display().to_string();
+            s.run("share.exportLayer", &json!({"layer": "zones", "path": path, "crs": format!("EPSG:{epsg}")})).unwrap();
+            let loaded = s.run("layer.addData", &json!({"path": path, "name": "loaded_zones"})).unwrap()["layer"].clone();
+            let input = s.map().layer(loaded.as_u64().unwrap() as u32).unwrap().dataset.clone();
+            assert_eq!(input.crs.map(|c| c.label()).unwrap_or_else(|| "EPSG:4326".into()), format!("EPSG:{epsg}"), "{ext}");
+            assert!(input.extent().contains(tr.to_lonlat(gt.to_world(2.0, 2.0)).unwrap()), "{epsg}, {ext}: {:?}", input.extent());
+            for raster in ["utm", "geographic"] {
+                let depth = s.undo_depth();
+                s.run(
+                    "gp.run",
+                    &json!({"tool": "zonalStats", "params": {"raster": raster, "polygons": "loaded_zones", "output": "stats"}}),
+                )
+                .unwrap();
+                let out = &s.map().layer_by_name("stats").unwrap().dataset;
+                for (stat, expected) in [("count", Value::Int(4)), ("mean", Value::Float(8.5)), ("sum", Value::Float(34.0))] {
+                    let field = out.field_index(&format!("{raster}_{stat}")).unwrap();
+                    assert_eq!(out.value(0, field), &expected, "EPSG:{epsg}, {ext}, {raster}, {stat}");
+                }
+                assert_eq!(out.features[0].geometry, input.features[0].geometry);
+                assert_eq!(out.crs, input.crs);
+                assert_eq!(s.undo_depth(), depth + 1);
+                assert!(s.undo());
+                assert!(s.map().layer_by_name("stats").is_none());
+                assert!(s.redo());
+                assert!(s.map().layer_by_name("stats").is_some());
+                assert!(s.undo());
+            }
+            s.run("layer.remove", &json!({"layer": loaded})).unwrap();
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn gp_zonal_stats_end_to_end_and_undo() {
     use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
     use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
@@ -16124,13 +16183,10 @@ fn gp_zonal_stats_end_to_end_and_undo() {
     assert!(run_layer.dataset.field_index("dem_count").is_some());
     assert!(run_layer.dataset.field_index("dem_min").is_none());
 
-    // Projected CRS (WebMercator) reprojection end-to-end
-    let merc_tr = Crs::WebMercator.transformer().unwrap();
-    let mp0 = merc_tr.from_lonlat(Coord::new(1.0, 7.0)).unwrap();
-    let mp1 = merc_tr.from_lonlat(Coord::new(3.0, 9.0)).unwrap();
+    // Loaded WebMercator data already uses longitude/latitude geometry.
     let mut merc_ds = Dataset::new("merc_districts", GeometryType::Polygon, vec![Field::new("code", FieldType::Text)]);
     merc_ds.crs = Some(Crs::WebMercator);
-    merc_ds.push(Some(sq(mp0.x, mp0.y, mp1.x, mp1.y)), vec![Value::Text("M1".into())]);
+    merc_ds.push(Some(sq(1.0, 7.0, 3.0, 9.0)), vec![Value::Text("M1".into())]);
     s.map_mut().add_layer(rustgis_map::Layer::new(0, merc_ds));
 
     let merc_res = s.run(

@@ -1906,12 +1906,6 @@ fn zonal_stats(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             poly_ds.geometry_type.label()
         ));
     }
-    let poly_tr = match poly_ds.crs {
-        Some(crs) if crs != rustgis_data::raster::Crs::LonLat && crs != rustgis_data::raster::Crs::Epsg(4326) => {
-            Some(crs.transformer().map_err(|e| format!("polygon layer coordinate system isn't supported: {e}"))?)
-        }
-        _ => None,
-    };
 
     let bands = parse_bands(p, r.band_count())?;
     let stats = parse_stats(p)?;
@@ -1964,7 +1958,8 @@ fn zonal_stats(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         let Some(f) = poly_ds.features.get(r_idx) else { continue };
         let (stats_by_band, feature_valid) = match &f.geometry {
             Some(Geometry::Polygon(polys)) if !polys.is_empty() => {
-                match crate::rasterops::transform_feature_polygons_to_lonlat(polys, poly_tr.as_ref()) {
+                // Dataset geometry is already lon/lat; crs records the source system.
+                match crate::rasterops::transform_feature_polygons_to_lonlat(polys, None) {
                     Ok(polys_lonlat) => {
                         let mut failed_parts = Vec::new();
                         let st = crate::rasterops::zonal_statistics_with_failures(r, &bands, &polys_lonlat, &mut failed_parts)?;
@@ -3437,10 +3432,9 @@ mod tests {
         assert!(crate::run("zonalStats", &m, &serde_json::json!({"raster": "elev", "polygons": "zones", "bands": [0]})).is_err());
         assert!(crate::run("zonalStats", &m, &serde_json::json!({"raster": "elev", "polygons": "zones", "bands": [-1]})).is_err());
 
-        // 10. Projected CRS reprojection: polygon in EPSG:3857 (WebMercator)
-        let merc_tr = rustgis_data::raster::Crs::WebMercator.transformer().unwrap();
-        let p0 = merc_tr.from_lonlat(Coord::new(1.0, 7.0)).unwrap();
-        let p1 = merc_tr.from_lonlat(Coord::new(3.0, 9.0)).unwrap();
+        // 10. A loaded projected layer keeps its source CRS, but its geometry is lon/lat.
+        let p0 = Coord::new(1.0, 7.0);
+        let p1 = Coord::new(3.0, 9.0);
         let merc_geom = Geometry::Polygon(vec![vec![vec![p0, Coord::new(p1.x, p0.y), p1, Coord::new(p0.x, p1.y), p0]]]);
         let mut merc_poly_ds = Dataset::new("merc_zones", GeometryType::Polygon, vec![Field::new("id", FieldType::Integer)]);
         merc_poly_ds.crs = Some(rustgis_data::raster::Crs::WebMercator);
@@ -3468,7 +3462,7 @@ mod tests {
         assert_eq!(out_merc.value(0, merc_count), &Value::Int(4));
         assert_eq!(out_merc.value(0, merc_mean), &Value::Float(16.5));
 
-        // 11. Unsupported polygon CRS returns error
+        // 11. Source CRS metadata does not change already-normalized geometry.
         let mut bad_crs_ds = Dataset::new("bad_crs", GeometryType::Polygon, vec![]);
         bad_crs_ds.crs = Some(rustgis_data::raster::Crs::Epsg(60000));
         bad_crs_ds.push(Some(sq_geom(1.0, 7.0, 3.0, 9.0)), vec![]);
@@ -3476,11 +3470,12 @@ mod tests {
             datasets: HashMap::from([("bad_crs".to_string(), bad_crs_ds)]),
             rasters: HashMap::from([("elev".to_string(), &raster)]),
         };
-        assert!(crate::run("zonalStats", &m_bad_crs, &serde_json::json!({"raster": "elev", "polygons": "bad_crs"})).is_err());
+        let out = layer(crate::run("zonalStats", &m_bad_crs, &serde_json::json!({"raster": "elev", "polygons": "bad_crs"})).unwrap());
+        assert_eq!(out.value(0, out.field_index("elev_count").unwrap()), &Value::Int(4));
 
-        // 12. Exterior ring dropped during reprojection (does not promote hole)
-        let hole_p0 = merc_tr.from_lonlat(Coord::new(1.0, 8.0)).unwrap();
-        let hole_p1 = merc_tr.from_lonlat(Coord::new(2.0, 9.0)).unwrap();
+        // 12. An invalid exterior does not promote a valid hole.
+        let hole_p0 = Coord::new(1.0, 8.0);
+        let hole_p1 = Coord::new(2.0, 9.0);
         let bad_ext_geom = Geometry::Polygon(vec![vec![
             vec![p0, p1], // Only 2 points (< 3 points, invalid exterior ring)
             vec![hole_p0, Coord::new(hole_p1.x, hole_p0.y), hole_p1, Coord::new(hole_p0.x, hole_p1.y), hole_p0], // valid hole
@@ -3500,8 +3495,7 @@ mod tests {
         assert_eq!(out_drop_ext.value(0, drop_count_idx), &Value::Int(0));
         assert_eq!(out_drop_ext.value(0, drop_mean_idx), &Value::Null);
 
-        // 13. Silent vertex loss prevention during reprojection:
-        // A polygon where one exterior ring vertex has non-finite coords (cannot be reprojected to lon/lat).
+        // 13. Reject a non-finite exterior vertex without silently dropping it.
         let nan_ext_geom = Geometry::Polygon(vec![vec![vec![
             Coord::new(f64::NAN, p0.y),
             Coord::new(p1.x, p0.y),
@@ -3524,11 +3518,11 @@ mod tests {
         assert_eq!(out_nan_ext.value(0, nan_count_idx), &Value::Int(0));
         assert_eq!(out_nan_ext.value(0, nan_mean_idx), &Value::Null);
 
-        // 14. Valid projected polygon with holes reprojects both and subtracts holes correctly
-        let merc_outer0 = merc_tr.from_lonlat(Coord::new(0.0, 7.0)).unwrap();
-        let merc_outer1 = merc_tr.from_lonlat(Coord::new(3.0, 10.0)).unwrap();
-        let merc_hole0 = merc_tr.from_lonlat(Coord::new(1.0, 8.0)).unwrap();
-        let merc_hole1 = merc_tr.from_lonlat(Coord::new(2.0, 9.0)).unwrap();
+        // 14. A loaded projected polygon retains its hole.
+        let merc_outer0 = Coord::new(0.0, 7.0);
+        let merc_outer1 = Coord::new(3.0, 10.0);
+        let merc_hole0 = Coord::new(1.0, 8.0);
+        let merc_hole1 = Coord::new(2.0, 9.0);
         let valid_hole_geom = Geometry::Polygon(vec![vec![
             vec![merc_outer0, Coord::new(merc_outer1.x, merc_outer0.y), merc_outer1, Coord::new(merc_outer0.x, merc_outer1.y), merc_outer0],
             vec![merc_hole0, Coord::new(merc_hole1.x, merc_hole0.y), merc_hole1, Coord::new(merc_hole0.x, merc_hole1.y), merc_hole0],
