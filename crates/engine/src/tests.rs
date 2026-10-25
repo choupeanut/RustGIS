@@ -15207,7 +15207,7 @@ fn dem_tiles_mosaic_clip_by_polygon_share_a_stretch_and_report_overviews() {
     let e_empty = s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "EmptyPoly"})).unwrap_err();
     assert!(e_empty.to_string().contains("has no features"), "{e_empty}");
 
-    // A polygon layer in a projected CRS (UTM) reprojects and clips accurately.
+    // A polygon layer with UTM source metadata still stores lon/lat geometry.
     let mut proj_ds = rustgis_data::Dataset::new("CityProj", rustgis_data::GeometryType::Polygon, vec![]);
     proj_ds.crs = Some(utm);
     let utm_ring = [
@@ -15216,7 +15216,8 @@ fn dem_tiles_mosaic_clip_by_polygon_share_a_stretch_and_report_overviews() {
         rustgis_geom::Coord::new(361_500.0, 5_699_500.0),
         rustgis_geom::Coord::new(360_500.0, 5_700_000.0),
     ];
-    proj_ds.push(Some(rustgis_data::Geometry::Polygon(vec![vec![utm_ring.to_vec()]])), vec![]);
+    let lonlat_ring = utm_ring.into_iter().map(|c| tr.to_lonlat(c).unwrap()).collect();
+    proj_ds.push(Some(rustgis_data::Geometry::Polygon(vec![vec![lonlat_ring]])), vec![]);
     s.map_mut().add_layer(rustgis_map::Layer::new(0, proj_ds));
     let v_proj = s.run("raster.process", &json!({"layer": "dem", "operation": "clip", "polygon": "CityProj"})).unwrap();
     let c_proj = raster(&s, &v_proj);
@@ -16179,7 +16180,7 @@ fn scans_have_no_coordinates_to_give_away() {
 }
 
 #[test]
-fn zonal_statistics_reads_projected_zone_files_without_reprojecting_twice() {
+fn raster_tools_read_projected_zone_files_without_reprojecting_twice() {
     use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
     use rustgis_data::{Dataset, Geometry, GeometryType, Value};
     let dir = std::env::temp_dir().join(format!("rustgis-zonal-crs-{}", std::process::id()));
@@ -16229,6 +16230,12 @@ fn zonal_statistics_reads_projected_zone_files_without_reprojecting_twice() {
                 assert!(s.map().layer_by_name("stats").is_none());
                 assert!(s.redo());
                 assert!(s.map().layer_by_name("stats").is_some());
+                assert!(s.undo());
+                s.run("raster.process", &json!({"layer": raster, "operation": "clip", "polygon": "loaded_zones", "name": "clipped"}))
+                    .unwrap();
+                let clipped = s.map().layer_by_name("clipped").unwrap().raster.as_ref().unwrap().data.as_ref().unwrap();
+                assert_eq!((clipped.width, clipped.height, clipped.bands[0].stats.count), (2, 2, 4), "{epsg}, {ext}, {raster}");
+                assert_eq!(clipped.bands[0].data.iter().sum::<f32>(), 34.0, "{epsg}, {ext}, {raster}");
                 assert!(s.undo());
             }
             s.run("layer.remove", &json!({"layer": loaded})).unwrap();

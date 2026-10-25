@@ -530,7 +530,7 @@ fn index(s: &mut Session, p: &Value) -> CmdResult {
 ///     otherwise clips using all features.
 ///   - Non-boolean values are rejected with an explicit validation error.
 /// - **Per-Zone and Overlap Semantics**:
-///   - Every polygon geometry (including multipart geometries) is transformed to WGS 84 lon/lat.
+///   - Every polygon geometry (including multipart geometries) is already WGS 84 lon/lat.
 ///   - Polygon exterior rings and interior holes are strictly validated; invalid or failed holes reject
 ///     the containing polygon rather than distorting the boundary.
 ///   - Polygons are combined into a composite scanline mask over the raster. Holes cut out cells using the
@@ -572,18 +572,12 @@ fn process(s: &mut Session, p: &Value) -> CmdResult {
             if rows.is_empty() {
                 return Err(format!("{pl}: has no features to clip by"));
             }
-            let poly_tr = match l.dataset.crs {
-                Some(crs) if crs != Crs::LonLat && crs != Crs::Epsg(4326) => {
-                    Some(crs.transformer().map_err(|e| format!("{pl} coordinate system isn't supported: {e}"))?)
-                }
-                _ => None,
-            };
             let mut polygons: Vec<Vec<Vec<Coord>>> = Vec::new();
             let mut failed_features = Vec::new();
             for &row in &rows {
                 let Some(f) = l.dataset.features.get(row) else { continue };
                 match &f.geometry {
-                    Some(Geometry::Polygon(polys)) => match rasterops::transform_feature_polygons_to_lonlat(polys, poly_tr.as_ref()) {
+                    Some(Geometry::Polygon(polys)) => match rasterops::transform_feature_polygons_to_lonlat(polys, None) {
                         Ok(transformed) => {
                             polygons.extend(transformed);
                         }
