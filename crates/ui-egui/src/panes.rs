@@ -648,6 +648,16 @@ fn contents(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             LayersView::DrawingOrder => {
                 let mut shown = std::collections::HashSet::new();
                 let mut rows: Vec<DropRow> = Vec::new();
+                // Reserve the insertion slot while idle too, so starting a drag never shifts rows.
+                let top = reorder.then(|| {
+                    let (r, response) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+                    if egui::DragAndDrop::payload::<DraggedLayer>(ui.ctx()).is_some() {
+                        ui.painter().rect_filled(r.shrink2(vec2(4.0, 0.0)), CornerRadius::same(4), t.hover);
+                        ui.painter().text(r.center(), Align2::CENTER_CENTER, tl!("Drop at top"), regular(10.5), t.accent);
+                        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, tl!("Drop at top")));
+                    }
+                    r
+                });
                 // A layer group lists at its topmost layer (its layers are kept together); while
                 // filtering, when one of its layers or its own name matches.
                 for layer in
@@ -676,8 +686,8 @@ fn contents(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         layer_group_row(app, ui, group, &layers, scale, reorder, &mut rows, t);
                     }
                 }
-                if reorder {
-                    layer_drop(app, ui, &rows, t);
+                if let Some(top) = top {
+                    layer_drop(app, ui, &rows, top, t);
                 }
                 // Web tile layers (services, tile addresses) draw over the basemap and under the layers.
                 let mut n = rows.iter().filter(|r| r.group.is_none() && !r.header).count() + shown.len();
@@ -1286,8 +1296,8 @@ struct DropRow {
 /// puts it there in one undo step. A layer dropped above one of a group's layers joins the group
 /// there, dropped elsewhere leaves its group, and dropped onto a group's row joins it at its end
 /// nearest the layer (`layer.group`); a group moves whole and only between groups (`group.move`). Released
-/// anywhere but over the rows, the drag does nothing.
-fn layer_drop(app: &mut RustGisApp, ui: &Ui, rows: &[DropRow], t: &Tokens) {
+/// anywhere but over the rows or their top insertion slot, the drag does nothing.
+fn layer_drop(app: &mut RustGisApp, ui: &Ui, rows: &[DropRow], top: Rect, t: &Tokens) {
     let Some(dragged) = egui::DragAndDrop::payload::<DraggedLayer>(ui.ctx()) else { return };
     let Some(from) = rows.iter().position(|r| r.id == dragged.0) else { return };
     let view = ui.clip_rect();
@@ -1302,13 +1312,32 @@ fn layer_drop(app: &mut RustGisApp, ui: &Ui, rows: &[DropRow], t: &Tokens) {
     }
     // Only the layer rows take a drop: not the map's name above them, the basemap or a table below.
     let (Some(first), Some(last)) = (rows.first(), rows.last()) else { return };
-    if pointer.y < first.rect.min.y || pointer.y > last.rect.max.y {
+    if !top.contains(pointer) && (pointer.y < first.rect.min.y || pointer.y > last.rect.max.y) {
         return;
     }
     let released = ui.input(|i| i.pointer.any_released());
     let m = app.session.map();
     let moving_group = m.group(dragged.0).is_some();
     let current = m.group_of(dragged.0).map(|g| g.id);
+    if top.contains(pointer) {
+        let already_top = m.layers.first().is_some_and(|l| match m.group(dragged.0) {
+            Some(g) => g.children.contains(&l.id),
+            None => current.is_none() && l.id == dragged.0,
+        });
+        if already_top {
+            return;
+        }
+        ui.painter().line_segment([pos2(top.min.x + 8.0, top.max.y), pos2(top.max.x - 8.0, top.max.y)], Stroke::new(2.0, t.accent));
+        if released {
+            if moving_group {
+                let _ = app.run("group.move", json!({"group": dragged.0, "to": 0}));
+            } else {
+                let before = m.layers.iter().find(|l| l.id != dragged.0).map(|l| l.id);
+                let _ = app.run("layer.group", json!({"layer": dragged.0, "group": null, "before": before}));
+            }
+        }
+        return;
+    }
     // The topmost layer of a group, in drawing order.
     let top_of = |g: u32| m.group(g).and_then(|g| m.layers.iter().find(|l| g.children.contains(&l.id)).map(|l| l.id));
     // Onto the middle of another group's row: into that group, at its end nearest the layer; onto
@@ -5342,62 +5371,120 @@ mod tests {
         app.session.map().layer_by_name(name).map(|l| l.id).unwrap_or_default()
     }
 
+    fn drag_layer(h: &mut egui_kittest::Harness<'_, RustGisApp>, from: egui::Pos2, to: egui::Pos2) {
+        use egui::{Event, Modifiers, PointerButton};
+        let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.event(Event::PointerMoved(from));
+        h.step();
+        h.event(button(from, true));
+        h.step();
+        h.event(Event::PointerMoved(from + vec2(10.0, 0.0)));
+        h.step();
+        h.event(Event::PointerMoved(to));
+        h.step();
+        h.event(button(to, false));
+        h.step();
+    }
+
     /// #836: the name's lower half means below, even with a tall legend; the legend
     /// itself still accepts drops. Group membership and one-step undo follow the drop.
     #[test]
     fn expanded_legends_do_not_shift_layer_drop_boundaries() {
-        use egui::{Event, Modifiers, PointerButton};
         use egui_kittest::kittest::Queryable;
-        for grouped in [false, true] {
-            for (expanded, offset) in [(false, -4.0), (false, 4.0), (true, -4.0), (true, 4.0), (true, 40.0)] {
-                let mut app = RustGisApp::with_sample();
-                let (cities, countries) = (layer(&app, "Cities"), layer(&app, "Countries"));
-                app.run("layer.move", json!({"layer": countries, "to": 2})).unwrap();
-                app.session.map_mut().layer_mut(countries).unwrap().expanded = expanded;
-                if grouped {
-                    app.run("group.add", json!({"layers": [countries], "name": "Base"})).unwrap();
+        for at_end in [false, true] {
+            for grouped in [false, true] {
+                for (expanded, offset) in [(false, -4.0), (false, 4.0), (true, -4.0), (true, 4.0), (true, 40.0)] {
+                    let mut app = RustGisApp::with_sample();
+                    let (cities, countries) = (layer(&app, "Cities"), layer(&app, "Countries"));
+                    if !at_end {
+                        app.run("layer.move", json!({"layer": countries, "to": 2})).unwrap();
+                    }
+                    app.session.map_mut().layer_mut(countries).unwrap().expanded = expanded;
+                    if grouped {
+                        app.run("group.add", json!({"layers": [countries], "name": "Base"})).unwrap();
+                    }
+                    let original: Vec<_> = app.session.map().layers.iter().map(|l| l.id).collect();
+                    let undo = app.session.undo_depth();
+                    let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
+                        |ui, app: &mut RustGisApp| {
+                            let ctx = ui.ctx().clone();
+                            app.logic(&ctx);
+                            app.ui(ui);
+                        },
+                        app,
+                    );
+                    h.run_steps(6);
+                    let from = h.get_by_label("Cities").rect().center();
+                    let name = h.get_by_label("Countries").rect();
+                    let to = name.center() + vec2(0.0, offset);
+                    drag_layer(&mut h, from, to);
+                    let mut expected: Vec<_> = original.iter().copied().filter(|id| *id != cities).collect();
+                    let target = expected.iter().position(|id| *id == countries).unwrap() + usize::from(offset > 0.0);
+                    expected.insert(target, cities);
+                    let map = h.state().session.map();
+                    assert_eq!(
+                        map.layers.iter().map(|l| l.id).collect::<Vec<_>>(),
+                        expected,
+                        "at_end={at_end}, grouped={grouped}, expanded={expanded}, offset={offset}"
+                    );
+                    assert_eq!(map.group_of(cities).is_some(), grouped && offset < 0.0);
+                    assert_eq!(h.state().session.undo_depth(), undo + 1);
+                    h.state_mut().run("edit.undo", Value::Null).unwrap();
+                    assert_eq!(h.state().session.map().layers.iter().map(|l| l.id).collect::<Vec<_>>(), original);
+                    assert!(h.state().session.map().group_of(cities).is_none());
                 }
-                let original: Vec<_> = app.session.map().layers.iter().map(|l| l.id).collect();
-                let undo = app.session.undo_depth();
-                let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
-                    |ui, app: &mut RustGisApp| {
-                        let ctx = ui.ctx().clone();
-                        app.logic(&ctx);
-                        app.ui(ui);
-                    },
-                    app,
-                );
-                h.run_steps(6);
-                let from = h.get_by_label("Cities").rect().center();
-                let name = h.get_by_label("Countries").rect();
-                let to = name.center() + vec2(0.0, offset);
-                let button =
-                    |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-                h.event(Event::PointerMoved(from));
-                h.step();
-                h.event(button(from, true));
-                h.step();
-                h.event(Event::PointerMoved(from + vec2(10.0, 0.0)));
-                h.step();
-                h.event(Event::PointerMoved(to));
-                h.step();
-                h.event(button(to, false));
-                h.step();
-                let mut expected: Vec<_> = original.iter().copied().filter(|id| *id != cities).collect();
-                let target = expected.iter().position(|id| *id == countries).unwrap() + usize::from(offset > 0.0);
-                expected.insert(target, cities);
-                let map = h.state().session.map();
-                assert_eq!(
-                    map.layers.iter().map(|l| l.id).collect::<Vec<_>>(),
-                    expected,
-                    "grouped={grouped}, expanded={expanded}, offset={offset}"
-                );
-                assert_eq!(map.group_of(cities).is_some(), grouped && offset < 0.0);
-                assert_eq!(h.state().session.undo_depth(), undo + 1);
-                h.state_mut().run("edit.undo", Value::Null).unwrap();
-                assert_eq!(h.state().session.map().layers.iter().map(|l| l.id).collect::<Vec<_>>(), original);
-                assert!(h.state().session.map().group_of(cities).is_none());
             }
+        }
+    }
+
+    /// The top slot moves layers out of groups and moves whole groups without splitting them.
+    #[test]
+    fn layers_and_groups_drop_in_the_top_insertion_slot() {
+        use egui_kittest::kittest::Queryable;
+        for case in 0..4 {
+            let mut app = RustGisApp::with_sample();
+            if case != 0 {
+                let members = if case == 2 { ["Lakes", "Countries"] } else { ["Cities", "Rivers"] };
+                app.run("group.add", json!({"name": "Base", "layers": members})).unwrap();
+            }
+            let source = if case == 2 {
+                "Base"
+            } else if case == 3 {
+                "Cities"
+            } else {
+                "Countries"
+            };
+            let original: Vec<_> = app.session.map().layers.iter().map(|l| l.id).collect();
+            let members: Vec<_> = app.session.map().groups.iter().map(|g| g.children.clone()).collect();
+            let moved: Vec<_> = if case == 2 { members.concat() } else { vec![layer(&app, source)] };
+            let undo = app.session.undo_depth();
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+            h.run_steps(6);
+            let from = h.get_by_label(source).rect().center();
+            let first = h.get_by_label(if case == 1 || case == 3 { "Base" } else { "Cities" }).rect();
+            let to = pos2(first.center().x, first.min.y - 12.0);
+            drag_layer(&mut h, from, to);
+            let expected: Vec<_> = original
+                .iter()
+                .copied()
+                .filter(|id| moved.contains(id))
+                .chain(original.iter().copied().filter(|id| !moved.contains(id)))
+                .collect();
+            assert_eq!(h.state().session.map().layers.iter().map(|l| l.id).collect::<Vec<_>>(), expected, "case={case}");
+            if case != 2 {
+                assert!(h.state().session.map().group_of(moved[0]).is_none());
+            }
+            assert_eq!(h.state().session.undo_depth(), undo + 1);
+            h.state_mut().run("edit.undo", Value::Null).unwrap();
+            assert_eq!(h.state().session.map().layers.iter().map(|l| l.id).collect::<Vec<_>>(), original);
+            assert_eq!(h.state().session.map().groups.iter().map(|g| g.children.clone()).collect::<Vec<_>>(), members);
         }
     }
 

@@ -14788,6 +14788,32 @@ fn a_layer_drops_into_and_out_of_a_group_at_a_place() {
 }
 
 #[test]
+fn a_layer_drops_at_the_end_with_explicit_null_before() {
+    for in_group in [false, true] {
+        let mut s = world();
+        let names = |s: &Session| s.map().layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>();
+        let g = s.run("group.add", &json!({"name": "Water", "layers": ["Rivers", "Lakes"]})).unwrap()["group"].clone();
+        let group = if in_group { g } else { Value::Null };
+        let original = names(&s);
+        // Omitting before keeps the nearest-end behavior used by the group's context menu.
+        s.run("layer.group", &json!({"layer": "Cities", "group": group})).unwrap();
+        assert_eq!(names(&s), original);
+        let members = s.map().groups[0].children.clone();
+        let depth = s.undo_depth();
+        s.run("layer.group", &json!({"layer": "Cities", "group": group, "before": null})).unwrap();
+        let expected = if in_group { ["Rivers", "Lakes", "Cities", "Countries"] } else { ["Rivers", "Lakes", "Countries", "Cities"] };
+        assert_eq!(names(&s), expected);
+        assert_eq!(s.undo_depth(), depth + 1);
+        s.run("edit.undo", &Value::Null).unwrap();
+        assert_eq!(names(&s), original);
+        assert_eq!(s.map().groups[0].children, members);
+        s.run("edit.redo", &Value::Null).unwrap();
+        assert_eq!(names(&s), expected);
+        assert!(s.run("layer.group", &json!({"layer": ["Cities", "Countries"], "group": group, "before": null})).is_err());
+    }
+}
+
+#[test]
 fn a_moved_group_never_lands_inside_another() {
     let mut s = world();
     let names = |s: &Session| s.map().layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>();

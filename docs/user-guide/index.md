@@ -29,7 +29,10 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
   under **Settings › Customize › Quick Access**.
 - **Layers pane** (left): the map's layers in drawing order, with their legends. Tick a layer to
   show or hide it; drag it up or down to change the drawing order; right-click it to zoom to it,
-  rename or remove it and more. Type in the box at the top to show only the layers and tables
+  rename or remove it and more. While dragging, **Drop at top** above the first row moves the
+  layer to the top. A layer name's upper and lower halves place the drop above or below it,
+  even with its legend expanded; below the last layer puts it at the bottom.
+  Type in the box at the top to show only the layers and tables
   whose names contain the text (++escape++ clears it); a selected layer it hides is no longer
   selected, and layers can be reordered again once it is cleared. The buttons beside the list's
   title list the layers by **drawing order**, by **data source** (grouped under the file, web
