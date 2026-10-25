@@ -1037,11 +1037,6 @@ fn idw_auto_cell(extent: &Extent, n: usize) -> f64 {
 /// Ordinary Kriging interpolation: builds prediction and error surfaces from spatial autocorrelation.
 fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
-    if let Some(crs) = ds.crs
-        && crs != rustgis_data::raster::Crs::LonLat
-    {
-        return Err("kriging interpolation expects coordinates in degrees (WGS 84 / EPSG:4326)".into());
-    }
     let field = s(p, "field");
     let fi = find_field_case_insensitive(ds, field)?;
     let mut raw_pts: Vec<(Coord, f64)> = Vec::new();
@@ -2537,13 +2532,22 @@ mod tests {
         assert!(crate::run("kriging", &m, &serde_json::json!({"input": "pts", "field": "v", "range": -5})).is_err());
         assert!(crate::run("kriging", &m, &serde_json::json!({"input": "pts", "field": "v", "range": "none"})).is_err());
 
-        // Projected layer with non-degrees CRS returns error
+        // Source CRS metadata does not change the normalized longitude/latitude geometry.
         let Some(pts_layer) = m.0.get("pts") else { panic!("missing pts") };
         let mut proj_pts = pts_layer.clone();
         proj_pts.crs = Some(rustgis_data::raster::Crs::WebMercator);
         let m_proj = Map(HashMap::from([("proj_pts".to_string(), proj_pts)]));
-        let err = crate::run("kriging", &m_proj, &serde_json::json!({"input": "proj_pts", "field": "v"})).unwrap_err();
-        assert!(err.contains("degrees"));
+        let projected =
+            crate::run("kriging", &m_proj, &serde_json::json!({"input": "proj_pts", "field": "v", "extent": "0,0,2,2", "pixelSize": 0.5}))
+                .unwrap();
+        let Output::Layers(projected_layers) = projected.output else { panic!("expected layers") };
+        assert_eq!(projected_layers.len(), out.len());
+        for (actual, expected) in projected_layers.iter().zip(&out) {
+            let (OutputLayer::Raster { bytes: actual, .. }, OutputLayer::Raster { bytes: expected, .. }) = (actual, expected) else {
+                panic!("expected raster layers")
+            };
+            assert_eq!(actual, expected);
+        }
 
         // Datasets with fewer than two points are cleanly rejected
         let mut single_pt = Dataset::new("single", GeometryType::Point, vec![Field::new("v", FieldType::Double)]);
