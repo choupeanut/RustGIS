@@ -662,8 +662,7 @@ fn contents(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                             layer_group_row(app, ui, group, &layers, scale, reorder, &mut rows, t);
                         }
                     } else {
-                        let rect = layer_row(app, ui, layer, scale, reorder, t);
-                        rows.push(DropRow { id: layer.id, rect, group: None, header: false });
+                        rows.push(layer_row(app, ui, layer, scale, reorder, t));
                     }
                 }
                 for group in &groups {
@@ -1193,7 +1192,7 @@ fn layer_group_row(
             egui::DragAndDrop::set_payload(ui.ctx(), DraggedLayer(group.id));
         }
         let dragging = egui::DragAndDrop::payload::<DraggedLayer>(ui.ctx()).is_some_and(|d| d.0 == group.id);
-        rows.push(DropRow { id: group.id, rect: r, group: None, header: true });
+        rows.push(DropRow { id: group.id, rect: r, name_center_y: r.center().y, group: None, header: true });
         if resp.hovered() || dragging {
             ui.painter().rect_filled(r.shrink2(vec2(4.0, 1.0)), CornerRadius::same(5), t.hover);
         }
@@ -1260,8 +1259,8 @@ fn layer_group_row(
         if group.expanded || filtering {
             ui.indent("children", |ui| {
                 for layer in children.iter().filter(|l| filter_shows(&q, &l.name) || filter_shows(&q, &group.name)) {
-                    let rect = layer_row(app, ui, layer, scale, reorder, t);
-                    rows.push(DropRow { id: layer.id, rect, group: Some(group.id), header: false });
+                    let row = layer_row(app, ui, layer, scale, reorder, t);
+                    rows.push(DropRow { group: Some(group.id), ..row });
                 }
             });
         }
@@ -1278,6 +1277,7 @@ struct DraggedLayer(u32);
 struct DropRow {
     id: u32,
     rect: Rect,
+    name_center_y: f32,
     group: Option<u32>,
     header: bool,
 }
@@ -1332,8 +1332,8 @@ fn layer_drop(app: &mut RustGisApp, ui: &Ui, rows: &[DropRow], t: &Tokens) {
         }
         return;
     }
-    // The gap above the first row whose middle is below the pointer, or the one after the last.
-    let gap = rows.iter().position(|r| pointer.y < r.rect.center().y).unwrap_or(rows.len());
+    // The name row decides above or below; an expanded legend only extends the drop area.
+    let gap = rows.iter().position(|r| pointer.y < r.name_center_y).unwrap_or(rows.len());
     let below = rows.get(gap);
     // Above one of a group's layers is in that group; anywhere else, in none.
     let into = below.filter(|r| !r.header).and_then(|r| r.group);
@@ -1517,9 +1517,9 @@ impl RowName {
     }
 }
 
-/// A layer's row and, expanded, its legend; returns the rectangle of both. With `reorder` off
+/// A layer's drop row: its name's middle and the rectangle including its legend. With `reorder` off
 /// (the list is filtered or children are sorted by name) the row can't be dragged.
-fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: bool, t: &Tokens) -> Rect {
+fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: bool, t: &Tokens) -> DropRow {
     app.ui.layer_rows.push(l.id);
     let active = app.session.active_layer == Some(l.id);
     let picked = app.ui.layer_picked.contains(&l.id);
@@ -1702,7 +1702,13 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
             ui.painter().text(pos2(r.min.x + 100.0, r.center().y), Align2::LEFT_CENTER, &e.label, regular(11.5), t.text);
         }
     }
-    Rect::from_min_max(r.min, pos2(r.max.x, ui.min_rect().max.y.max(r.max.y)))
+    DropRow {
+        id: l.id,
+        rect: Rect::from_min_max(r.min, pos2(r.max.x, ui.min_rect().max.y.max(r.max.y))),
+        name_center_y: r.center().y,
+        group: None,
+        header: false,
+    }
 }
 
 /// Makes a group of layers from a menu, then asks for its name, as the default one says nothing.
@@ -5334,6 +5340,65 @@ mod tests {
 
     fn layer(app: &RustGisApp, name: &str) -> u32 {
         app.session.map().layer_by_name(name).map(|l| l.id).unwrap_or_default()
+    }
+
+    /// #836: the name's lower half means below, even with a tall legend; the legend
+    /// itself still accepts drops. Group membership and one-step undo follow the drop.
+    #[test]
+    fn expanded_legends_do_not_shift_layer_drop_boundaries() {
+        use egui::{Event, Modifiers, PointerButton};
+        use egui_kittest::kittest::Queryable;
+        for grouped in [false, true] {
+            for (expanded, offset) in [(false, -4.0), (false, 4.0), (true, -4.0), (true, 4.0), (true, 40.0)] {
+                let mut app = RustGisApp::with_sample();
+                let (cities, countries) = (layer(&app, "Cities"), layer(&app, "Countries"));
+                app.run("layer.move", json!({"layer": countries, "to": 2})).unwrap();
+                app.session.map_mut().layer_mut(countries).unwrap().expanded = expanded;
+                if grouped {
+                    app.run("group.add", json!({"layers": [countries], "name": "Base"})).unwrap();
+                }
+                let original: Vec<_> = app.session.map().layers.iter().map(|l| l.id).collect();
+                let undo = app.session.undo_depth();
+                let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
+                    |ui, app: &mut RustGisApp| {
+                        let ctx = ui.ctx().clone();
+                        app.logic(&ctx);
+                        app.ui(ui);
+                    },
+                    app,
+                );
+                h.run_steps(6);
+                let from = h.get_by_label("Cities").rect().center();
+                let name = h.get_by_label("Countries").rect();
+                let to = name.center() + vec2(0.0, offset);
+                let button =
+                    |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+                h.event(Event::PointerMoved(from));
+                h.step();
+                h.event(button(from, true));
+                h.step();
+                h.event(Event::PointerMoved(from + vec2(10.0, 0.0)));
+                h.step();
+                h.event(Event::PointerMoved(to));
+                h.step();
+                h.event(button(to, false));
+                h.step();
+                let mut expected: Vec<_> = original.iter().copied().filter(|id| *id != cities).collect();
+                let target = expected.iter().position(|id| *id == countries).unwrap() + usize::from(offset > 0.0);
+                expected.insert(target, cities);
+                let map = h.state().session.map();
+                assert_eq!(
+                    map.layers.iter().map(|l| l.id).collect::<Vec<_>>(),
+                    expected,
+                    "grouped={grouped}, expanded={expanded}, offset={offset}"
+                );
+                assert_eq!(map.group_of(cities).is_some(), grouped && offset < 0.0);
+                assert_eq!(h.state().session.undo_depth(), undo + 1);
+                h.state_mut().run("edit.undo", Value::Null).unwrap();
+                assert_eq!(h.state().session.map().layers.iter().map(|l| l.id).collect::<Vec<_>>(), original);
+                assert!(h.state().session.map().group_of(cities).is_none());
+            }
+        }
     }
 
     /// The Data Source view (#301) names a group by a file's name (its path on hover) or a web
