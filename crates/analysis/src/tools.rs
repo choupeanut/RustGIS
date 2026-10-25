@@ -2002,7 +2002,7 @@ fn zonal_stats(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let n_features = out.features.len();
     let mut messages = vec![format!("Calculated zonal statistics for {n_features} feature(s)")];
     if skipped_features > 0 {
-        messages.push(format!("{skipped_features} feature(s) had invalid geometry or failed coordinate transformation"));
+        messages.push(format!("{skipped_features} feature(s) had invalid geometry"));
     }
     if skipped_parts > 0 {
         messages.push(format!("{skipped_parts} polygon part(s) could not be projected onto the raster grid; valid parts were retained"));
