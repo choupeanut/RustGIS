@@ -104,6 +104,13 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | IDW Interpolation | `idwInterpolation` | Analysis › Interpolation |
 | Ordinary Kriging | `kriging` | Analysis › Interpolation |
 
+**Simplify** uses Douglas–Peucker with a tolerance in kilometres. Each polygon ring keeps at
+least three different, non-collinear corners (plus the closing vertex), so a tolerance larger
+than a polygon produces a small ring instead of restoring its original vertices. Holes and
+multipart rings are retained. This is not a topology-preserving simplifier: check the result
+where holes or neighbouring polygons must stay aligned. The default tolerance remains 25 km;
+use a smaller value for local boundaries.
+
 Most feature tools process only the selected rows when an input has a selection. Selection tools
 instead replace the input's selection; Select Layer By Location honours the selecting layer's
 selection. Summarize Within counts the selected points against **all** input polygons, and

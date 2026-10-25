@@ -892,11 +892,54 @@ fn xy_table_to_point(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     Ok(ToolResult { output: Output::Layer(out), messages })
 }
 
+// Three fixed non-collinear anchors prevent ring collapse and keep vertex counts monotonic.
+fn simplify_ring(ring: &geo::LineString<f64>, eps: f64) -> geo::LineString<f64> {
+    use geo::{Distance, Euclidean};
+    if ring.0.len() <= 4 || ring.0.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
+        return ring.clone();
+    }
+    let Some(&first) = ring.0.first() else { return ring.clone() };
+    let Some((b, _)) = ring.0.iter().enumerate().map(|(i, c)| (i, Euclidean.distance(first, *c))).max_by(|a, b| a.1.total_cmp(&b.1)) else {
+        return ring.clone();
+    };
+    let Some(&second) = ring.0.get(b) else { return ring.clone() };
+    let Some((c, _)) = ring
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, ((second.x - first.x) * (c.y - first.y) - (second.y - first.y) * (c.x - first.x)).abs()))
+        .filter(|(_, area)| area.is_finite() && *area > 0.0)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+    else {
+        return ring.clone();
+    };
+    let mut stops = [0, b, c, ring.0.len() - 1];
+    stops.sort_unstable();
+    let mut corners = Vec::new();
+    for bounds in stops.windows(2) {
+        let [start, end] = bounds else { return ring.clone() };
+        let Some(arc) = ring.0.get(*start..=*end) else { return ring.clone() };
+        let simple = geo::LineString::new(arc.to_vec()).simplify(eps);
+        corners.extend(simple.0.into_iter().skip(usize::from(!corners.is_empty())));
+    }
+    geo::LineString::new(corners)
+}
+
 /// A geometry simplified (Douglas–Peucker) to a tolerance in metres.
 pub fn simplify_geometry(g: &Geometry, tol_m: f64) -> Geometry {
     let eps = tol_m * merc_scale(feature_lat(g));
     let sg = match g {
-        Geometry::Polygon(_) => to_multipolygon(g).and_then(|m| from_multipolygon(&m.simplify(eps))),
+        Geometry::Polygon(_) => to_multipolygon(g).and_then(|mut m| {
+            for p in &mut m.0 {
+                p.exterior_mut(|r| *r = simplify_ring(r, eps));
+                p.interiors_mut(|rings| {
+                    for r in rings {
+                        *r = simplify_ring(r, eps);
+                    }
+                });
+            }
+            from_multipolygon(&m)
+        }),
         Geometry::Line(_) => to_multiline(g).and_then(|m| from_line(&m.simplify(eps))),
         _ => None,
     };
@@ -912,14 +955,9 @@ fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         let Some(f) = ds.features.get(r) else { continue };
         let Some(g) = &f.geometry else { continue };
         before += g.coord_count();
-        let eps = tol * merc_scale(feature_lat(g));
-        let sg = match g {
-            Geometry::Polygon(_) => to_multipolygon(g).and_then(|m| from_multipolygon(&m.simplify(eps))),
-            Geometry::Line(_) => to_multiline(g).and_then(|m| from_line(&m.simplify(eps))),
-            other => Some(other.clone()),
-        };
-        after += sg.as_ref().map(|g| g.coord_count()).unwrap_or(0);
-        out.push(sg, f.attrs.clone());
+        let sg = simplify_geometry(g, tol);
+        after += sg.coord_count();
+        out.push(Some(sg), f.attrs.clone());
     }
     result(out, format!("Simplify: {before} → {after} vertices"))
 }
@@ -2089,6 +2127,82 @@ mod tests {
             Output::Layer(d) | Output::Table(d) | Output::Update { dataset: d, .. } => d,
             Output::Selection { .. } | Output::Layers(_) => panic!("expected a dataset"),
         }
+    }
+
+    #[test]
+    fn simplify_rings_do_not_grow_with_tolerance() {
+        use geo::{Distance, Euclidean};
+        let ring = |x: f64, y: f64, radius: f64| {
+            (0..=80)
+                .map(|i| {
+                    let angle = (i % 80) as f64 * std::f64::consts::TAU / 80.0;
+                    let r = radius * (1.0 + 0.1 * (7.0 * angle).sin());
+                    Coord::new(x + r * angle.cos(), y + r * angle.sin())
+                })
+                .collect::<Vec<_>>()
+        };
+        let original = Geometry::Polygon(vec![vec![ring(10.5, 46.5, 0.1), ring(10.5, 46.52, 0.001)], vec![ring(11.0, 46.5, 0.05)]]);
+        let mut ds = Dataset::new("zones", GeometryType::Polygon, vec![]);
+        ds.push(Some(original.clone()), vec![]);
+        let inputs = Map(HashMap::from([("zones".into(), ds)]));
+        let mut previous = original.coord_count();
+        for tolerance in [0.0, 100.0, 500.0, 1000.0, 2000.0, 5000.0, 25000.0, 100000.0] {
+            let simple = simplify_geometry(&original, tolerance);
+            assert!(simple.coord_count() <= previous, "{tolerance} m: {} > {previous}", simple.coord_count());
+            previous = simple.coord_count();
+            let Geometry::Polygon(parts) = &simple else { panic!("polygon required") };
+            assert_eq!(parts.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1]);
+            for rings in parts {
+                for r in rings {
+                    assert!(r.len() >= 4);
+                    assert_eq!(r.first(), r.last());
+                    assert!(rustgis_data::geometry::ring_area(r).abs() > 1e-14);
+                }
+            }
+            let source = to_multipolygon(&original).unwrap();
+            let target = to_multipolygon(&simple).unwrap();
+            for (a, b) in source.0.iter().zip(&target.0) {
+                for (a, b) in std::iter::once(a.exterior()).chain(a.interiors()).zip(std::iter::once(b.exterior()).chain(b.interiors())) {
+                    let deviation = a.0.iter().map(|c| Euclidean.distance(&geo::Point::from(*c), b)).fold(0.0_f64, f64::max);
+                    assert!(deviation <= tolerance * merc_scale(feature_lat(&original)) + 1e-6, "{tolerance} m: {deviation}");
+                }
+            }
+            let out =
+                layer(crate::run("simplify", &inputs, &serde_json::json!({"input":"zones", "tolerance":tolerance / 1000.0})).unwrap());
+            assert_eq!(out.features[0].geometry.as_ref(), Some(&simple));
+        }
+        assert_eq!(previous, 12, "three closed triangle rings at a very large tolerance");
+    }
+
+    #[test]
+    fn simplify_keeps_points_lines_and_degenerate_rings() {
+        use geo::Area;
+        let point = Geometry::Point(Coord::new(10.0, 46.0));
+        assert_eq!(simplify_geometry(&point, 1e6), point);
+        let line = Geometry::Line(vec![vec![Coord::new(10.0, 46.0), Coord::new(10.1, 46.0), Coord::new(10.2, 46.0)]]);
+        assert_eq!(simplify_geometry(&line, 1e6).coord_count(), 2);
+        let repeated = geo::LineString::new(vec![geo::Coord { x: 1.0, y: 1.0 }; 6]);
+        assert_eq!(simplify_ring(&repeated, 1e6), repeated);
+        let collinear = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (0.0, 0.0)]);
+        assert_eq!(simplify_ring(&collinear, 1e6), collinear);
+        let both_sides = geo::LineString::from(vec![(0.0, 0.0), (3.0, 0.0), (-3.0, 0.0), (0.0, 0.0), (1.0, 0.0), (0.0, 0.0)]);
+        assert_eq!(simplify_ring(&both_sides, 1e6), both_sides);
+        let concave = geo::LineString::from(vec![(0.0, 0.0), (3.0, 0.0), (2.0, 1.0), (-2.0, 1.0), (-3.0, 0.0), (-2.0, -1.0), (0.0, 0.0)]);
+        let mut previous = concave.0.len();
+        for tolerance in [0.1, 1.1, 2.5, 1e6] {
+            use geo::{Distance, Euclidean};
+            let reduced = simplify_ring(&concave, tolerance);
+            assert!((4..=previous).contains(&reduced.0.len()));
+            previous = reduced.0.len();
+            let deviation = concave.0.iter().map(|c| Euclidean.distance(&geo::Point::from(*c), &reduced)).fold(0.0_f64, f64::max);
+            assert!(deviation <= tolerance + 1e-12);
+            assert!(geo::Polygon::new(reduced, vec![]).unsigned_area() > 0.0);
+        }
+        assert_eq!(previous, 4);
+        let triangle = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]);
+        assert_eq!(simplify_ring(&triangle, 1e6), triangle);
+        let nonfinite = geo::LineString::from(vec![(0.0, 0.0), (f64::INFINITY, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]);
+        assert_eq!(simplify_ring(&nonfinite, 1e6), nonfinite);
     }
 
     #[test]

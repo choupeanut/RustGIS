@@ -16858,3 +16858,38 @@ fn raster_projection_failures_are_reported_for_zonal_statistics_and_clipping() {
     let data = s.map().layer_by_name("clipped").unwrap().raster.as_ref().unwrap().data.as_ref().unwrap();
     assert_eq!((data.width, data.height), (8, 8));
 }
+
+#[test]
+fn simplify_large_tolerances_keep_a_small_polygon_and_one_step_undo() {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    use rustgis_geom::Coord;
+    let mut s = world();
+    let ring = (0..=40)
+        .map(|i| {
+            let angle = (i % 40) as f64 * std::f64::consts::TAU / 40.0;
+            Coord::new(10.5 + 0.05 * angle.cos(), 46.5 + 0.05 * angle.sin())
+        })
+        .collect();
+    let mut zones = Dataset::new("zones", GeometryType::Polygon, vec![Field::new("code", FieldType::Text)]);
+    zones.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Value::Text("Z1".into())]);
+    s.map_mut().add_layer(rustgis_map::Layer::new(0, zones.clone()));
+    let mut previous = zones.features[0].geometry.as_ref().unwrap().coord_count();
+    for tolerance in [0.1, 0.5, 1.0, 2.0, 5.0, 25.0, 100.0] {
+        let depth = s.undo_depth();
+        s.run("gp.run", &json!({"tool":"simplify", "params":{"input":"zones", "tolerance":tolerance, "output":"simple"}})).unwrap();
+        let out = &s.map().layer_by_name("simple").unwrap().dataset;
+        assert_eq!(out.features.len(), 1);
+        assert_eq!(out.features[0].attrs, zones.features[0].attrs);
+        let count = out.features[0].geometry.as_ref().unwrap().coord_count();
+        assert!((4..=previous).contains(&count), "{tolerance} km: {count} > {previous}");
+        previous = count;
+        assert_eq!(s.map().layer_by_name("zones").unwrap().dataset, zones);
+        assert_eq!(s.undo_depth(), depth + 1);
+        assert!(s.undo());
+        assert!(s.map().layer_by_name("simple").is_none());
+        assert!(s.redo());
+        assert_eq!(s.map().layer_by_name("simple").unwrap().dataset.features[0].geometry.as_ref().unwrap().coord_count(), count);
+        assert!(s.undo());
+    }
+    assert_eq!(previous, 4);
+}

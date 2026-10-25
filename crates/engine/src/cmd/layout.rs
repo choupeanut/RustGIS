@@ -1439,10 +1439,23 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             // Each polygon simplified to a tenth of a millimetre on the disc (its scale in metres),
             // so the project keeps a sketch of the layers for it, not a second full copy of them.
             let tolerance_m = globe * 1e-4;
-            // A polygon too small for that (an island) would collapse to a ring of under four
-            // points: it keeps its own shape, already small.
+            // On the locator, sub-tolerance rings keep their outline rather than becoming triangles.
             let sketch = |g: &rustgis_data::Geometry| {
-                let simple = rustgis_analysis::simplify_geometry(g, tolerance_m);
+                let mut simple = rustgis_analysis::simplify_geometry(g, tolerance_m);
+                if let (rustgis_data::Geometry::Polygon(original), rustgis_data::Geometry::Polygon(reduced)) = (g, &mut simple) {
+                    for (original, reduced) in original.iter().flatten().zip(reduced.iter_mut().flatten()) {
+                        let mut extent = Extent::EMPTY;
+                        for &c in original {
+                            extent.expand(c);
+                        }
+                        let projected = rustgis_geom::extent_to_merc(&extent);
+                        let size_m =
+                            projected.width().hypot(projected.height()) * extent.center().y.clamp(-85.0, 85.0).to_radians().cos().max(0.01);
+                        if size_m < tolerance_m {
+                            *reduced = original.clone();
+                        }
+                    }
+                }
                 match &simple {
                     rustgis_data::Geometry::Polygon(polys) if polys.iter().flatten().all(|ring| ring.len() >= 4) => simple,
                     _ => g.clone(),
