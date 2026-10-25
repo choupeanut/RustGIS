@@ -535,3 +535,40 @@ fn raster_renderers_read_as_rustgis_raster_styles() {
         assert!(s.raster.is_none() && report.notes.iter().any(|n| n.text.contains("couldn't read")), "{bad}: {report:?}");
     }
 }
+
+/// Every generated style and project in `testdata/qgis` reads, each project with its layers.
+#[test]
+fn every_corpus_file_reads() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis");
+    let files = |dir: &str, extensions: &[&str]| {
+        let mut paths: Vec<_> = std::fs::read_dir(root.join(dir)).unwrap().map(|e| e.unwrap().path()).collect();
+        paths.retain(|path| path.is_file() && path.extension().and_then(|e| e.to_str()).is_some_and(|e| extensions.contains(&e)));
+        paths.sort();
+        paths
+    };
+    // Pin the corpus sizes so a regeneration cannot silently drop fixtures.
+    let styles = files("generated/qml", &["qml"]);
+    assert_eq!(styles.len(), 90, "style corpus changed: {styles:?}");
+    for path in &styles {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut report = Report::default();
+        read_style(&text, "layer", &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    }
+    let projects = files("generated/qgs", &["qgs", "qgz"]);
+    assert_eq!(projects.len(), 21, "project corpus changed: {projects:?}");
+    for path in &projects {
+        let bytes = std::fs::read(path).unwrap();
+        let text = if path.extension().is_some_and(|e| e == "qgz") {
+            let entries = rustgis_data::zip::read_matching_within(&bytes, |n| n.ends_with(".qgs"), 64 << 20).unwrap();
+            String::from_utf8(entries.into_iter().next().unwrap().1).unwrap()
+        } else {
+            String::from_utf8(bytes).unwrap()
+        };
+        let dir = path.parent().unwrap().to_string_lossy().to_string();
+        let mut report = Report::default();
+        let project = read_project(&text, &dir, &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(!project.layers.is_empty(), "{}: no layers", path.display());
+        // The PostGIS and SQL Server projects' made-up password reaches neither the layers nor the notes.
+        assert!(!format!("{project:?} {report:?}").contains("secret"), "{}: the password came through", path.display());
+    }
+}
