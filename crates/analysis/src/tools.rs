@@ -3,7 +3,7 @@
 use geo::{BooleanOps, Contains, ConvexHull, InteriorPoint, Intersects, MultiPolygon, Orient, Simplify, orient::Direction};
 use rustgis_data::raster::Crs;
 use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value};
-use rustgis_geom::{Extent, geodesic_length_m, geodesic_ring_area_m2};
+use rustgis_geom::Extent;
 use serde_json::Value as Json;
 
 use crate::convert::{from_line, from_multipolygon, from_point, to_geo, to_multiline, to_multipolygon};
@@ -1236,6 +1236,8 @@ fn count_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 }
 
 fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    use geo::{Geodesic, GeodesicArea, Length};
+    let line = |coords: &[Coord]| geo::LineString::new(coords.iter().map(|c| geo::Coord { x: c.x, y: c.y }).collect());
     let ds = input(inp, p, "input")?;
     let mut out = ds.clone();
     match ds.geometry_type {
@@ -1247,9 +1249,9 @@ fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                 if let Some(Geometry::Polygon(polys)) = &f.geometry {
                     for rings in polys {
                         for (i, r) in rings.iter().enumerate() {
-                            let ra = geodesic_ring_area_m2(r);
-                            a += if i == 0 { ra } else { -ra };
-                            per += geodesic_length_m(r);
+                            let (rp, ra) = geo::Polygon::new(line(r), vec![]).geodesic_perimeter_area_signed();
+                            a += if i == 0 { ra.abs() } else { -ra.abs() };
+                            per += rp;
                         }
                     }
                 }
@@ -1265,7 +1267,7 @@ fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             let fl = out.ensure_field("length_km", FieldType::Double);
             for f in &mut out.features {
                 let len: f64 = match &f.geometry {
-                    Some(Geometry::Line(parts)) => parts.iter().map(|p| geodesic_length_m(p)).sum(),
+                    Some(Geometry::Line(parts)) => parts.iter().map(|p| Geodesic.length(&line(p))).sum(),
                     _ => 0.0,
                 };
                 if let Some(v) = f.attrs.get_mut(fl) {
@@ -2241,6 +2243,75 @@ mod tests {
             let radius = on_wgs84_m(center, *vertex);
             assert!((radius - 152.4).abs() < 1e-6, "radius: {radius}");
         }
+    }
+
+    // Reference values from PROJ / pyproj 3.7.2 Geod(ellps="WGS84"), in km² and km.
+    #[test]
+    fn calculate_geometry_uses_wgs84_for_polygons() {
+        let rectangle = |x: f64, y: f64, w: f64, h: f64| {
+            vec![Coord::new(x, y), Coord::new(x + w, y), Coord::new(x + w, y + h), Coord::new(x, y + h), Coord::new(x, y)]
+        };
+        for (lat, area, perimeter) in [
+            (0.0, 132.93794889680612, 68.77959742996498),
+            (46.5, 92.07715389612198, 58.58311003354862),
+            (60.0, 67.04587460470582, 52.371257858418176),
+        ] {
+            let parts = vec![
+                vec![rectangle(10.5, lat, 0.1, 0.1), rectangle(10.52, lat + 0.02, 0.02, 0.02)],
+                vec![rectangle(11.0, lat, 0.03, 0.04)],
+            ];
+            for reverse in [false, true] {
+                let mut parts = parts.clone();
+                if reverse {
+                    for ring in parts.iter_mut().flatten() {
+                        ring.reverse();
+                    }
+                }
+                let mut ds = Dataset::new("zones", GeometryType::Polygon, vec![Field::new("code", FieldType::Text)]);
+                ds.push(Some(Geometry::Polygon(parts)), vec![Value::Text("Z1".into())]);
+                let inputs = Map(HashMap::from([("zones".into(), ds.clone())]));
+                let out = layer(crate::run("calculateGeometry", &inputs, &serde_json::json!({"input":"zones"})).unwrap());
+                assert_eq!(out.features[0].geometry, ds.features[0].geometry);
+                assert_eq!(out.value(0, 0), &Value::Text("Z1".into()));
+                let measured_area = out.value(0, out.field_index("area_km2").unwrap()).as_f64().unwrap();
+                let measured_perimeter = out.value(0, out.field_index("perimeter_km").unwrap()).as_f64().unwrap();
+                assert!((measured_area - area).abs() < 1e-6, "{lat}, reversed={reverse}: {measured_area} vs {area}");
+                assert!((measured_perimeter - perimeter).abs() < 1e-6, "{lat}: {measured_perimeter} vs {perimeter}");
+                assert_eq!(inputs.0["zones"], ds);
+            }
+        }
+        let ring = vec![
+            Coord::new(179.9, 10.0),
+            Coord::new(-179.9, 10.0),
+            Coord::new(-179.9, 10.1),
+            Coord::new(179.9, 10.1),
+            Coord::new(179.9, 10.0),
+        ];
+        let mut ds = Dataset::new("island", GeometryType::Polygon, vec![]);
+        ds.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+        let inputs = Map(HashMap::from([("island".into(), ds)]));
+        let out = layer(crate::run("calculateGeometry", &inputs, &serde_json::json!({"input":"island"})).unwrap());
+        assert!((out.value(0, out.field_index("area_km2").unwrap()).as_f64().unwrap() - 242.50305444813918).abs() < 1e-6);
+        assert!((out.value(0, out.field_index("perimeter_km").unwrap()).as_f64().unwrap() - 65.97062684618793).abs() < 1e-6);
+    }
+
+    #[test]
+    fn calculate_geometry_uses_wgs84_for_lines() {
+        let mut ds = Dataset::new("routes", GeometryType::Polyline, vec![]);
+        let parts = vec![
+            vec![Coord::new(0.0, 0.0), Coord::new(1.0, 0.0)],
+            vec![Coord::new(10.0, 60.0), Coord::new(10.0, 61.0)],
+            vec![Coord::new(179.9, 10.0), Coord::new(-179.9, 10.0)],
+        ];
+        ds.push(Some(Geometry::Line(parts)), vec![]);
+        ds.push(None, vec![]);
+        let inputs = Map(HashMap::from([("routes".into(), ds.clone())]));
+        let out = layer(crate::run("calculateGeometry", &inputs, &serde_json::json!({"input":"routes"})).unwrap());
+        let length = out.field_index("length_km").unwrap();
+        let expected = 111.31949079327356 + 111.42072786973769 + 21.92787247793737;
+        assert!((out.value(0, length).as_f64().unwrap() - expected).abs() < 1e-6);
+        assert_eq!(out.value(1, length).as_f64(), Some(0.0));
+        assert_eq!(out.features[0].geometry, ds.features[0].geometry);
     }
 
     /// Calculate Geometry stores full-precision values (#513): rounding to 0.01 km² gave every

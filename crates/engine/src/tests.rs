@@ -17395,3 +17395,26 @@ fn publication_locator_keeps_small_islands_across_the_antimeridian() {
         assert_eq!(geometry.as_ref(), Some(&original), "island at {lon}, {lat}");
     }
 }
+
+#[test]
+fn calculate_geometry_updates_ellipsoidal_lengths_in_one_undo_step() {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    use rustgis_geom::Coord;
+    let mut s = world();
+    let mut routes = Dataset::new("routes", GeometryType::Polyline, vec![Field::new("code", FieldType::Text)]);
+    routes.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 0.0)]])), vec![Value::Text("R1".into())]);
+    s.map_mut().add_layer(rustgis_map::Layer::new(0, routes.clone()));
+    let depth = s.undo_depth();
+    s.run("gp.run", &json!({"tool":"calculateGeometry", "params":{"input":"routes"}})).unwrap();
+    let out = &s.map().layer_by_name("routes").unwrap().dataset;
+    let length = out.field_index("length_km").unwrap();
+    assert!((out.value(0, length).as_f64().unwrap() - 111.31949079327356).abs() < 1e-6);
+    assert_eq!(out.features[0].geometry, routes.features[0].geometry);
+    assert_eq!(out.value(0, 0), &Value::Text("R1".into()));
+    assert_eq!(s.undo_depth(), depth + 1);
+    assert!(s.undo());
+    assert_eq!(s.map().layer_by_name("routes").unwrap().dataset, routes);
+    assert!(s.redo());
+    let out = &s.map().layer_by_name("routes").unwrap().dataset;
+    assert!((out.value(0, length).as_f64().unwrap() - 111.31949079327356).abs() < 1e-6);
+}
