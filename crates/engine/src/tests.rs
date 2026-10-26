@@ -16893,3 +16893,24 @@ fn simplify_large_tolerances_keep_a_small_polygon_and_one_step_undo() {
     }
     assert_eq!(previous, 4);
 }
+
+#[test]
+fn publication_locator_keeps_small_islands_across_the_antimeridian() {
+    use rustgis_data::{Dataset, Geometry, GeometryType};
+    use rustgis_geom::Coord;
+    for (lon, lat) in [(0.0_f64, -5.0), (180.0, -5.0), (-180.0, 70.0)] {
+        let mut s = world();
+        let ring: Vec<_> = [(-0.0005, 0.0), (0.0005, 0.0), (0.0005, 0.001), (-0.0005, 0.001), (-0.0005, 0.0)]
+            .into_iter()
+            .map(|(x, y)| Coord::new((lon + x + 180.0).rem_euclid(360.0) - 180.0, lat + y))
+            .collect();
+        let original = Geometry::Polygon(vec![vec![ring]]);
+        let mut island = Dataset::new("island", GeometryType::Polygon, vec![]);
+        island.push(Some(original.clone()), vec![]);
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, island));
+        let r = s.run("layout.publication", &json!({"extent": [-46.8, -11.6, -38.5, -2.2]})).unwrap();
+        let locator = s.project.maps.iter().find(|m| Some(m.name.as_str()) == r["locator"].as_str()).unwrap();
+        let geometry = &locator.layer_by_name("island").unwrap().dataset.features[0].geometry;
+        assert_eq!(geometry.as_ref(), Some(&original), "island at {lon}, {lat}");
+    }
+}

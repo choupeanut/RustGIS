@@ -1445,8 +1445,11 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                 if let (rustgis_data::Geometry::Polygon(original), rustgis_data::Geometry::Polygon(reduced)) = (g, &mut simple) {
                     for (original, reduced) in original.iter().flatten().zip(reduced.iter_mut().flatten()) {
                         let mut extent = Extent::EMPTY;
-                        for &c in original {
-                            extent.expand(c);
+                        // Keep the extent continuous across the antimeridian.
+                        let mut longitude = original.iter().find(|c| c.is_finite()).map_or(0.0, |c| c.x);
+                        for &c in original.iter().filter(|c| c.is_finite()) {
+                            longitude += (c.x - longitude + 180.0).rem_euclid(360.0) - 180.0;
+                            extent.expand(Coord::new(longitude, c.y));
                         }
                         let projected = rustgis_geom::extent_to_merc(&extent);
                         let size_m =
