@@ -125,7 +125,11 @@ buffered in stretches of a few hundred kilometres to limit projection error. Neg
 distances shrink polygons. Buffer and Select Layer By Location limit distances to 5,000 km.
 **Calculate Geometry Attributes** measures polygon areas and perimeters, and line lengths,
 on the WGS 84 ellipsoid, independently of the map's display projection. Holes are subtracted
-regardless of ring winding, and multipart measurements are summed. The output fields remain
+regardless of ring winding, and multipart measurements are summed. Ring directions are
+normalized in continuous longitude space, so non-polar regions larger than half the Earth
+keep their full area and small antimeridian crossings stay small. Rings winding around a pole
+use the smaller polar region in either direction; reversing a ring does not select its global
+complement. Edges follow the shortest geodesics between vertices. The output fields remain
 `area_km2`, `perimeter_km` and `length_km`; point coordinates are unchanged.
 Spatial Join's **Largest overlap** still measures area on a sphere of radius 6,371 km; it can
 differ from the ellipsoid by up to about 0.9 % (a small area near a pole).
