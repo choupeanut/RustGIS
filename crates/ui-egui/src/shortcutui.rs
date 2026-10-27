@@ -86,7 +86,7 @@ pub fn can_customize(app: &RustGisApp, id: &str) -> bool {
     }
     crate::chrome::UI_COMMANDS.iter().any(|(command, _, _)| *command == id)
         || app.session.registry.commands.iter().any(|c| c.id == id && !c.needs_input())
-        || rustgis_engine::plugins::commands().iter().any(|c| c.id == id)
+        || rustgis_engine::plugins::command(id).is_some()
         || app.ui.keymap.grouped().iter().any(|(command, params, _)| *command == id && params.is_null())
 }
 
