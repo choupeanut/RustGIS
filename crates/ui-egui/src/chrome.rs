@@ -507,6 +507,7 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             // While a text field has focus, it keeps the keys it acts on: those without Ctrl (⌘),
             // which type text, and undo and redo, whatever they're bound to (#685), as ModelBuilder
             // leaves them.
+            // Pause unmodified shortcuts during first-person movement, retaining the existing Escape, Home and Delete controls.
             if (typing && !b.chord.command)
                 || (text_field && b.chord.is_text_undo())
                 || (app.session.map().view.first_person

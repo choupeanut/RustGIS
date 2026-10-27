@@ -108,8 +108,11 @@ Each layer keeps its look:
 - **Labels**: simple and rule-based, each rule a label class whose SQL clause is its filter and
   its parents' (an else rule's: none of its siblings'), with the text's field, size, colour,
   bold, italic and letter spacing, its font family (drawn in it where it is installed, else in
-  RustGIS's label font), its buffer as a halo of its colour, opacity and size, its placement
-  (Parallel and Curved along lines, around and over points) and its scale range.
+  RustGIS's label font), its buffer as a halo of its colour, opacity and size, its background as
+  a rectangle (filled and outlined as its fill symbol says, padded by its size, its corners
+  rounded), its placement (Parallel and Curved along lines, around and over points), its offset
+  from a point (and on a point layer, its distance around the point, as an offset upwards) and
+  its scale range.
 
 Projects and styles from QGIS 1 and 2 read too: their legend gives the layers' order, and the
 older names of the same settings are read.
@@ -119,7 +122,8 @@ QGIS expressions carry over where they are SQL: fields compared with values, `LI
 near as it can, or left out, and said: the import's notes list, layer by layer, what was
 approximated (pattern fills drawn as a tint of their colour, SVG markers as circles,
 dashed polygon outlines solid, label halos with sharp corners drawn round and blended ones drawn
-over the map, label offsets and wrapping, values outside a graduated renderer's ranges in its first or last class, file options
+over the map, label backgrounds of other shapes drawn as rectangles, label distances from lines
+and polygons, a distance around points moved straight up, and wrapping, values outside a graduated renderer's ranges in its first or last class, file options
 such as `layerid` that RustGIS doesn't read) and what was skipped (arrow lines, other data-defined
 settings, draw effects, label callouts, labels from expressions, contours and other raster
 renderers RustGIS has no match for, PostGIS, WFS
@@ -159,6 +163,7 @@ Use scripts or the assistant for parameterized commands without an interactive e
 **Settings › Customize › Customize Shortcuts** assigns multiple keys to commands and map tools.
 Click **Add…** and press the desired key combination. Escape cancels; **Assign Escape** binds Escape.
 If the combination is already in use, choose **Replace** or **Cancel**.
+Tab, Enter, Space and arrow key bindings can override their usual keyboard navigation actions.
 Click a displayed key to remove it, **Reset** to restore a default key, or **Reset All** to restore
 all defaults. These changes are saved as a user preference on this device. Copy, Cut and Paste stay
 fixed. While typing, shortcuts without Ctrl/⌘ are paused, including Shift and Alt combinations. During

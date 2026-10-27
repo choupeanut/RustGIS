@@ -361,6 +361,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn removed_registry_shortcut_stays_removed_after_preference_reload() {
+        let registry =
+            Registry { commands: vec![rustgis_engine::CommandSpec::new("test.action", "Test", "", |_, _| Ok(Value::Null)).key("F8")] };
+        let defaults = Keymap::new(&registry);
+        let chord = Chord::parse("F8").unwrap();
+        assert_eq!(defaults.command_for(chord).unwrap().command, "test.action");
+        let mut changed = defaults.clone();
+        changed.remove(chord);
+        let saved = changed.preferences(&defaults);
+        let mut reloaded = Keymap::new(&registry);
+        reloaded.apply_preferences(&saved);
+        assert!(reloaded.command_for(chord).is_none());
+    }
+
+    #[test]
     fn shortcut_preferences_round_trip_and_keep_new_defaults() {
         let defaults = Keymap::default();
         let mut changed = defaults.clone();

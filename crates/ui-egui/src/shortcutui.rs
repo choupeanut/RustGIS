@@ -149,7 +149,11 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
                                 remove = Some(chord);
                             }
                         }
-                        if ui.small_button(tl!("Add…")).clicked() {
+                        if ui
+                            .small_button(tl!("Add…"))
+                            .on_hover_text(tl!("Tab, Enter, Space and arrow key bindings can override keyboard navigation."))
+                            .clicked()
+                        {
                             editor.notice_clipboard = false;
                             editor.capture = Some(Target { command: command.clone(), params: params.clone() });
                         }
