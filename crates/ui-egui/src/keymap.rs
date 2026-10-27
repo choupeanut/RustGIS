@@ -7,6 +7,7 @@
 
 use egui::Key;
 use rustgis_engine::Registry;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::RustGisApp;
@@ -174,6 +175,17 @@ impl Binding {
     }
 }
 
+/// One user change to the defaults, stored in preferences.
+#[derive(Serialize, Deserialize)]
+struct Change {
+    keys: String,
+    command: String,
+    #[serde(default)]
+    params: Value,
+    #[serde(default)]
+    remove: bool,
+}
+
 /// Every shortcut.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Keymap {
@@ -212,6 +224,57 @@ impl Keymap {
             }
         }
         map
+    }
+
+    /// Apply stored user changes to this version's defaults.
+    pub fn apply_preferences(&mut self, text: &str) {
+        if text.len() > 100_000 {
+            return;
+        }
+        let Ok(changes) = serde_json::from_str::<Vec<Change>>(text) else { return };
+        for change in changes.into_iter().take(1_000) {
+            let Some(chord) = Chord::parse(&change.keys) else { continue };
+            if is_clipboard(chord) || change.command.is_empty() || change.command.len() > 200 {
+                continue;
+            }
+            if change.remove {
+                self.bindings.retain(|b| b.chord != chord || !b.runs(&change.command, &change.params));
+            } else {
+                self.bindings.retain(|b| b.chord != chord);
+                self.bindings.push(Binding { chord, command: change.command, params: change.params });
+            }
+        }
+    }
+
+    /// Store differences only, so defaults added by a later version still reach the user.
+    pub fn preferences(&self, defaults: &Keymap) -> String {
+        let mut changes = Vec::new();
+        for b in &defaults.bindings {
+            if !self.bindings.contains(b) {
+                changes.push(Change { keys: b.chord.to_string(), command: b.command.clone(), params: b.params.clone(), remove: true });
+            }
+        }
+        for b in &self.bindings {
+            if !defaults.bindings.contains(b) {
+                changes.push(Change { keys: b.chord.to_string(), command: b.command.clone(), params: b.params.clone(), remove: false });
+            }
+        }
+        serde_json::to_string(&changes).unwrap_or_default()
+    }
+
+    /// Assign a chord, replacing its previous assignment. Clipboard chords are reserved.
+    pub fn assign(&mut self, chord: Chord, command: &str, params: Value) -> bool {
+        if is_clipboard(chord) || command.is_empty() {
+            return false;
+        }
+        self.bindings.retain(|b| b.chord != chord);
+        self.bindings.push(Binding { chord, command: command.to_owned(), params });
+        true
+    }
+
+    /// Remove a particular chord.
+    pub fn remove(&mut self, chord: Chord) {
+        self.bindings.retain(|b| b.chord != chord);
     }
 
     /// The binding a key combination runs.
@@ -296,6 +359,28 @@ pub fn label(app: &RustGisApp, command: &str, params: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_preferences_round_trip_and_keep_new_defaults() {
+        let defaults = Keymap::default();
+        let mut changed = defaults.clone();
+        let table = Chord::parse("Mod+T").unwrap();
+        changed.remove(table);
+        let d = Chord::parse("D").unwrap();
+        assert!(changed.assign(d, "tool.set", serde_json::json!({"tool": "select"})));
+        assert!(changed.assign(table, "select.clear", Value::Null));
+        assert!(!changed.assign(Chord::parse("Mod+C").unwrap(), "select.clear", Value::Null));
+        let saved = changed.preferences(&defaults);
+        let mut newer = defaults.clone();
+        let fresh = Chord::parse("F8").unwrap();
+        assert!(newer.assign(fresh, "new.command", Value::Null));
+        newer.apply_preferences(&saved);
+        assert_eq!(newer.command_for(d).unwrap().params, serde_json::json!({"tool": "select"}));
+        assert_eq!(newer.command_for(table).unwrap().command, "select.clear");
+        assert_eq!(newer.command_for(fresh).unwrap().command, "new.command");
+        newer.apply_preferences("not json");
+        assert_eq!(newer.command_for(table).unwrap().command, "select.clear");
+    }
 
     /// Undo and redo are a text field's own, an extra Alt or Shift aside; nothing else is.
     #[test]

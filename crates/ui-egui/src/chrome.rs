@@ -489,7 +489,7 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
     // Behind a dialog (Save changes?, Recover unsaved work?, Command Search…) the keys are the
     // dialog's: Escape answers it rather than switching tools, and Ctrl+N can't start what it
     // asks about.
-    if ctx.memory(|m| m.top_modal_layer()).is_some() {
+    if ctx.memory(|m| m.top_modal_layer()).is_some() || app.ui.shortcut_editor.capturing() {
         return;
     }
     crate::modelbuilder::shortcuts(app, ctx);
@@ -507,7 +507,10 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             // While a text field has focus, it keeps the keys it acts on: those without Ctrl (⌘),
             // which type text, and undo and redo, whatever they're bound to (#685), as ModelBuilder
             // leaves them.
-            if (typing && !b.chord.command) || (text_field && b.chord.is_text_undo()) {
+            if (typing && !b.chord.command)
+                || (text_field && b.chord.is_text_undo())
+                || (app.session.map().view.first_person && !b.chord.command && !b.chord.alt && !b.chord.shift)
+            {
                 continue;
             }
             // Duplicating needs a selected layout element, and not a text field being typed in;
@@ -634,6 +637,8 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
 
 /// The `ui.*` commands Command Search lists: (id, label, ribbon location).
 pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
+    ("ui.customizeShortcuts", "Customize Shortcuts…", "Settings › Customize"),
+    ("ui.identify", "Identify Features", "Home › Inspect"),
     ("ui.addData", "Add Data…", "Home › Add"),
     ("ui.addDelimited", "Add Delimited Text…", "Home › Add › Add Data"),
     ("ui.addUrl", "Add Data From URL…", "Home › Add › Add Data"),
@@ -966,7 +971,11 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                 let on = why.is_none();
                 let mut b = egui::Button::new(egui::RichText::new(label).size(13.0)).frame(false).min_size(vec2(row_w, 26.0));
                 // The command's shortcut after its location.
-                let keys = if id.contains(':') { String::new() } else { crate::keymap::shortcut_text(ui.ctx(), app, id, &Value::Null) };
+                let keys = if id.contains(':') && !id.starts_with("plugin:") {
+                    String::new()
+                } else {
+                    crate::keymap::shortcut_text(ui.ctx(), app, id, &Value::Null)
+                };
                 let right = match (show_loc, keys.is_empty()) {
                     (true, false) => format!("{loc}   {keys}"),
                     (true, true) => loc.clone(),
@@ -979,6 +988,20 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                 let mut resp = row_button(ui, on, b, 0.0);
                 if let Some(why) = why {
                     resp = resp.on_disabled_hover_text(crate::i18n::fmt("Unavailable: {reason}", &[("reason", tl_raw!(why))]));
+                }
+                let mut customize = false;
+                if !id.contains(':') || id.starts_with("plugin:") {
+                    resp.context_menu(|ui| {
+                        if ui.button(tl!("Customize shortcut…")).clicked() {
+                            customize = true;
+                            ui.close();
+                        }
+                    });
+                }
+                if customize {
+                    app.ui.shortcut_editor.open = true;
+                    app.ui.shortcut_editor.filter = id.clone();
+                    keep = false;
                 }
                 let enter = on && first && ui.input(|i| i.key_pressed(Key::Enter));
                 first &= !on;

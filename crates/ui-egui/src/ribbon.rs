@@ -3241,6 +3241,7 @@ fn settings_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 }
             }
         });
+        big(ui, app, "command", "Shortcuts…", "Customize keyboard shortcuts.", "ui.customizeShortcuts", Value::Null, false, false);
         let qa = app.ui.quick_access.clone();
         big_form_menu(ui, app, "command", "Quick\nAccess", "Choose extra buttons for the Quick Access Toolbar.", move |ui, app| {
             for (id, label) in QUICK {

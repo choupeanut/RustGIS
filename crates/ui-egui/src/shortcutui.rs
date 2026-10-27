@@ -1,0 +1,228 @@
+//! User customization of keyboard shortcuts.
+use crate::{
+    RustGisApp,
+    keymap::{self, Chord, Keymap},
+};
+use egui::{Context, Event};
+use serde_json::{Value, json};
+
+const PREF: &str = "shortcut_changes";
+
+#[derive(Clone)]
+struct Target {
+    command: String,
+    params: Value,
+}
+
+#[derive(Default)]
+pub struct Editor {
+    pub open: bool,
+    pub filter: String,
+    capture: Option<Target>,
+    pending: Option<(Chord, Target)>,
+    notice: Option<&'static str>,
+}
+
+impl Editor {
+    pub fn capturing(&self) -> bool {
+        self.capture.is_some() || self.pending.is_some()
+    }
+}
+
+fn save(app: &RustGisApp) {
+    let defaults = Keymap::new(&app.session.registry);
+    if let Some(save) = &app.services.save_pref {
+        save(PREF, &app.ui.keymap.preferences(&defaults));
+    }
+}
+
+pub fn load(app: &mut RustGisApp) {
+    if let Some(changes) = app.services.load_pref.as_ref().and_then(|load| load(PREF)) {
+        app.ui.keymap.apply_preferences(&changes);
+    }
+}
+
+fn assign(app: &mut RustGisApp, editor: &mut Editor, chord: Chord, target: Target) {
+    if keymap::is_clipboard(chord) {
+        editor.notice = Some("Copy, Cut and Paste keys cannot be reassigned.");
+    } else if app.ui.keymap.command_for(chord).is_some_and(|b| !b.runs(&target.command, &target.params)) {
+        editor.pending = Some((chord, target));
+    } else if app.ui.keymap.assign(chord, &target.command, target.params) {
+        save(app);
+    }
+}
+
+fn rows(app: &RustGisApp) -> Vec<(String, Value, String)> {
+    let mut rows = Vec::new();
+    for c in &app.session.registry.commands {
+        if !c.needs_input() && !matches!(c.id, "edit.copy" | "edit.cut" | "edit.paste") {
+            rows.push((c.id.to_string(), Value::Null, tl!(c.label).to_string()));
+        }
+    }
+    for &(id, label, _) in crate::chrome::UI_COMMANDS {
+        rows.push((id.to_string(), Value::Null, tl!(label).to_string()));
+    }
+    for c in rustgis_engine::plugins::commands() {
+        let label = c.plugin.manifest.translate(app.lang().code(), &c.decl.label).to_string();
+        rows.push((c.id, Value::Null, label));
+    }
+    for &(tool, label) in keymap::MAP_TOOLS {
+        rows.push(("tool.set".to_string(), json!({"tool": tool}), crate::i18n::fmt("Map Tool: {tool}", &[("tool", tl_raw!(label))])));
+    }
+    for (command, params, _) in app.ui.keymap.grouped() {
+        if !rows.iter().any(|(c, p, _)| c == command && p == params) {
+            rows.push((command.to_string(), params.clone(), keymap::label(app, command, params)));
+        }
+    }
+    rows.sort_by_key(|a| a.2.to_lowercase());
+    rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    rows
+}
+
+/// Draws the editor after the normal map and dialogs.
+pub fn show(app: &mut RustGisApp, ctx: &Context) {
+    let mut editor = std::mem::take(&mut app.ui.shortcut_editor);
+    if !editor.open {
+        app.ui.shortcut_editor = editor;
+        return;
+    }
+    let mut open = true;
+    let mut remove = None;
+    let mut restore = None;
+    let mut reset_all = false;
+    let defaults = Keymap::new(&app.session.registry);
+    let rows = rows(app);
+    egui::Window::new(tl!("Customize Shortcuts")).open(&mut open).default_width(620.0).default_height(500.0).resizable(true).show(
+        ctx,
+        |ui| {
+            ui.horizontal(|ui| {
+                let label = ui.label(tl!("Search commands"));
+                ui.add_enabled(!editor.capturing(), egui::TextEdit::singleline(&mut editor.filter)).labelled_by(label.id);
+                if ui.button(tl!("Reset All")).clicked() {
+                    reset_all = true;
+                }
+            });
+            if cfg!(target_arch = "wasm32") {
+                ui.label(tl!("Your browser may reserve some shortcuts."));
+            }
+            ui.label(tl!("Single keys are paused during first-person navigation and while typing."));
+            if let Some(notice) = editor.notice {
+                ui.label(tl!(notice));
+            }
+            if editor.capture.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label(tl!("Press a key combination to assign it."));
+                    if ui.button(tl!("Cancel")).clicked() {
+                        editor.capture = None;
+                    }
+                });
+            }
+            let filter = editor.filter.to_lowercase();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for (command, params, label) in &rows {
+                    if !filter.is_empty() && !label.to_lowercase().contains(&filter) && !command.to_lowercase().contains(&filter) {
+                        continue;
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(label);
+                        for chord in app.ui.keymap.keys_for(command, params).collect::<Vec<_>>() {
+                            if ui
+                                .small_button(format!("{} ×", chord.text(ctx.os().is_mac())))
+                                .on_hover_text(tl!("Remove shortcut"))
+                                .clicked()
+                            {
+                                remove = Some(chord);
+                            }
+                        }
+                        if ui.small_button(tl!("Add…")).clicked() {
+                            editor.notice = None;
+                            editor.capture = Some(Target { command: command.clone(), params: params.clone() });
+                        }
+                        for chord in defaults.keys_for(command, params) {
+                            if app.ui.keymap.command_for(chord).is_none_or(|b| !b.runs(command, params))
+                                && ui.small_button(crate::i18n::fmt("Reset {key}", &[("key", &chord.text(ctx.os().is_mac()))])).clicked()
+                            {
+                                restore = Some((chord, Target { command: command.clone(), params: params.clone() }));
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
+            });
+        },
+    );
+    if !open {
+        editor = Editor::default();
+    }
+    if reset_all {
+        app.ui.keymap = defaults;
+        editor.capture = None;
+        editor.pending = None;
+        editor.notice = None;
+        save(app);
+    }
+    if let Some(chord) = remove {
+        app.ui.keymap.remove(chord);
+        save(app);
+    }
+    if let Some((chord, target)) = restore {
+        assign(app, &mut editor, chord, target);
+    }
+    if editor.capture.is_some() {
+        let chord = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                Event::Key { key, pressed: true, repeat: false, modifiers, .. } => {
+                    Some(Chord { command: modifiers.command, alt: modifiers.alt, shift: modifiers.shift, key: *key })
+                }
+                _ => None,
+            })
+        });
+        if let Some(chord) = chord
+            && let Some(target) = editor.capture.take()
+        {
+            assign(app, &mut editor, chord, target);
+        }
+    }
+    if let Some((chord, target)) = editor.pending.clone() {
+        let existing = app.ui.keymap.command_for(chord).map(|b| keymap::label(app, &b.command, &b.params)).unwrap_or_default();
+        egui::Modal::new(egui::Id::unique("shortcut_conflict")).show(ctx, |ui| {
+            ui.heading(tl!("Shortcut already assigned"));
+            ui.label(crate::i18n::fmt("{key} is used by {command}.", &[("key", &chord.text(ctx.os().is_mac())), ("command", &existing)]));
+            ui.horizontal(|ui| {
+                if ui.button(tl!("Replace")).clicked() {
+                    if app.ui.keymap.assign(chord, &target.command, target.params.clone()) {
+                        save(app);
+                    }
+                    editor.pending = None;
+                }
+                if ui.button(tl!("Cancel")).clicked() {
+                    editor.pending = None;
+                }
+            });
+        });
+    }
+    app.ui.shortcut_editor = editor;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustgis_engine::{Project, Session};
+
+    #[test]
+    fn conflicting_and_clipboard_keys_are_not_changed_without_confirmation() {
+        let mut app = RustGisApp::new(Session::new(Project::default()));
+        let mut editor = Editor::default();
+        let target = Target { command: "select.clear".into(), params: Value::Null };
+        let chord = Chord::parse("Mod+T").unwrap();
+        let before = app.ui.keymap.command_for(chord).unwrap().command.clone();
+        assign(&mut app, &mut editor, chord, target.clone());
+        assert!(editor.pending.is_some());
+        assert_eq!(app.ui.keymap.command_for(chord).unwrap().command, before);
+        editor.pending = None;
+        let clipboard = Chord::parse("Mod+C").unwrap();
+        assign(&mut app, &mut editor, clipboard, target);
+        assert!(editor.notice.is_some());
+        assert!(app.ui.keymap.command_for(clipboard).is_none());
+    }
+}
