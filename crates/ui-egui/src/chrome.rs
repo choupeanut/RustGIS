@@ -509,7 +509,11 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             // leaves them.
             if (typing && !b.chord.command)
                 || (text_field && b.chord.is_text_undo())
-                || (app.session.map().view.first_person && !b.chord.command && !b.chord.alt && !b.chord.shift)
+                || (app.session.map().view.first_person
+                    && !b.chord.command
+                    && !b.chord.alt
+                    && !b.chord.shift
+                    && !matches!(b.chord.key, Key::Escape | Key::Home | Key::Delete))
             {
                 continue;
             }
@@ -1295,6 +1299,61 @@ mod tests {
         h.event(undo);
         h.run();
         assert_eq!(h.state().session.undo_depth(), depth - 1, "no field focused: the project");
+    }
+
+    #[test]
+    fn first_person_preserves_default_controls_and_pauses_custom_single_keys() {
+        let mut app = RustGisApp::with_sample();
+        app.session.map_mut().view.first_person = true;
+        app.run("tool.set", json!({"tool": "select"})).unwrap();
+        app.ui.keymap.assign(crate::keymap::Chord::parse("T").unwrap(), "ui.theme", Value::Null);
+        let before = app.ui.dark;
+        let mut h = egui_kittest::Harness::builder().build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                shortcuts(app, ui.ctx());
+            },
+            app,
+        );
+        h.key_press(Key::T);
+        h.run();
+        assert_eq!(h.state().ui.dark, before);
+        h.key_press(Key::Escape);
+        h.run();
+        assert_eq!(h.state().session.tool.code(), "explore");
+        // Home and Delete must also reach the keymap while navigating.
+        for key in ["Home", "Delete"] {
+            h.state_mut().ui.keymap.assign(crate::keymap::Chord::parse(key).unwrap(), "ui.theme", Value::Null);
+            let before = h.state().ui.dark;
+            h.key_press(Key::from_name(key).unwrap());
+            h.run();
+            assert_ne!(h.state().ui.dark, before);
+        }
+    }
+
+    #[test]
+    fn typing_keeps_shift_and_alt_shortcuts_in_the_text_field() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        for key in ["Shift+T", "Alt+T"] {
+            app.ui.keymap.assign(crate::keymap::Chord::parse(key).unwrap(), "ui.theme", Value::Null);
+        }
+        let before = app.ui.dark;
+        let mut h = egui_kittest::Harness::builder().build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                shortcuts(app, ui.ctx());
+                let label = ui.label("Script");
+                ui.text_edit_singleline(&mut app.workflow.script).labelled_by(label.id);
+            },
+            app,
+        );
+        h.run();
+        h.get_by_role(egui::accesskit::Role::TextInput).focus();
+        h.run();
+        for modifiers in [Modifiers::SHIFT, Modifiers::ALT] {
+            h.key_press_modifiers(modifiers, Key::T);
+            h.run();
+            assert_eq!(h.state().ui.dark, before);
+        }
     }
 
     #[test]

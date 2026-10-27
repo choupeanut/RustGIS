@@ -156,11 +156,13 @@ Use scripts or the assistant for parameterized commands without an interactive e
 
 ## Keyboard shortcuts
 
-**Settings › Customize › Shortcuts** assigns multiple keys to commands and map tools. Click **Add…**
-and press the desired key combination; if it is already in use, choose **Replace** or **Cancel**.
+**Settings › Customize › Customize Shortcuts** assigns multiple keys to commands and map tools.
+Click **Add…** and press the desired key combination. Escape cancels; **Assign Escape** binds Escape.
+If the combination is already in use, choose **Replace** or **Cancel**.
 Click a displayed key to remove it, **Reset** to restore a default key, or **Reset All** to restore
 all defaults. These changes are saved as a user preference on this device. Copy, Cut and Paste stay
-fixed. Unmodified keys do not run while typing or during first-person navigation; browsers may
+fixed. While typing, shortcuts without Ctrl/⌘ are paused, including Shift and Alt combinations. During
+first-person navigation, unmodified shortcuts are paused except Escape, Home and Delete. Browsers may
 reserve some shortcuts. In Command Search, right-click a command to open it in the editor.
 
 See the [keyboard shortcut reference](index.md#keyboard-shortcuts) for project, map and editing
