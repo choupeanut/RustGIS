@@ -20,7 +20,7 @@ pub struct Editor {
     pub filter: String,
     capture: Option<Target>,
     pending: Option<(Chord, Target)>,
-    notice: Option<&'static str>,
+    notice: bool,
 }
 
 impl Editor {
@@ -44,7 +44,7 @@ pub fn load(app: &mut RustGisApp) {
 
 fn assign(app: &mut RustGisApp, editor: &mut Editor, chord: Chord, target: Target) {
     if keymap::is_clipboard(chord) {
-        editor.notice = Some("Copy, Cut and Paste keys cannot be reassigned.");
+        editor.notice = true;
     } else if app.ui.keymap.command_for(chord).is_some_and(|b| !b.runs(&target.command, &target.params)) {
         editor.pending = Some((chord, target));
     } else if app.ui.keymap.assign(chord, &target.command, target.params) {
@@ -118,7 +118,7 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
                 ui.label(tl!("Your browser may reserve some shortcuts."));
             }
             ui.label(tl!("Single keys are paused during first-person navigation and while typing."));
-            if editor.notice.is_some() {
+            if editor.notice {
                 ui.label(tl!("Copy, Cut and Paste keys cannot be reassigned."));
             }
             if editor.capture.is_some() {
@@ -147,7 +147,7 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
                             }
                         }
                         if ui.small_button(tl!("Add…")).clicked() {
-                            editor.notice = None;
+                            editor.notice = false;
                             editor.capture = Some(Target { command: command.clone(), params: params.clone() });
                         }
                         for chord in defaults.keys_for(command, params) {
@@ -170,7 +170,7 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
         app.ui.keymap = defaults;
         editor.capture = None;
         editor.pending = None;
-        editor.notice = None;
+        editor.notice = false;
         save(app);
     }
     if let Some(chord) = remove {
@@ -189,10 +189,13 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
                 _ => None,
             })
         });
-        if let Some(chord) = chord
-            && let Some(target) = editor.capture.take()
-        {
-            assign(app, &mut editor, chord, target);
+        if let Some(chord) = chord {
+            // A bare Escape backs out, as Cancel does, rather than being assigned.
+            if chord.key == egui::Key::Escape && !chord.command && !chord.alt && !chord.shift {
+                editor.capture = None;
+            } else if let Some(target) = editor.capture.take() {
+                assign(app, &mut editor, chord, target);
+            }
         }
     }
     if let Some((chord, target)) = editor.pending.clone() {
@@ -234,7 +237,7 @@ mod tests {
         editor.pending = None;
         let clipboard = Chord::parse("Mod+C").unwrap();
         assign(&mut app, &mut editor, clipboard, target);
-        assert!(editor.notice.is_some());
+        assert!(editor.notice);
         assert!(app.ui.keymap.command_for(clipboard).is_none());
     }
 
