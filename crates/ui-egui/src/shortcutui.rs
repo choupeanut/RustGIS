@@ -29,16 +29,23 @@ impl Editor {
     }
 }
 
-fn save(app: &RustGisApp) {
+fn save(app: &mut RustGisApp) {
+    if app.ui.shortcut_preferences_blocked {
+        return;
+    }
     let defaults = Keymap::new(&app.session.registry);
-    if let Some(save) = &app.services.save_pref {
-        save(PREF, &app.ui.keymap.preferences(&defaults));
+    if let Some(changes) = app.ui.keymap.preferences(&defaults) {
+        if let Some(save) = &app.services.save_pref {
+            save(PREF, &changes);
+        }
+    } else {
+        app.ui.shortcut_preferences_blocked = true;
     }
 }
 
 pub fn load(app: &mut RustGisApp) {
     if let Some(changes) = app.services.load_pref.as_ref().and_then(|load| load(PREF)) {
-        app.ui.keymap.apply_preferences(&changes);
+        app.ui.shortcut_preferences_blocked = !app.ui.keymap.apply_preferences(&changes);
     }
 }
 
@@ -52,7 +59,7 @@ fn assign(app: &mut RustGisApp, editor: &mut Editor, chord: Chord, target: Targe
     }
 }
 
-fn rows(app: &RustGisApp) -> Vec<(String, Value, String)> {
+fn rows(app: &RustGisApp, web: bool) -> Vec<(String, Value, String)> {
     let mut rows = Vec::new();
     for c in &app.session.registry.commands {
         if !c.needs_input() && !matches!(c.id, "edit.copy" | "edit.cut" | "edit.paste") {
@@ -74,6 +81,7 @@ fn rows(app: &RustGisApp) -> Vec<(String, Value, String)> {
             rows.push((command.to_string(), params.clone(), keymap::label(app, command, params)));
         }
     }
+    rows.retain(|(id, _, _)| crate::chrome::command_available(id, web));
     let mut seen = std::collections::HashSet::new();
     rows.retain(|(command, params, _)| seen.insert((command.clone(), params.to_string())));
     rows.sort_by_cached_key(|a| a.2.to_lowercase());
@@ -82,7 +90,7 @@ fn rows(app: &RustGisApp) -> Vec<(String, Value, String)> {
 
 /// Whether Command Search can open a matching row in the editor.
 pub fn can_customize(app: &RustGisApp, id: &str) -> bool {
-    if matches!(id, "edit.copy" | "edit.cut" | "edit.paste") {
+    if !crate::chrome::command_available(id, cfg!(target_arch = "wasm32")) || matches!(id, "edit.copy" | "edit.cut" | "edit.paste") {
         return false;
     }
     crate::chrome::UI_COMMANDS.iter().any(|(command, _, _)| *command == id)
@@ -105,7 +113,7 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
     let mut reset_all = false;
     let mut assign_escape = false;
     let defaults = Keymap::new(&app.session.registry);
-    let rows = rows(app);
+    let rows = rows(app, cfg!(target_arch = "wasm32"));
     egui::Window::new(tl!("Customize Shortcuts")).open(&mut open).default_width(620.0).default_height(500.0).resizable(true).show(
         ctx,
         |ui| {
@@ -116,6 +124,9 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
                     reset_all = true;
                 }
             });
+            if app.ui.shortcut_preferences_blocked {
+                ui.label(tl!("Saved shortcuts are unreadable or exceed the limit. Changes apply only to this session; Reset All replaces the saved shortcuts."));
+            }
             if cfg!(target_arch = "wasm32") {
                 ui.label(tl!("Your browser may reserve some shortcuts."));
             }
@@ -175,6 +186,7 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
     }
     if reset_all {
         app.ui.keymap = defaults;
+        app.ui.shortcut_preferences_blocked = false;
         editor.capture = None;
         editor.pending = None;
         editor.notice_clipboard = false;
@@ -237,6 +249,18 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
 mod tests {
     use super::*;
     use rustgis_engine::{Project, Session};
+
+    #[test]
+    fn web_rows_exclude_desktop_commands_even_with_existing_bindings() {
+        let mut app = RustGisApp::new(Session::new(Project::default()));
+        for id in ["ui.checkUpdate", "ui.mcpRelay"] {
+            app.ui.keymap.assign(Chord::parse("F8").unwrap(), id, Value::Null);
+            assert!(!crate::chrome::command_available(id, true));
+            assert!(!rows(&app, true).iter().any(|(command, _, _)| command == id));
+            assert!(rows(&app, false).iter().any(|(command, _, _)| command == id));
+        }
+        assert!(crate::chrome::command_available("ui.theme", true));
+    }
 
     #[test]
     fn conflicting_and_clipboard_keys_are_not_changed_without_confirmation() {

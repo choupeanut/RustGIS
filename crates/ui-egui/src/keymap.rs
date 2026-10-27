@@ -12,6 +12,9 @@ use serde_json::Value;
 
 use crate::RustGisApp;
 
+const MAX_PREF_BYTES: usize = 100_000;
+const MAX_PREF_CHANGES: usize = 1_000;
+
 /// The default shortcuts: (keys, command, parameters as JSON, or empty for none). Clipboard
 /// keys are not here: they arrive as copy, cut and paste events, not key presses.
 const DEFAULTS: &[(&str, &str, &str)] = &[
@@ -227,12 +230,15 @@ impl Keymap {
     }
 
     /// Apply stored user changes to this version's defaults.
-    pub fn apply_preferences(&mut self, text: &str) {
-        if text.len() > 100_000 {
-            return;
+    pub fn apply_preferences(&mut self, text: &str) -> bool {
+        if text.len() > MAX_PREF_BYTES {
+            return false;
         }
-        let Ok(changes) = serde_json::from_str::<Vec<Value>>(text) else { return };
-        for change in changes.into_iter().take(1_000).filter_map(|record| serde_json::from_value::<Change>(record).ok()) {
+        let Ok(changes) = serde_json::from_str::<Vec<Value>>(text) else { return false };
+        if changes.len() > MAX_PREF_CHANGES {
+            return false;
+        }
+        for change in changes.into_iter().filter_map(|record| serde_json::from_value::<Change>(record).ok()) {
             let Some(chord) = Chord::parse(&change.keys) else { continue };
             if is_clipboard(chord) || change.command.is_empty() || change.command.len() > 200 {
                 continue;
@@ -244,10 +250,11 @@ impl Keymap {
                 self.bindings.push(Binding { chord, command: change.command, params: change.params });
             }
         }
+        true
     }
 
-    /// Store differences only, so defaults added by a later version still reach the user.
-    pub fn preferences(&self, defaults: &Keymap) -> String {
+    /// Store differences only; return None if they would exceed the load limits.
+    pub fn preferences(&self, defaults: &Keymap) -> Option<String> {
         let mut changes = Vec::new();
         for b in &defaults.bindings {
             if !self.bindings.contains(b) {
@@ -259,7 +266,10 @@ impl Keymap {
                 changes.push(Change { keys: b.chord.to_string(), command: b.command.clone(), params: b.params.clone(), remove: false });
             }
         }
-        serde_json::to_string(&changes).unwrap_or_default()
+        if changes.len() > MAX_PREF_CHANGES {
+            return None;
+        }
+        serde_json::to_string(&changes).ok().filter(|text| text.len() <= MAX_PREF_BYTES)
     }
 
     /// Assign a chord, replacing its previous assignment. Clipboard chords are reserved.
@@ -361,6 +371,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn over_limit_preferences_are_rejected_without_partial_changes() {
+        let defaults = Keymap::default();
+        let too_many =
+            serde_json::to_string(&vec![serde_json::json!({"keys":"D","command":"select.clear"}); MAX_PREF_CHANGES + 1]).unwrap();
+        let too_large = " ".repeat(MAX_PREF_BYTES + 1);
+        for saved in [&too_many, &too_large] {
+            let mut keymap = defaults.clone();
+            assert!(!keymap.apply_preferences(saved));
+            assert_eq!(keymap, defaults);
+        }
+        let mut changed = defaults.clone();
+        changed.assign(Chord::parse("D").unwrap(), "test.command", Value::String("x".repeat(MAX_PREF_BYTES)));
+        assert!(changed.preferences(&defaults).is_none(), "never save a value that cannot be loaded");
+    }
+
+    #[test]
     fn removed_registry_shortcut_stays_removed_after_preference_reload() {
         let registry =
             Registry { commands: vec![rustgis_engine::CommandSpec::new("test.action", "Test", "", |_, _| Ok(Value::Null)).key("F8")] };
@@ -369,7 +395,7 @@ mod tests {
         assert_eq!(defaults.command_for(chord).unwrap().command, "test.action");
         let mut changed = defaults.clone();
         changed.remove(chord);
-        let saved = changed.preferences(&defaults);
+        let saved = changed.preferences(&defaults).unwrap();
         let mut reloaded = Keymap::new(&registry);
         reloaded.apply_preferences(&saved);
         assert!(reloaded.command_for(chord).is_none());
@@ -385,7 +411,7 @@ mod tests {
         assert!(changed.assign(d, "tool.set", serde_json::json!({"tool": "select"})));
         assert!(changed.assign(table, "select.clear", Value::Null));
         assert!(!changed.assign(Chord::parse("Mod+C").unwrap(), "select.clear", Value::Null));
-        let saved = changed.preferences(&defaults);
+        let saved = changed.preferences(&defaults).unwrap();
         let mut newer = defaults.clone();
         let fresh = Chord::parse("F8").unwrap();
         assert!(newer.assign(fresh, "new.command", Value::Null));

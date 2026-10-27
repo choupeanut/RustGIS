@@ -640,6 +640,11 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
     }
 }
 
+/// Whether a UI command is available on the current platform.
+pub(crate) fn command_available(id: &str, web: bool) -> bool {
+    !web || !matches!(id, "ui.checkUpdate" | "ui.mcpRelay")
+}
+
 /// The `ui.*` commands Command Search lists: (id, label, ribbon location).
 pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.customizeShortcuts", "Customize Shortcuts…", "Settings › Customize"),
@@ -951,7 +956,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
         for &(id, label, loc) in UI_COMMANDS {
             // The web app always serves the latest release (no Check for Updates button) and is
             // one process a loopback relay could not reach (`ui.mcpRelay` is desktop only).
-            if matches!(id, "ui.checkUpdate" | "ui.mcpRelay") && cfg!(target_arch = "wasm32") {
+            if !command_available(id, cfg!(target_arch = "wasm32")) {
                 continue;
             }
             if ql.is_empty() || label.to_lowercase().contains(&ql) || tl!(label).to_lowercase().contains(&ql) {
@@ -996,7 +1001,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                 let mut customize = false;
                 if (!id.contains(':') || id.starts_with("plugin:")) && crate::shortcutui::can_customize(app, id) {
                     resp.context_menu(|ui| {
-                        if ui.button(tl!("Customize shortcut…")).clicked() {
+                        if ui.button(tl!("Customize Shortcuts…")).clicked() {
                             customize = true;
                             ui.close();
                         }

@@ -39,6 +39,8 @@ comment on its issue or pull request and open a draft pull request early.
 - Georeferencer: side-by-side window, transform picker, more formats
   ([#609](https://github.com/opengeos/RustGIS/issues/609)).
 
+- Rebindable keyboard shortcuts ([#562](https://github.com/opengeos/RustGIS/issues/562)).
+
 ## Next
 
 ### Fixes and quick wins
@@ -154,7 +156,6 @@ built-in version must justify itself on one of those.
   only used by tests ([#557](https://github.com/opengeos/RustGIS/issues/557)).
 - A catalog of data cubes for the time slider
   ([#683](https://github.com/opengeos/RustGIS/issues/683)).
-- Rebindable keyboard shortcuts ([#562](https://github.com/opengeos/RustGIS/issues/562)).
 
 ## Exploratory
 Open questions rather than plans; discuss before building.

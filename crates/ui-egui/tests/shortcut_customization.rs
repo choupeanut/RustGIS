@@ -100,11 +100,41 @@ fn command_search_context_menu_opens_matching_editor_row() {
     h.run_steps(3);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Toggle Dark Mode View").click_secondary();
     h.run_steps(3);
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Customize shortcut…").click();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Customize Shortcuts…").click();
     h.run_steps(3);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Add…").click();
     h.step();
     h.key_press(egui::Key::T);
     h.run_steps(3);
     assert!(h.state().ui.keymap.bindings.iter().any(|b| b.command == "ui.theme" && b.chord.key == egui::Key::T));
+}
+
+#[test]
+fn unreadable_preferences_survive_edits_until_an_explicit_reset() {
+    let too_many = serde_json::to_string(&vec![serde_json::json!({"keys":"D","command":"select.clear"}); 1_001]).unwrap();
+    for original in ["not json".to_string(), " ".repeat(100_001), too_many] {
+        let prefs = Arc::new(Mutex::new(HashMap::from([("shortcut_changes".into(), original.clone())])));
+        let mut h = harness(prefs.clone());
+        h.state_mut().run("ui.customizeShortcuts", Value::Null).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("Saved shortcuts are unreadable or exceed the limit. Changes apply only to this session; Reset All replaces the saved shortcuts.").is_some());
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Search commands").focus();
+        h.event(egui::Event::Text("ui.theme".into()));
+        h.run_steps(3);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Add…").click();
+        h.step();
+        h.key_press(egui::Key::T);
+        h.run_steps(3);
+        assert!(h.state().ui.keymap.bindings.iter().any(|b| b.command == "ui.theme"));
+        assert_eq!(prefs.lock().unwrap().get("shortcut_changes").unwrap(), &original);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Reset All").click();
+        h.run_steps(3);
+        assert_eq!(prefs.lock().unwrap().get("shortcut_changes").unwrap(), "[]");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Add…").click();
+        h.step();
+        h.key_press(egui::Key::T);
+        h.run_steps(3);
+        let reloaded = harness(prefs);
+        assert!(reloaded.state().ui.keymap.bindings.iter().any(|b| b.command == "ui.theme" && b.chord.key == egui::Key::T));
+    }
 }
