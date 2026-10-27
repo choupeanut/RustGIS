@@ -231,8 +231,8 @@ impl Keymap {
         if text.len() > 100_000 {
             return;
         }
-        let Ok(changes) = serde_json::from_str::<Vec<Change>>(text) else { return };
-        for change in changes.into_iter().take(1_000) {
+        let Ok(changes) = serde_json::from_str::<Vec<Value>>(text) else { return };
+        for change in changes.into_iter().take(1_000).filter_map(|record| serde_json::from_value::<Change>(record).ok()) {
             let Some(chord) = Chord::parse(&change.keys) else { continue };
             if is_clipboard(chord) || change.command.is_empty() || change.command.len() > 200 {
                 continue;
@@ -380,6 +380,14 @@ mod tests {
         assert_eq!(newer.command_for(fresh).unwrap().command, "new.command");
         newer.apply_preferences("not json");
         assert_eq!(newer.command_for(table).unwrap().command, "select.clear");
+    }
+
+    #[test]
+    fn malformed_preference_records_do_not_hide_valid_bindings() {
+        let mut keymap = Keymap::default();
+        keymap.apply_preferences(r#"[{"keys":"D","command":"select.clear"},{"keys":42},{"keys":"W","command":"table.open"}]"#);
+        assert_eq!(keymap.command_for(Chord::parse("D").unwrap()).unwrap().command, "select.clear");
+        assert_eq!(keymap.command_for(Chord::parse("W").unwrap()).unwrap().command, "table.open");
     }
 
     /// Undo and redo are a text field's own, an extra Alt or Shift aside; nothing else is.

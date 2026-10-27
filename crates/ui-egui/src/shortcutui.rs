@@ -74,14 +74,26 @@ fn rows(app: &RustGisApp) -> Vec<(String, Value, String)> {
             rows.push((command.to_string(), params.clone(), keymap::label(app, command, params)));
         }
     }
-    rows.sort_by_key(|a| a.2.to_lowercase());
+    rows.sort_by_cached_key(|a| a.2.to_lowercase());
     rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     rows
+}
+
+/// Whether Command Search can open a matching row in the editor.
+pub fn can_customize(app: &RustGisApp, id: &str) -> bool {
+    if matches!(id, "edit.copy" | "edit.cut" | "edit.paste") {
+        return false;
+    }
+    crate::chrome::UI_COMMANDS.iter().any(|(command, _, _)| *command == id)
+        || app.session.registry.commands.iter().any(|c| c.id == id && !c.needs_input())
+        || rustgis_engine::plugins::commands().iter().any(|c| c.id == id)
+        || app.ui.keymap.grouped().iter().any(|(command, params, _)| *command == id && params.is_null())
 }
 
 /// Draws the editor after the normal map and dialogs.
 pub fn show(app: &mut RustGisApp, ctx: &Context) {
     let mut editor = std::mem::take(&mut app.ui.shortcut_editor);
+    let was_capturing = editor.capture.is_some();
     if !editor.open {
         app.ui.shortcut_editor = editor;
         return;
@@ -106,8 +118,8 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
                 ui.label(tl!("Your browser may reserve some shortcuts."));
             }
             ui.label(tl!("Single keys are paused during first-person navigation and while typing."));
-            if let Some(notice) = editor.notice {
-                ui.label(tl!(notice));
+            if editor.notice.is_some() {
+                ui.label(tl!("Copy, Cut and Paste keys cannot be reassigned."));
             }
             if editor.capture.is_some() {
                 ui.horizontal(|ui| {
@@ -168,7 +180,7 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
     if let Some((chord, target)) = restore {
         assign(app, &mut editor, chord, target);
     }
-    if editor.capture.is_some() {
+    if was_capturing && editor.capture.is_some() {
         let chord = ctx.input(|i| {
             i.events.iter().find_map(|e| match e {
                 Event::Key { key, pressed: true, repeat: false, modifiers, .. } => {
@@ -224,5 +236,16 @@ mod tests {
         assign(&mut app, &mut editor, clipboard, target);
         assert!(editor.notice.is_some());
         assert!(app.ui.keymap.command_for(clipboard).is_none());
+    }
+
+    #[test]
+    fn search_customize_requires_an_editor_row() {
+        let mut app = RustGisApp::new(Session::new(Project::default()));
+        assert!(can_customize(&app, "ui.theme"));
+        assert!(!can_customize(&app, "layer.addData"));
+        assert!(!can_customize(&app, "edit.copy"));
+        assert!(!can_customize(&app, "ui.identify"));
+        assert!(app.ui.keymap.assign(Chord::parse("D").unwrap(), "layer.addData", Value::Null));
+        assert!(can_customize(&app, "layer.addData"));
     }
 }
