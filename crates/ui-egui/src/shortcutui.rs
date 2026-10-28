@@ -317,4 +317,22 @@ mod tests {
         assert!(app.ui.keymap.assign(Chord::parse("D").unwrap(), "layer.addData", json!({"path": "example.geojson"})));
         assert!(can_customize(&app, "layer.addData"));
     }
+
+    /// Command Search's menu entry and the editor's rows must agree: every row can be customized,
+    /// and every command that can be customized has a row.
+    #[test]
+    fn search_customize_agrees_with_the_editor_rows() {
+        let app = RustGisApp::new(Session::new(Project::default()));
+        let ids: std::collections::HashSet<String> = rows(&app, false).into_iter().map(|(id, _, _)| id).collect();
+        for id in &ids {
+            assert!(can_customize(&app, id), "{id} has an editor row but Command Search cannot customize it");
+        }
+        let registry = app.session.registry.commands.iter().map(|c| c.id.to_string());
+        let ui = crate::chrome::UI_COMMANDS.iter().map(|&(id, _, _)| id.to_string());
+        let plugins = rustgis_engine::plugins::commands().into_iter().map(|c| c.id);
+        let bound = app.ui.keymap.bindings.iter().map(|b| b.command.clone());
+        for id in registry.chain(ui).chain(plugins).chain(bound) {
+            assert_eq!(can_customize(&app, &id), ids.contains(&id), "{id}");
+        }
+    }
 }
