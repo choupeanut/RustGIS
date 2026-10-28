@@ -687,8 +687,7 @@ impl Project {
                         log::warn!("{}: {e}", l.name);
                     }
                 }
-                let n = l.dataset.features.len();
-                l.selection.retain(|r| *r < n);
+                l.normalize_selection();
                 let fields = l.dataset.fields.len();
                 for f in &mut l.dataset.features {
                     f.attrs.resize(fields, rustgis_data::Value::Null);

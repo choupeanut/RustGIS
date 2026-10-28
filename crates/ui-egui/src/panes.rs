@@ -14,7 +14,7 @@ use rustgis_engine::map::symbology::{
 };
 use rustgis_engine::map::tiles::{TileKind, TileLayer};
 use rustgis_engine::map::{
-    ClassMethod, Glyph, Layer, Marker, Ramp, RampGroup, RasterDefaults, RasterRenderer, Renderer, Resampling, Stretch, Symbol,
+    ClassMethod, Drawn, Glyph, Layer, Marker, Ramp, RampGroup, RasterDefaults, RasterRenderer, Renderer, Resampling, Stretch, Symbol,
 };
 use serde_json::{Value, json};
 
@@ -545,6 +545,11 @@ pub fn follow_layer_filter(app: &mut RustGisApp) {
             let _ = app.run("layer.select", json!({"layer": keep}));
         }
     }
+    // A tile layer picked since the filter hid the active layer (a row's click, a command or a
+    // script) is picked instead: the hidden layer isn't made active again once it shows.
+    if app.session.selected_tile().is_some() {
+        app.ui.layer_filter_hid = None;
+    }
     match (app.session.active_layer, app.ui.layer_filter_hid) {
         (Some(id), _) if shown(&app.session, id) == Some(false) => {
             // No command clears the active layer; it is view state, like a click on an empty row.
@@ -561,6 +566,14 @@ pub fn follow_layer_filter(app: &mut RustGisApp) {
             None => app.ui.layer_filter_hid = None,
         },
         _ => {}
+    }
+    // So does a tile layer picked: one the filter hides isn't picked any more (for good, as the
+    // pick isn't kept to come back).
+    if let Some(i) = app.session.selected_tile()
+        && app.session.map().tiles.get(i).is_some_and(|t| !filter_shows(&q, &t.name))
+        && let Some(t) = app.session.map_mut().tiles.get_mut(i)
+    {
+        t.selected = false;
     }
 }
 
@@ -662,11 +675,36 @@ fn contents(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             LayersView::DrawingOrder => {
                 let mut shown = std::collections::HashSet::new();
                 let mut rows: Vec<DropRow> = Vec::new();
+                // Web tile layers list at their place in the drawing order of all the map's layers
+                // (#808): over the layer (or group) they're drawn over, or under them all.
+                let (slots, order): (Vec<Option<u32>>, Vec<Drawn>) = {
+                    let m = app.session.map();
+                    (m.tile_slots(), m.stack())
+                };
+                // The tile layers' rows over each layer's (or group's) first row, by that row: a
+                // layer dropped there goes above them, as the line drawn says.
+                let mut blocks: Vec<(usize, Rect)> = Vec::new();
+                let mut tile_rows: Vec<(usize, Rect)> = Vec::new();
+                let mut listed_tiles = 0;
+                let mut tiles_at = |app: &mut RustGisApp, ui: &mut Ui, over: Option<u32>, tile_rows: &mut Vec<(usize, Rect)>| {
+                    for (i, tile) in tiles.iter().enumerate().filter(|(i, x)| slots.get(*i) == Some(&over) && shows(&x.name)) {
+                        let at = order.iter().position(|d| *d == Drawn::Tile(i));
+                        let moves = [at.is_some_and(|a| a > 0), at.is_some_and(|a| a + 1 < order.len())];
+                        let rect = tile_row(app, ui, i, moves, reorder, tile, t);
+                        tile_rows.push((i, rect));
+                        listed_tiles += 1;
+                    }
+                };
                 // A layer group lists at its topmost layer (its layers are kept together); while
                 // filtering, when one of its layers or its own name matches.
-                for layer in
-                    layers.iter().filter(|l| shows(&l.name) || layer_groups.iter().any(|g| g.children.contains(&l.id) && shows(&g.name)))
-                {
+                for layer in &layers {
+                    let tiles_before = tile_rows.len();
+                    tiles_at(app, ui, Some(layer.id), &mut tile_rows);
+                    let above = tile_rows.get(tiles_before..).and_then(|r| r.iter().map(|(_, r)| *r).reduce(|a, b| a.union(b)));
+                    let rows_before = rows.len();
+                    if !(shows(&layer.name) || layer_groups.iter().any(|g| g.children.contains(&layer.id) && shows(&g.name))) {
+                        continue;
+                    }
                     if let Some(group) = groups.iter().find(|g| g.children.iter().any(|c| c.layer == layer.id)) {
                         if shows(&layer.name) && shown.insert(group.id) {
                             service_group_row(app, ui, group, &layers, scale, t);
@@ -678,6 +716,9 @@ fn contents(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     } else {
                         let rect = layer_row(app, ui, layer, scale, reorder, t);
                         rows.push(DropRow { id: layer.id, rect, group: None, header: false });
+                    }
+                    if let Some(above) = above.filter(|_| rows.len() > rows_before) {
+                        blocks.push((rows_before, above));
                     }
                 }
                 for group in &groups {
@@ -691,16 +732,19 @@ fn contents(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         layer_group_row(app, ui, group, &layers, scale, reorder, &mut rows, t);
                     }
                 }
+                // Those under all the map's layers, over the basemap.
+                tiles_at(app, ui, None, &mut tile_rows);
                 if reorder {
-                    layer_drop(app, ui, &rows, t);
+                    let mut drop_rows = rows.clone();
+                    for (k, above) in blocks {
+                        if let Some(r) = drop_rows.get_mut(k) {
+                            r.rect = r.rect.union(above);
+                        }
+                    }
+                    layer_drop(app, ui, &drop_rows, t);
+                    tile_drop(app, ui, &rows, &tile_rows, t);
                 }
-                // Web tile layers (services, tile addresses) draw over the basemap and under the layers.
-                let mut n = rows.iter().filter(|r| r.group.is_none() && !r.header).count() + shown.len();
-                for (i, tile) in tiles.iter().enumerate().filter(|(_, x)| shows(&x.name)) {
-                    tile_row(app, ui, i, tiles.len(), reorder, tile, t);
-                    n += 1;
-                }
-                n
+                rows.iter().filter(|r| r.group.is_none() && !r.header).count() + shown.len() + listed_tiles
             }
             LayersView::DataSource => source_groups(app, ui, &layers, &tiles, scale, &shows, t),
             LayersView::Selection => selection_groups(app, ui, &layers, &shows, t),
@@ -981,7 +1025,9 @@ fn source_groups(
                 Item::Layer(l) => {
                     layer_row(app, ui, l, scale, false, t);
                 }
-                Item::Tile(i, tile) => tile_row(app, ui, i, tiles.len(), false, tile, t),
+                Item::Tile(i, tile) => {
+                    tile_row(app, ui, i, [false, false], false, tile, t);
+                }
             }
             n += 1;
         }
@@ -1286,6 +1332,9 @@ fn layer_group_row(
 #[derive(Clone, Copy)]
 struct DraggedLayer(u32);
 
+/// A web tile layer row being dragged (its index among the map's tile layers).
+struct DraggedTile(usize);
+
 /// A row of the drawing order view a dragged layer can drop on: a layer's (in a layer `group` or
 /// not) or a layer group's `header`.
 #[derive(Clone, Copy)]
@@ -1398,6 +1447,50 @@ fn layer_drop(app: &mut RustGisApp, ui: &Ui, rows: &[DropRow], t: &Tokens) {
     let _ = app.run("layer.group", json!({"layer": dragged.0, "group": into, "before": before}));
 }
 
+/// Dragging a web tile layer's row over the list: marks where it would drop and, on release,
+/// puts it there in the drawing order of all the map's layers (`map.setTiles` `to`). It never
+/// goes into a group: a group's layers count as one row, its header's.
+fn tile_drop(app: &mut RustGisApp, ui: &Ui, rows: &[DropRow], tile_rows: &[(usize, Rect)], t: &Tokens) {
+    let Some(dragged) = egui::DragAndDrop::payload::<DraggedTile>(ui.ctx()) else { return };
+    let view = ui.clip_rect();
+    let Some(pointer) = ui.ctx().pointer_interact_pos().filter(|p| view.contains(*p)) else { return };
+    let m = app.session.map();
+    let order = m.stack();
+    let Some(from) = order.iter().position(|d| *d == Drawn::Tile(dragged.0)) else { return };
+    // Each row with its place in the drawing order: a layer's, a group's topmost layer's, a tile
+    // layer's.
+    let layer_at = |id: u32| m.layer_index(id).and_then(|i| order.iter().position(|d| *d == Drawn::Layer(i)));
+    let top_of = |g: u32| m.group(g).and_then(|g| m.layers.iter().find(|l| g.children.contains(&l.id))).map(|l| l.id);
+    let mut places: Vec<(usize, Rect)> = rows
+        .iter()
+        .filter(|r| r.header || r.group.is_none())
+        .filter_map(|r| layer_at(if r.header { top_of(r.id)? } else { r.id }).map(|at| (at, r.rect)))
+        .chain(tile_rows.iter().filter_map(|(i, rect)| order.iter().position(|d| *d == Drawn::Tile(*i)).map(|at| (at, *rect))))
+        .collect();
+    places.sort_by(|a, b| a.1.min.y.total_cmp(&b.1.min.y));
+    let (Some(first), Some(last)) = (places.first().map(|p| p.1), places.last().map(|p| p.1)) else { return };
+    // A group's layers (expanded under its header) count with the group: the pointer over them
+    // drops below the group.
+    let bottom = rows.iter().map(|r| r.rect.max.y).fold(last.max.y, f32::max);
+    if pointer.y < first.min.y || pointer.y > bottom {
+        return;
+    }
+    let gap = places.iter().position(|(_, r)| pointer.y < r.center().y).unwrap_or(places.len());
+    // The place among the other layers: that of the row below the gap, one less past itself.
+    let to = places.get(gap).map_or(order.len() - 1, |(at, _)| if *at > from { at - 1 } else { *at });
+    if to == from {
+        return;
+    }
+    let (y, r) = match places.get(gap) {
+        Some((_, r)) => (r.min.y, *r),
+        None => (bottom, last),
+    };
+    ui.painter().line_segment([pos2(first.min.x + 8.0, y), pos2(r.max.x - 8.0, y)], Stroke::new(2.0, t.accent));
+    if ui.input(|i| i.pointer.any_released()) {
+        let _ = app.run("map.setTiles", json!({"index": dragged.0, "to": to}));
+    }
+}
+
 /// A layer row's visibility checkbox, ticked when the layer is shown.
 fn visibility_box(ui: &Ui, cb: Rect, visible: bool, t: &Tokens) {
     ui.painter().rect_filled(cb, CornerRadius::same(3), if visible { t.accent } else { t.input });
@@ -1415,18 +1508,30 @@ fn visibility_box(ui: &Ui, cb: Rect, visible: bool, t: &Tokens) {
     }
 }
 
-/// A web tile layer's row (index `i` of `count`, top first as the map lists them): its checkbox
+/// A web tile layer's row (index `i` of `count`, top first as the map lists them): a click picks
+/// it (`map.selectTiles`: the Selected in Layers pop-up mode identifies it); its checkbox
 /// shows or hides it; right-click zooms to it (known bounds, an archive or GeoTIFF), sets its
 /// opacity, moves it up or down (not with `reorder` off: the list is filtered), or removes it.
-fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, count: usize, reorder: bool, tile: &TileLayer, t: &Tokens) {
+fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reorder: bool, tile: &TileLayer, t: &Tokens) -> Rect {
     let shown = if tile.overlay { format!("{} · {}", tile.name, tl!("overlay")) } else { tile.name.clone() };
     let name = row_name(ui, shown.clone(), regular(12.5), ui.available_width() - NAME_X - 8.0);
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), name.row_h), Sense::click());
+    let sense = if reorder { Sense::click_and_drag() } else { Sense::click() };
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), name.row_h), sense);
     // Named for screen readers as a layer's row is.
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &tile.name));
-    if resp.hovered() {
+    // Dragged to another place in the drawing order, as a layer's row is.
+    if reorder && resp.drag_started_by(egui::PointerButton::Primary) {
+        egui::DragAndDrop::set_payload(ui.ctx(), DraggedTile(i));
+    }
+    let dragging = egui::DragAndDrop::payload::<DraggedTile>(ui.ctx()).is_some_and(|d| d.0 == i);
+    // Picked, it looks as an active layer's row does.
+    let picked = app.session.selected_tile() == Some(i);
+    if picked {
+        ui.painter().rect_filled(r.shrink2(vec2(4.0, 1.0)), CornerRadius::same(5), t.selection);
+    } else if resp.hovered() || dragging {
         ui.painter().rect_filled(r.shrink2(vec2(4.0, 1.0)), CornerRadius::same(5), t.hover);
     }
+    active_outline(ui, r, picked, t);
     // Lined up with the layer rows' arrows, checkboxes, icons and names.
     let cy = r.min.y + 13.0;
     // A WMS or WMTS layer's legend opens under it, as a feature layer's classes do.
@@ -1464,6 +1569,8 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, count: usize, reorder: 
         action = Some(("map.setTiles", json!({"index": i, "visible": !tile.visible})));
     } else if ar_resp.is_some_and(|a| a.clicked()) {
         action = Some(("map.expandTiles", json!({"index": i})));
+    } else if resp.clicked() && !picked {
+        action = Some(("map.selectTiles", json!({"index": i})));
     }
     let mut hover = if elided { format!("{shown}\n{}", tile.url) } else { tile.url.clone() };
     if let Some(error) = &tile.error {
@@ -1499,11 +1606,11 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, count: usize, reorder: 
         .response
         .on_hover_text(tl!("How the layer's colours combine with the tile layers and basemap beneath."));
         ui.separator();
-        if ui.add_enabled(reorder && i > 0, egui::Button::new(tl!("Move up"))).clicked() {
+        if ui.add_enabled(reorder && moves[0], egui::Button::new(tl!("Move up"))).clicked() {
             action = Some(("map.setTiles", json!({"index": i, "move": "up"})));
             ui.close();
         }
-        if ui.add_enabled(reorder && i + 1 < count, egui::Button::new(tl!("Move down"))).clicked() {
+        if ui.add_enabled(reorder && moves[1], egui::Button::new(tl!("Move down"))).clicked() {
             action = Some(("map.setTiles", json!({"index": i, "move": "down"})));
             ui.close();
         }
@@ -1522,6 +1629,7 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, count: usize, reorder: 
     if let Some((cmd, p)) = action {
         let _ = app.run(cmd, p);
     }
+    r
 }
 
 /// The hit target of a row's 14-point arrow or box at `at`: wider, and the first line's full
@@ -3226,17 +3334,21 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 let hint = match p.kind {
                     ParamKind::Number => tl!("number"),
                     ParamKind::Path => tl!("file path"),
+                    ParamKind::SaveFile { .. } if cfg!(target_arch = "wasm32") => tl!("File name"),
+                    ParamKind::SaveFile { .. } => tl!("file path"),
                     _ => "",
                 };
                 let mut browse = false;
                 // Browse picks a file to read: on the desktop for any file input (GeoLibre's too);
                 // in the browser, where the file itself goes with the run, only for plugins.
-                let browsable = p.kind == ParamKind::Path && (app.services.open_async.is_none() || plugin_tool);
+                let browsable = (p.kind == ParamKind::Path && (app.services.open_async.is_none() || plugin_tool))
+                    || (matches!(p.kind, ParamKind::SaveFile { .. }) && !cfg!(target_arch = "wasm32"));
                 let changed = if browsable {
                     // One row: the path box takes what the button leaves.
                     let row = vec2(ui.available_width(), ui.spacing().interact_size.y);
                     ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        browse = ui.button(tl!("Browse")).clicked();
+                        browse =
+                            ui.button(if matches!(p.kind, ParamKind::SaveFile { .. }) { tl!("Save As") } else { tl!("Browse") }).clicked();
                         ui.add(egui::TextEdit::singleline(&mut v).hint_text(hint).desired_width(f32::INFINITY))
                             .on_hover_text(tl!(p.label))
                             .changed()
@@ -3259,14 +3371,41 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         ui.add_space(4.0);
     }
-    if let Some(param) = browse_for {
-        browse_file(app, spec.id, param);
+    if let Some(param) = browse_for
+        && let Some(p) = spec.params.iter().find(|p| p.name == param)
+    {
+        if let ParamKind::SaveFile { ext } = p.kind {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let name = app.gp.values.get(param).filter(|v| !v.trim().is_empty()).cloned().unwrap_or_else(|| {
+                    format!("{}.{}", first_layer.and_then(|n| app.gp.values.get(n)).map(String::as_str).unwrap_or("output"), ext)
+                });
+                if let Some(path) = crate::dialogs::pick_save(&name, &[ext], tl!(p.label)) {
+                    app.gp.values.insert(param, path);
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            let _ = ext;
+        } else {
+            browse_file(app, spec.id, param);
+        }
     }
     ui.add_space(8.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
         // One browser run at a time, and one plugin run.
         let idle = app.gp.web_run.is_none() && app.gp.plugin_run.is_none();
         if crate::widgets::primary_button(ui, tl!("Run"), idle, vec2(96.0, 30.0)).clicked() {
+            // A blank output opens Save As before any work starts. Cancelling writes nothing.
+            #[cfg(not(target_arch = "wasm32"))]
+            for p in spec.params {
+                if let ParamKind::SaveFile { ext } = p.kind
+                    && app.gp.values.get(p.name).is_none_or(|v| v.trim().is_empty())
+                {
+                    let input = first_layer.and_then(|n| app.gp.values.get(n)).map(String::as_str).unwrap_or("output");
+                    let Some(path) = crate::dialogs::pick_save(&format!("{input}.{ext}"), &[ext], tl!(p.label)) else { return };
+                    app.gp.values.insert(p.name, path);
+                }
+            }
             let mut params = serde_json::Map::new();
             // The tools of a suite or a plugin read their inputs as text; a plugin's is handed
             // every parameter, so it gets only those it declares.
@@ -3415,6 +3554,7 @@ pub fn tool_icon(id: &str) -> &'static str {
         "intersect" => "intersect",
         "identity" => "identity",
         "union" => "union",
+        "near" => "near",
         "dissolve" => "dissolve",
         "convexHull" => "hull",
         "featureToPoint" => "centroid",
@@ -3708,6 +3848,10 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     if matches!(g, GeometryType::Polyline | GeometryType::Point) && !l.graphics {
         ui.add_space(8.0);
         line_strokes_editor(app, ui, &l, t);
+    }
+    if g == GeometryType::Polygon && !l.graphics {
+        ui.add_space(8.0);
+        crate::fill_editor::fills_editor(app, ui, &l, t);
     }
     ui.add_space(10.0);
     ui.separator();
@@ -4366,7 +4510,7 @@ fn set_strokes(app: &mut RustGisApp, class: Option<&ClassRef>, strokes: &[LineSt
 }
 
 /// The classes a line layer's strokes can be set for, with their legend labels and symbols.
-fn stroke_classes(r: &Renderer) -> Vec<(ClassRef, String, Symbol)> {
+pub(crate) fn stroke_classes(r: &Renderer) -> Vec<(ClassRef, String, Symbol)> {
     match r {
         Renderer::Unique { classes, other, class_labels, other_label, .. } => {
             // A value listed twice is drawn with its first class, as the legend shows it.
@@ -5821,6 +5965,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         let listed = stroke_classes(&r);
         let refs: Vec<&ClassRef> = listed.iter().map(|(c, ..)| c).collect();
@@ -5845,6 +5991,99 @@ mod tests {
         h.step();
         h.event(button(to, false));
         h.step();
+    }
+
+    /// #808: a web tile layer is listed at its place among the map's layers, moves past them
+    /// from its menu, and is dragged to another place.
+    #[test]
+    fn a_tile_layer_is_listed_and_moved_among_the_layers() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        for c in ["Cities", "Countries"] {
+            app.run("layer.expand", json!({"layer": c, "on": false})).unwrap();
+        }
+        app.run("map.addTiles", json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        let y = |h: &egui_kittest::Harness<'_, RustGisApp>, name: &str| h.get_by_label(name).rect().center().y;
+        let names = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+            let m = h.state().session.map();
+            m.stack()
+                .into_iter()
+                .map(|d| match d {
+                    Drawn::Layer(i) => m.layers[i].name.clone(),
+                    Drawn::Tile(i) => m.tiles[i].name.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        // Added on top: listed above Cities.
+        assert!(y(&h, "Depths") < y(&h, "Cities"));
+        // Its menu moves it down, past Cities.
+        h.get_by_label("Depths").click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Move down").click();
+        h.run_steps(4);
+        assert_eq!(names(&h), ["Cities", "Depths", "Rivers", "Lakes", "Countries"]);
+        assert!(y(&h, "Cities") < y(&h, "Depths") && y(&h, "Depths") < y(&h, "Rivers"));
+        // Dragged below Lakes.
+        let (from, lakes) = (h.get_by_label("Depths").rect().center(), h.get_by_label("Lakes").rect());
+        drag_layer(&mut h, from, pos2(lakes.center().x, lakes.max.y - 2.0));
+        h.run_steps(2);
+        assert_eq!(names(&h), ["Cities", "Rivers", "Lakes", "Depths", "Countries"]);
+        assert!(y(&h, "Lakes") < y(&h, "Depths") && y(&h, "Depths") < y(&h, "Countries"));
+    }
+
+    /// A tile layer's row is picked with a click, as a layer's is (the Selected in Layers pop-up
+    /// mode identifies it), and clicking a layer's row picks that instead.
+    #[test]
+    fn a_tile_layers_row_is_picked_with_a_click() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("map.addTiles", json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        h.get_by_label("Depths").click();
+        h.run_steps(2);
+        let depths = h.state().session.map().tiles.iter().position(|t| t.name == "Depths");
+        assert_eq!((h.state().session.active_layer, h.state().session.selected_tile()), (None, depths));
+        // Hidden by the filter, it isn't picked any more, as an active layer isn't.
+        h.state_mut().ui.layer_filter = "Cit".into();
+        h.run_steps(2);
+        assert_eq!(h.state().session.selected_tile(), None);
+        h.state_mut().ui.layer_filter.clear();
+        h.run_steps(2);
+        assert_eq!(h.state().session.selected_tile(), None, "not picked again");
+        h.get_by_label("Depths").click();
+        h.run_steps(2);
+        assert_eq!(h.state().session.selected_tile(), depths);
+        // An active layer the filter hides isn't made active again when a tile layer was picked
+        // meanwhile by a command, as by a click.
+        h.state_mut().run("layer.select", json!({"layer": "Cities"})).unwrap();
+        h.state_mut().ui.layer_filter = "Dep".into();
+        h.run_steps(2);
+        assert_eq!(h.state().session.active_layer, None, "hidden");
+        h.state_mut().run("map.selectTiles", json!({"name": "Depths"})).unwrap();
+        h.state_mut().ui.layer_filter.clear();
+        h.run_steps(2);
+        assert_eq!((h.state().session.active_layer, h.state().session.selected_tile()), (None, depths));
+        h.get_by_label("Cities").click();
+        h.run_steps(2);
+        let cities = h.state().session.map().layer_by_name("Cities").map(|l| l.id);
+        assert_eq!((h.state().session.active_layer, h.state().session.selected_tile()), (cities, None));
     }
 
     /// #836: both halves of the whole visible block accept drops, including multi-class

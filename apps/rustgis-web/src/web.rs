@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use rustgis_ui_egui::{Inbox, RustGisApp, Services};
+use rustgis_ui_egui::{Inbox, RustGisApp, Services, Slot};
 
 use crate::parts::Notes;
 use wasm_bindgen::JsCast as _;
@@ -777,6 +777,16 @@ async fn http(
     Ok(rustgis_ui_egui::rustgis_assistant::HttpResponse { status, body: bytes.to_vec(), headers })
 }
 
+/// The browser's clipboard, where a page may read it: a secure context (HTTPS, or this computer)
+/// whose `navigator.clipboard` has `readText`.
+fn clipboard() -> Option<web_sys::Clipboard> {
+    let window = web_sys::window().filter(web_sys::Window::is_secure_context)?;
+    let navigator = window.navigator();
+    let clipboard = js_sys::Reflect::get(&navigator, &"clipboard".into()).ok().filter(|c| !c.is_null_or_undefined())?;
+    js_sys::Reflect::get(&clipboard, &"readText".into()).ok().filter(wasm_bindgen::JsValue::is_function)?;
+    Some(navigator.clipboard())
+}
+
 /// The browser's services. Embedded, settings live in memory for the visit: the page that embeds
 /// the app must not read what the user saved on the site.
 fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, embedded: bool) -> Services {
@@ -827,7 +837,24 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
         )
     };
     let arcgis_ctx = ctx.clone();
+    let clipboard_ctx = ctx.clone();
     Services {
+        // A text field's Paste: the page reads the clipboard (Firefox and Safari show a Paste
+        // button to confirm, Chrome asks once); only over HTTPS, where the browser offers it.
+        read_clipboard: clipboard().map(|clipboard| -> Box<dyn Fn(Slot<Result<String, String>>)> {
+            Box::new(move |slot| {
+                let (clipboard, ctx) = (clipboard.clone(), clipboard_ctx.clone());
+                wasm_bindgen_futures::spawn_local(async move {
+                    let read = wasm_bindgen_futures::JsFuture::from(clipboard.read_text()).await;
+                    let text = read.map(|v| v.as_string().unwrap_or_default()).map_err(|e| {
+                        // A refusal is a DOMException: its name says why (NotAllowedError).
+                        js_sys::Reflect::get(&e, &"name".into()).ok().and_then(|n| n.as_string()).unwrap_or_else(|| format!("{e:?}"))
+                    });
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+                    ctx.request_repaint();
+                });
+            })
+        }),
         arcgis_sign_in: Some(Box::new(move |portal, client_id, slot| crate::arcgis::sign_in(portal, client_id, slot, arcgis_ctx.clone()))),
         load_pref: Some(load_pref),
         save_pref: Some(save_pref),
@@ -873,6 +900,8 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 rfd::AsyncFileDialog::new().add_filter("Shapefile", &["shp", "dbf", "shx", "prj", "cpg", "zip"])
             } else if purpose == "project" {
                 rfd::AsyncFileDialog::new().add_filter("RustGIS project", &["rgis", "rgisx", "rgispkg"])
+            } else if purpose == "qgisProject" {
+                rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("QGIS project"), &["qgs", "qgz"])
             } else if purpose == "item" {
                 rfd::AsyncFileDialog::new().add_filter(
                     "RustGIS items",
@@ -913,11 +942,7 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 ctx.request_repaint();
             });
         })),
-        download: Some(Box::new(|name: &str, bytes: Vec<u8>| {
-            if let Err(e) = download(name, &bytes) {
-                log::error!("download of {name} failed: {e}");
-            }
-        })),
+        download: Some(Box::new(|name: &str, bytes: Vec<u8>| download(name, &bytes))),
         inbox: Some(inbox),
         geolibre_manifests: Some(Box::new(move |slot| crate::geolibre::manifests(slot, gl_list_ctx.clone()))),
         geolibre_run: Some(Box::new(move |job, slot| crate::geolibre::run(job, slot, gl_run_ctx.clone()))),
@@ -943,7 +968,10 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
 /// Saves bytes through a temporary `<a download>` link.
 fn download(name: &str, bytes: &[u8]) -> Result<(), String> {
     let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
-    let document = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
+    let window = web_sys::window().ok_or("no window")?;
+    let document = window.document().ok_or("no document")?;
+    let body = document.body().ok_or("no body")?;
+    let a: web_sys::HtmlAnchorElement = document.create_element("a").map_err(err)?.dyn_into().map_err(|_| "not an anchor".to_string())?;
     let array = js_sys::Uint8Array::from(bytes);
     let parts = js_sys::Array::new();
     parts.push(&array);
@@ -951,20 +979,26 @@ fn download(name: &str, bytes: &[u8]) -> Result<(), String> {
     props.set_type("application/octet-stream");
     let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &props).map_err(err)?;
     let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(err)?;
-    let a: web_sys::HtmlAnchorElement = document.create_element("a").map_err(err)?.dyn_into().map_err(|_| "not an anchor".to_string())?;
     a.set_href(&url);
     a.set_download(name);
     // Some browsers only follow links that are in the document.
-    let body = document.body().ok_or("no body")?;
-    body.append_child(&a).map_err(err)?;
+    if let Err(error) = body.append_child(&a) {
+        let _ = web_sys::Url::revoke_object_url(&url);
+        return Err(err(error));
+    }
+    // Schedule cleanup before submission: a timer error must not mark an already offered file
+    // as failed. The browser may start reading the URL after `click` returns.
+    let cleanup_url = url.clone();
+    let revoke = wasm_bindgen::closure::Closure::once_into_js(move || {
+        let _ = web_sys::Url::revoke_object_url(&cleanup_url);
+    });
+    if let Err(error) = window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000) {
+        a.remove();
+        let _ = web_sys::Url::revoke_object_url(&url);
+        return Err(err(error));
+    }
     a.click();
     a.remove();
-    // Browsers may start the download after `click` returns, so free the URL a little later.
-    let revoke = wasm_bindgen::closure::Closure::once_into_js(move || {
-        let _ = web_sys::Url::revoke_object_url(&url);
-    });
-    let window = web_sys::window().ok_or("no window")?;
-    window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000).map_err(err)?;
     Ok(())
 }
 
