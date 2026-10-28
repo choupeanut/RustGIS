@@ -647,7 +647,7 @@ pub(crate) fn command_available(id: &str, web: bool) -> bool {
 
 /// The `ui.*` commands Command Search lists: (id, label, ribbon location).
 pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
-    ("ui.customizeShortcuts", "Keyboard Shortcuts…", "Settings › Customize"),
+    ("ui.customizeShortcuts", "Keyboard Shortcuts", "Settings › Customize"),
     ("ui.addData", "Add Data…", "Home › Add"),
     ("ui.addDelimited", "Add Delimited Text…", "Home › Add › Add Data"),
     ("ui.addUrl", "Add Data From URL…", "Home › Add › Add Data"),
@@ -1005,7 +1005,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                 let mut customize = false;
                 if (!id.contains(':') || id.starts_with("plugin:")) && crate::shortcutui::can_customize(app, id) {
                     resp.context_menu(|ui| {
-                        if ui.button(tl!("Keyboard Shortcuts…")).clicked() {
+                        if ui.button(tl!("Keyboard Shortcuts")).clicked() {
                             customize = true;
                             ui.close();
                         }
