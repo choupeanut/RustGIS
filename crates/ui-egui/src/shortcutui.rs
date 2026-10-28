@@ -114,7 +114,7 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
     let mut assign_escape = false;
     let defaults = Keymap::new(&app.session.registry);
     let rows = rows(app, cfg!(target_arch = "wasm32"));
-    egui::Window::new(tl!("Customize Shortcuts")).open(&mut open).default_width(620.0).default_height(500.0).resizable(true).show(
+    egui::Window::new(tl!("Keyboard Shortcuts")).id(egui::Id::unique("shortcut_editor")).open(&mut open).default_width(620.0).default_height(500.0).resizable(true).show(
         ctx,
         |ui| {
             ui.horizontal(|ui| {

@@ -100,7 +100,7 @@ fn command_search_context_menu_opens_matching_editor_row() {
     h.run_steps(3);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Toggle Dark Mode View").click_secondary();
     h.run_steps(3);
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Customize Shortcuts…").click();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Keyboard Shortcuts…").click();
     h.run_steps(3);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Add…").click();
     h.step();

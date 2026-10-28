@@ -3245,7 +3245,7 @@ fn settings_tab(app: &mut RustGisApp, ui: &mut Ui) {
             ui,
             app,
             "command",
-            "Customize\nShortcuts…",
+            "Keyboard\nShortcuts…",
             "Customize keyboard shortcuts.",
             "ui.customizeShortcuts",
             Value::Null,
