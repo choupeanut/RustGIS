@@ -61,6 +61,23 @@ fn assigns_a_key_confirms_conflicts_and_restores_saved_preferences() {
 }
 
 #[test]
+fn tab_and_arrow_keys_can_be_captured() {
+    let mut h = harness(Arc::new(Mutex::new(HashMap::new())));
+    h.state_mut().run("ui.customizeShortcuts", Value::Null).unwrap();
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Search commands").focus();
+    h.event(egui::Event::Text("ui.theme".into()));
+    h.run_steps(3);
+    for key in [egui::Key::Tab, egui::Key::ArrowLeft] {
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Add…").click();
+        h.step();
+        h.key_press(key);
+        h.run_steps(3);
+        assert!(h.state().ui.keymap.bindings.iter().any(|b| b.command == "ui.theme" && b.chord.key == key), "{key:?} was not captured");
+    }
+}
+
+#[test]
 fn escape_cancels_capture_but_can_be_assigned_explicitly_and_reset() {
     let prefs = Arc::new(Mutex::new(HashMap::new()));
     let mut h = harness(prefs.clone());

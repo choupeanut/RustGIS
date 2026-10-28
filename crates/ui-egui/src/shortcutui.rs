@@ -61,6 +61,9 @@ fn assign(app: &mut RustGisApp, editor: &mut Editor, chord: Chord, target: Targe
     }
 }
 
+/// UI commands that need parameters only their dialog supplies, so a bare shortcut would fail.
+const NEEDS_DIALOG: &[&str] = &["ui.importShapefile"];
+
 fn rows(app: &RustGisApp, web: bool) -> Vec<(String, Value, String)> {
     let mut rows = Vec::new();
     for c in &app.session.registry.commands {
@@ -69,7 +72,9 @@ fn rows(app: &RustGisApp, web: bool) -> Vec<(String, Value, String)> {
         }
     }
     for &(id, label, _) in crate::chrome::UI_COMMANDS {
-        rows.push((id.to_string(), Value::Null, tl!(label).to_string()));
+        if !NEEDS_DIALOG.contains(&id) {
+            rows.push((id.to_string(), Value::Null, tl!(label).to_string()));
+        }
     }
     for c in rustgis_engine::plugins::commands() {
         let label = c.plugin.manifest.translate(app.lang().code(), &c.decl.label).to_string();
@@ -92,7 +97,10 @@ fn rows(app: &RustGisApp, web: bool) -> Vec<(String, Value, String)> {
 
 /// Whether Command Search can open a matching row in the editor.
 pub fn can_customize(app: &RustGisApp, id: &str) -> bool {
-    if !crate::chrome::command_available(id, cfg!(target_arch = "wasm32")) || matches!(id, "edit.copy" | "edit.cut" | "edit.paste") {
+    if !crate::chrome::command_available(id, cfg!(target_arch = "wasm32"))
+        || matches!(id, "edit.copy" | "edit.cut" | "edit.paste")
+        || NEEDS_DIALOG.contains(&id)
+    {
         return false;
     }
     crate::chrome::UI_COMMANDS.iter().any(|(command, _, _)| *command == id)
@@ -102,10 +110,13 @@ pub fn can_customize(app: &RustGisApp, id: &str) -> bool {
 }
 
 /// The chord a key press assigns. On a Mac, Ctrl alone is not one: ⌘ is the command key there
-/// and Ctrl is a separate modifier, so Ctrl+T is skipped rather than stored as T.
+/// and Ctrl is a separate modifier, so Ctrl+T and Ctrl+⌘+T are skipped rather than stored as T
+/// and ⌘T. Elsewhere `mac_cmd` is never set and `command` mirrors Ctrl.
 fn captured_chord(event: &Event) -> Option<Chord> {
     match event {
-        Event::Key { key, pressed: true, repeat: false, modifiers, .. } if !(modifiers.ctrl && !modifiers.command) => {
+        Event::Key { key, pressed: true, repeat: false, modifiers, .. }
+            if !(modifiers.ctrl && (!modifiers.command || modifiers.mac_cmd)) =>
+        {
             Some(Chord { command: modifiers.command, alt: modifiers.alt, shift: modifiers.shift, key: *key })
         }
         _ => None,
