@@ -436,7 +436,8 @@ mod tests {
     #[test]
     fn malformed_preference_records_do_not_hide_valid_bindings() {
         let mut keymap = Keymap::default();
-        let readable = keymap.apply_preferences(r#"[{"keys":"D","command":"select.clear"},{"keys":42},{"keys":"W","command":"table.open"}]"#);
+        let readable =
+            keymap.apply_preferences(r#"[{"keys":"D","command":"select.clear"},{"keys":42},{"keys":"W","command":"table.open"}]"#);
         assert!(!readable, "an unreadable record blocks saving over the stored text");
         assert_eq!(keymap.command_for(Chord::parse("D").unwrap()).unwrap().command, "select.clear");
         assert_eq!(keymap.command_for(Chord::parse("W").unwrap()).unwrap().command, "table.open");

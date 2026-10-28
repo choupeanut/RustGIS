@@ -289,13 +289,8 @@ mod tests {
 
     #[test]
     fn capture_takes_the_command_key_not_a_bare_ctrl() {
-        let press = |modifiers: egui::Modifiers| Event::Key {
-            key: egui::Key::T,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers,
-        };
+        let press =
+            |modifiers: egui::Modifiers| Event::Key { key: egui::Key::T, physical_key: None, pressed: true, repeat: false, modifiers };
         assert_eq!(captured_chord(&press(egui::Modifiers::COMMAND)), Chord::parse("Mod+T"));
         // On a Mac, Ctrl+T is Ctrl alone: it is skipped, not stored as a bare T.
         assert_eq!(captured_chord(&press(egui::Modifiers::CTRL)), None);
