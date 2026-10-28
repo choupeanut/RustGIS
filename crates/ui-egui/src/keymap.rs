@@ -14,6 +14,7 @@ use crate::RustGisApp;
 
 const MAX_PREF_BYTES: usize = 100_000;
 const MAX_PREF_CHANGES: usize = 1_000;
+const MAX_COMMAND_LEN: usize = 200;
 
 /// The default shortcuts: (keys, command, parameters as JSON, or empty for none). Clipboard
 /// keys are not here: they arrive as copy, cut and paste events, not key presses.
@@ -249,7 +250,7 @@ impl Keymap {
                 readable = false;
                 continue;
             };
-            if is_clipboard(chord) || change.command.is_empty() || change.command.len() > 200 {
+            if is_clipboard(chord) || change.command.is_empty() || change.command.len() > MAX_COMMAND_LEN {
                 readable = false;
                 continue;
             }
@@ -276,7 +277,7 @@ impl Keymap {
                 changes.push(Change { keys: b.chord.to_string(), command: b.command.clone(), params: b.params.clone(), remove: false });
             }
         }
-        if changes.len() > MAX_PREF_CHANGES {
+        if changes.len() > MAX_PREF_CHANGES || changes.iter().any(|c| c.command.is_empty() || c.command.len() > MAX_COMMAND_LEN) {
             return None;
         }
         serde_json::to_string(&changes).ok().filter(|text| text.len() <= MAX_PREF_BYTES)
@@ -394,6 +395,9 @@ mod tests {
         let mut changed = defaults.clone();
         changed.assign(Chord::parse("D").unwrap(), "test.command", Value::String("x".repeat(MAX_PREF_BYTES)));
         assert!(changed.preferences(&defaults).is_none(), "never save a value that cannot be loaded");
+        let mut long_id = defaults.clone();
+        long_id.assign(Chord::parse("D").unwrap(), &"x".repeat(MAX_COMMAND_LEN + 1), Value::Null);
+        assert!(long_id.preferences(&defaults).is_none(), "never save a command id that loading rejects");
     }
 
     #[test]
