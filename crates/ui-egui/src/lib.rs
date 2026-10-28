@@ -548,6 +548,8 @@ pub struct UiState {
     pub(crate) shortcut_editor: shortcutui::Editor,
     /// Preserve unreadable saved shortcuts until the user explicitly resets them.
     pub(crate) shortcut_preferences_blocked: bool,
+    /// The shortcut changes are too many to save: they apply only to this session.
+    pub(crate) shortcut_preferences_full: bool,
     pub tab_strip_rect: Option<egui::Rect>,
     /// Where the left and right panes were drawn on the last frame, while they show.
     pub pane_rects: [Option<egui::Rect>; 2],
@@ -744,6 +746,7 @@ impl Default for UiState {
             keymap: keymap::Keymap::default(),
             shortcut_editor: shortcutui::Editor::default(),
             shortcut_preferences_blocked: false,
+            shortcut_preferences_full: false,
             tab_strip_rect: None,
             pane_rects: [None; 2],
             copy_out: None,

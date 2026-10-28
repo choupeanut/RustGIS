@@ -35,11 +35,13 @@ fn save(app: &mut RustGisApp) {
     }
     let defaults = Keymap::new(&app.session.registry);
     if let Some(changes) = app.ui.keymap.preferences(&defaults) {
+        app.ui.shortcut_preferences_full = false;
         if let Some(save) = &app.services.save_pref {
             save(PREF, &changes);
         }
     } else {
-        app.ui.shortcut_preferences_blocked = true;
+        // Too many changes to store: the saved ones stay as they are, and these apply to this session.
+        app.ui.shortcut_preferences_full = true;
     }
 }
 
@@ -99,6 +101,17 @@ pub fn can_customize(app: &RustGisApp, id: &str) -> bool {
         || app.ui.keymap.bindings.iter().any(|b| b.command == id)
 }
 
+/// The chord a key press assigns. On a Mac, Ctrl alone is not one: ⌘ is the command key there
+/// and Ctrl is a separate modifier, so Ctrl+T is skipped rather than stored as T.
+fn captured_chord(event: &Event) -> Option<Chord> {
+    match event {
+        Event::Key { key, pressed: true, repeat: false, modifiers, .. } if !(modifiers.ctrl && !modifiers.command) => {
+            Some(Chord { command: modifiers.command, alt: modifiers.alt, shift: modifiers.shift, key: *key })
+        }
+        _ => None,
+    }
+}
+
 /// Draws the editor after the normal map and dialogs.
 pub fn show(app: &mut RustGisApp, ctx: &Context) {
     let mut editor = std::mem::take(&mut app.ui.shortcut_editor);
@@ -126,6 +139,8 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
             });
             if app.ui.shortcut_preferences_blocked {
                 ui.label(tl!("Saved shortcuts are unreadable or exceed the limit. Changes apply only to this session; Reset All replaces the saved shortcuts."));
+            } else if app.ui.shortcut_preferences_full {
+                ui.label(tl!("Too many shortcut changes to save. Changes apply only to this session."));
             }
             if cfg!(target_arch = "wasm32") {
                 ui.label(tl!("Your browser may reserve some shortcuts."));
@@ -206,14 +221,7 @@ pub fn show(app: &mut RustGisApp, ctx: &Context) {
             assign(app, &mut editor, chord, target);
         }
     } else if was_capturing && editor.capture.is_some() {
-        let chord = ctx.input(|i| {
-            i.events.iter().find_map(|e| match e {
-                Event::Key { key, pressed: true, repeat: false, modifiers, .. } => {
-                    Some(Chord { command: modifiers.command, alt: modifiers.alt, shift: modifiers.shift, key: *key })
-                }
-                _ => None,
-            })
-        });
+        let chord = ctx.input(|i| i.events.iter().find_map(captured_chord));
         if let Some(chord) = chord
             && let Some(target) = editor.capture.take()
         {
@@ -277,6 +285,20 @@ mod tests {
         assign(&mut app, &mut editor, clipboard, target);
         assert!(editor.notice_clipboard);
         assert!(app.ui.keymap.command_for(clipboard).is_none());
+    }
+
+    #[test]
+    fn capture_takes_the_command_key_not_a_bare_ctrl() {
+        let press = |modifiers: egui::Modifiers| Event::Key {
+            key: egui::Key::T,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        assert_eq!(captured_chord(&press(egui::Modifiers::COMMAND)), Chord::parse("Mod+T"));
+        // On a Mac, Ctrl+T is Ctrl alone: it is skipped, not stored as a bare T.
+        assert_eq!(captured_chord(&press(egui::Modifiers::CTRL)), None);
     }
 
     #[test]

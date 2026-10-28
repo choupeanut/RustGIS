@@ -229,7 +229,8 @@ impl Keymap {
         map
     }
 
-    /// Apply stored user changes to this version's defaults.
+    /// Apply stored user changes to this version's defaults. Returns false if any of them could
+    /// not be read: the valid ones still apply, but the stored text must not be overwritten.
     pub fn apply_preferences(&mut self, text: &str) -> bool {
         if text.len() > MAX_PREF_BYTES {
             return false;
@@ -238,9 +239,18 @@ impl Keymap {
         if changes.len() > MAX_PREF_CHANGES {
             return false;
         }
-        for change in changes.into_iter().filter_map(|record| serde_json::from_value::<Change>(record).ok()) {
-            let Some(chord) = Chord::parse(&change.keys) else { continue };
+        let mut readable = true;
+        for record in changes {
+            let Ok(change) = serde_json::from_value::<Change>(record) else {
+                readable = false;
+                continue;
+            };
+            let Some(chord) = Chord::parse(&change.keys) else {
+                readable = false;
+                continue;
+            };
             if is_clipboard(chord) || change.command.is_empty() || change.command.len() > 200 {
+                readable = false;
                 continue;
             }
             if change.remove {
@@ -250,7 +260,7 @@ impl Keymap {
                 self.bindings.push(Binding { chord, command: change.command, params: change.params });
             }
         }
-        true
+        readable
     }
 
     /// Store differences only; return None if they would exceed the load limits.
@@ -426,7 +436,8 @@ mod tests {
     #[test]
     fn malformed_preference_records_do_not_hide_valid_bindings() {
         let mut keymap = Keymap::default();
-        keymap.apply_preferences(r#"[{"keys":"D","command":"select.clear"},{"keys":42},{"keys":"W","command":"table.open"}]"#);
+        let readable = keymap.apply_preferences(r#"[{"keys":"D","command":"select.clear"},{"keys":42},{"keys":"W","command":"table.open"}]"#);
+        assert!(!readable, "an unreadable record blocks saving over the stored text");
         assert_eq!(keymap.command_for(Chord::parse("D").unwrap()).unwrap().command, "select.clear");
         assert_eq!(keymap.command_for(Chord::parse("W").unwrap()).unwrap().command, "table.open");
     }
