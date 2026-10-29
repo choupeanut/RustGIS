@@ -116,7 +116,8 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 
 **Raster to PMTiles** (`rasterToPmtiles`) writes Web Mercator PNG tiles using the raster's current
 bands, colors, mask and resampling. Set the minimum and maximum zoom from 0 to 16 and choose a
-`.pmtiles` output; without one it uses the layer name. The raster must be georeferenced and fit
+`.pmtiles` output; without one it uses the last component of the layer name. Layer and group
+transparency are included. The raster must be georeferenced and fit
 within one world. Turn off dynamic range adjustment and display rotation first. The in-memory
 export is limited to 512 tiles and 64 MiB of compressed tile data; reduce the extent or zoom range
 if it exceeds a limit. Areas beyond the Web Mercator latitude limit are clipped.

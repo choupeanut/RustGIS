@@ -858,10 +858,9 @@ fn vector_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 
 fn raster_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let name = s(p, "input");
-    inp.raster(name).ok_or_else(|| format!("no raster layer named '{name}'"))?;
     let (min_zoom, max_zoom) = pmtiles_zooms(p)?;
     let output = s(p, "output").trim();
-    let default_name = name.rsplit(['/', '\\']).find(|name| !name.is_empty()).unwrap_or("output");
+    let default_name = name.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or("output");
     let file_name = if output.is_empty() { format!("{default_name}.pmtiles") } else { output.to_string() };
     let bytes = inp.raster_to_pmtiles(name, min_zoom, max_zoom)?;
     Ok(ToolResult { output: Output::File { file_name, bytes }, messages: vec![] })

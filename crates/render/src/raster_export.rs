@@ -13,8 +13,16 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 const TILE_SIZE: u32 = 256;
 const MAX_LAT: f64 = 85.051_128_779_806_6;
 
+/// Half-open tile interval, retaining a tile for a zero-width extent.
+fn tile_range(start: f64, end: f64, n: u32) -> (u32, u32) {
+    let first = ((start * f64::from(n)).floor() as i64).clamp(0, i64::from(n) - 1) as u32;
+    // One representable step absorbs projection rounding at an exact tile boundary.
+    let last = ((end * f64::from(n)).next_down().ceil() as i64 - 1).clamp(i64::from(first), i64::from(n) - 1) as u32;
+    (first, last)
+}
+
 /// Raster pixels are rendered with the same style and resampling as the map.
-pub fn export(layer: &RasterLayer, min_zoom: u8, max_zoom: u8) -> Result<Vec<u8>, String> {
+pub fn export(layer: &RasterLayer, min_zoom: u8, max_zoom: u8, opacity: f32) -> Result<Vec<u8>, String> {
     if min_zoom > max_zoom || max_zoom > 16 {
         return Err("zoom range must satisfy 0 <= minZoom <= maxZoom <= 16".into());
     }
@@ -40,9 +48,8 @@ pub fn export(layer: &RasterLayer, min_zoom: u8, max_zoom: u8) -> Result<Vec<u8>
     let mut count = 0u64;
     for z in min_zoom..=max_zoom {
         let n = 1u32 << z;
-        let tile = |x: f64| ((x * f64::from(n)).floor() as i64).clamp(0, i64::from(n) - 1) as u32;
-        let (x0, x1) = (tile((m.min_x + half) / (2.0 * half)), tile((m.max_x + half) / (2.0 * half)));
-        let (y0, y1) = (tile((half - m.max_y) / (2.0 * half)), tile((half - m.min_y) / (2.0 * half)));
+        let (x0, x1) = tile_range((m.min_x + half) / (2.0 * half), (m.max_x + half) / (2.0 * half), n);
+        let (y0, y1) = tile_range((half - m.max_y) / (2.0 * half), (half - m.min_y) / (2.0 * half), n);
         count = count.saturating_add(u64::from(x1 - x0 + 1) * u64::from(y1 - y0 + 1));
         if count > MAX_TILES {
             return Err(format!("raster export exceeds {MAX_TILES} tiles; reduce the zoom range or raster extent"));
@@ -66,7 +73,7 @@ pub fn export(layer: &RasterLayer, min_zoom: u8, max_zoom: u8) -> Result<Vec<u8>
                     &layer.style,
                     stats.as_deref().map(Vec::as_slice),
                     &view,
-                    1.0,
+                    opacity,
                     true,
                     raster::Place::Flat(&Flat::Mercator, "EPSG:3857"),
                 );
@@ -103,6 +110,20 @@ mod tests {
     use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
 
     #[test]
+    fn tile_ranges_respect_exact_and_near_boundaries() {
+        let n = 65_536;
+        let start = 1000.0 / f64::from(n);
+        let end = 1022.0 / f64::from(n);
+        assert_eq!(tile_range(start, end, n), (1000, 1021));
+        assert_eq!(tile_range(start, 1022.0_f64.next_up() / f64::from(n), n), (1000, 1021));
+        assert_eq!(tile_range(start, end + 1e-12, n), (1000, 1022));
+        assert_eq!(tile_range(start, end - 1e-12, n), (1000, 1021));
+        assert_eq!(tile_range(start, start, n), (1000, 1000));
+        let (first, last) = tile_range(start, end, n);
+        assert_eq!((last - first + 1).pow(2), 484);
+    }
+
+    #[test]
     #[allow(clippy::panic)]
     fn exports_png_tiles_and_rejects_unbounded_or_unsupported_requests() {
         let raster = Raster::new(
@@ -118,7 +139,7 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         let mut layer = RasterLayer::from_path(raster, "test.tif");
-        let data = export(&layer, 0, 1).unwrap_or_else(|e| panic!("{e}"));
+        let data = export(&layer, 0, 1, 1.0).unwrap_or_else(|e| panic!("{e}"));
         let path = std::env::temp_dir().join(format!("rustgis-raster-tiles-{}.pmtiles", std::process::id()));
         std::fs::write(&path, data).unwrap_or_else(|e| panic!("{e}"));
         let archive = path.to_string_lossy();
@@ -132,10 +153,26 @@ mod tests {
         let Payload::Image(image) = payload.as_ref() else { panic!("tile was not an image") };
         assert_eq!((image.width(), image.height()), (256, 256));
         assert!(image.data().as_chunks::<4>().0.iter().any(|p| p[3] != 0));
-        assert!(export(&layer, 3, 2).is_err());
-        assert!(export(&layer, 0, 16).is_err());
+        let faded_path = std::env::temp_dir().join(format!("rustgis-raster-tiles-faded-{}.pmtiles", std::process::id()));
+        std::fs::write(&faded_path, export(&layer, 0, 0, 0.25).unwrap_or_else(|e| panic!("{e}"))).unwrap_or_else(|e| panic!("{e}"));
+        let faded_url = format!("pmtiles:0/0/0@{}", faded_path.display());
+        let _ = cache::get(&faded_url, Want::Image);
+        cache::wait(web_time::Duration::from_secs(10));
+        let State::Ready(faded) = cache::get(&faded_url, Want::Image) else { panic!("faded tile did not load") };
+        let Payload::Image(faded) = faded.as_ref() else { panic!("faded tile was not an image") };
+        let original_alpha = image.data().as_chunks::<4>().0.iter().map(|p| p[3]).max().unwrap_or_default();
+        let faded_alpha = faded.data().as_chunks::<4>().0.iter().map(|p| p[3]).max().unwrap_or_default();
+        assert_eq!(original_alpha, 255);
+        assert!((63..=64).contains(&faded_alpha), "faded alpha: {faded_alpha}");
+        assert!(export(&layer, 3, 2, 1.0).is_err());
+        assert!(export(&layer, 0, 16, 1.0).is_err());
+        layer.style.mask.min = Some(100.0);
+        layer.style.mask.max = Some(200.0);
+        assert!(export(&layer, 0, 0, 1.0).is_err());
+        layer.style.mask = Default::default();
         layer.style.dra = true;
-        assert!(export(&layer, 0, 0).is_err());
+        assert!(export(&layer, 0, 0, 1.0).is_err());
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(faded_path);
     }
 }
