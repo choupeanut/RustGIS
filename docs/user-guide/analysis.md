@@ -109,9 +109,17 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Pivot Table | `pivotTable` | Analysis › Statistics |
 | Export Features | `exportFeatures` | Conversion |
 | Vector to PMTiles | `vectorToPmtiles` | Analyze › Tools |
+| Raster to PMTiles | `rasterToPmtiles` | Analyze › Tools |
 | IDW Interpolation | `idwInterpolation` | Analysis › Interpolation |
 | Ordinary Kriging | `kriging` | Analysis › Interpolation |
 | Zonal Statistics | `zonalStats` | Analysis › Raster |
+
+**Raster to PMTiles** (`rasterToPmtiles`) writes Web Mercator PNG tiles using the raster's current
+bands, colors, mask and resampling. Set the minimum and maximum zoom from 0 to 16 and choose a
+`.pmtiles` output; without one it uses the layer name. The raster must be georeferenced and fit
+within one world. Turn off dynamic range adjustment and display rotation first. The in-memory
+export is limited to 512 tiles and 64 MiB of compressed tile data; reduce the extent or zoom range
+if it exceeds a limit. Areas beyond the Web Mercator latitude limit are clipped.
 
 **Vector to PMTiles** (`vectorToPmtiles`) writes a single-layer MVT archive in standard Web
 Mercator. Choose `minZoom` and `maxZoom` from 0 to 16; `sourceLayer` defaults to the input

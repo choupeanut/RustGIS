@@ -712,6 +712,47 @@ pub static TOOLS: &[ToolSpec] = &[
         run: zonal_stats,
     },
     ToolSpec {
+        id: "rasterToPmtiles",
+        name: "Raster to PMTiles",
+        toolbox: "Analyze › Tools",
+        summary: "Exports a styled raster layer as Web Mercator PNG tiles in a PMTiles archive.",
+        params: &[
+            P {
+                name: "input",
+                label: "Input Layer",
+                kind: K::RasterLayer,
+                required: true,
+                default: "",
+                help: "The raster's current style, bands and resampling are used.",
+            },
+            P {
+                name: "minZoom",
+                label: "Minimum Zoom",
+                kind: K::Number,
+                required: true,
+                default: "",
+                help: "Minimum tile zoom, an integer from 0 to 16.",
+            },
+            P {
+                name: "maxZoom",
+                label: "Maximum Zoom",
+                kind: K::Number,
+                required: true,
+                default: "",
+                help: "Maximum tile zoom, an integer from minZoom to 16.",
+            },
+            P {
+                name: "output",
+                label: "Output",
+                kind: K::SaveFile { ext: "pmtiles" },
+                required: false,
+                default: "",
+                help: "Write a .pmtiles archive.",
+            },
+        ],
+        run: raster_to_pmtiles,
+    },
+    ToolSpec {
         id: "vectorToPmtiles",
         name: "Vector to PMTiles",
         toolbox: "Analyze › Tools",
@@ -782,8 +823,7 @@ fn rows(inp: &dyn Inputs, p: &Json, k: &str, ds: &Dataset) -> Vec<usize> {
     if sel.is_empty() { (0..ds.features.len()).collect() } else { sel.iter().copied().filter(|r| *r < ds.features.len()).collect() }
 }
 
-fn vector_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
-    let ds = input(inp, p, "input")?;
+fn pmtiles_zooms(p: &Json) -> Result<(u8, u8), String> {
     let zoom = |name: &str| -> Result<u8, String> {
         let value = p.get(name).ok_or_else(|| format!("{name} is required"))?;
         let parsed = match value {
@@ -798,6 +838,12 @@ fn vector_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     if min_zoom > max_zoom {
         return Err("minZoom must not exceed maxZoom".into());
     }
+    Ok((min_zoom, max_zoom))
+}
+
+fn vector_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    let ds = input(inp, p, "input")?;
+    let (min_zoom, max_zoom) = pmtiles_zooms(p)?;
     let source_layer = {
         let name = s(p, "sourceLayer").trim();
         if name.is_empty() { &ds.name } else { name }
@@ -808,6 +854,17 @@ fn vector_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let selected = inp.selection(s(p, "input"));
     let (bytes, messages) = inp.vector_to_pmtiles(ds, selected, min_zoom, max_zoom, source_layer)?;
     Ok(ToolResult { output: Output::File { file_name, bytes }, messages })
+}
+
+fn raster_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    let name = s(p, "input");
+    inp.raster(name).ok_or_else(|| format!("no raster layer named '{name}'"))?;
+    let (min_zoom, max_zoom) = pmtiles_zooms(p)?;
+    let output = s(p, "output").trim();
+    let default_name = name.rsplit(['/', '\\']).find(|name| !name.is_empty()).unwrap_or("output");
+    let file_name = if output.is_empty() { format!("{default_name}.pmtiles") } else { output.to_string() };
+    let bytes = inp.raster_to_pmtiles(name, min_zoom, max_zoom)?;
+    Ok(ToolResult { output: Output::File { file_name, bytes }, messages: vec![] })
 }
 
 /// The name of a tool's new layer, from its `output` parameter.
@@ -3716,8 +3773,11 @@ mod tests {
     fn built_in_tool_outputs_have_explicit_contracts() {
         for spec in TOOLS {
             for p in spec.params.iter().filter(|p| p.name.eq_ignore_ascii_case("output")) {
-                let valid =
-                    if spec.id == "vectorToPmtiles" { matches!(p.kind, K::SaveFile { ext: "pmtiles" }) } else { matches!(p.kind, K::Text) };
+                let valid = if matches!(spec.id, "vectorToPmtiles" | "rasterToPmtiles") {
+                    matches!(p.kind, K::SaveFile { ext: "pmtiles" })
+                } else {
+                    matches!(p.kind, K::Text)
+                };
                 assert!(valid, "{}: unexpected output kind {:?}", spec.id, p.kind);
             }
         }

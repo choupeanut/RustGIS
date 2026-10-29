@@ -654,6 +654,15 @@ impl Inputs for MapInputs<'_> {
         let out = crate::render::rustgis_tiles::vector_export::export(dataset, rows, min_zoom, max_zoom, source_layer)?;
         Ok((out.bytes, out.messages))
     }
+    fn raster_to_pmtiles(&self, layer: &str, min_zoom: u8, max_zoom: u8) -> Result<Vec<u8>, String> {
+        let raster = self
+            .session
+            .map()
+            .layer_by_name(layer)
+            .and_then(|l| l.raster.as_ref())
+            .ok_or_else(|| format!("no raster layer named '{layer}'"))?;
+        crate::render::raster_export::export(raster, min_zoom, max_zoom)
+    }
     fn dataset(&self, layer: &str) -> Option<&Dataset> {
         self.loaded
             .get(layer)
@@ -1067,6 +1076,37 @@ fn apply(s: &mut Session, ran: Ran, params: Value, res: Result<rustgis_analysis:
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod file_tests {
     use super::*;
+
+    #[test]
+    fn raster_to_pmtiles_queues_the_archive_without_changing_the_map() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let raster = Raster::new(
+            "Elevation",
+            4,
+            4,
+            vec![(0..16).map(|v| v as f32).collect()],
+            GeoTransform { origin_x: -180.0, origin_y: 80.0, pixel_width: 90.0, pixel_height: -40.0 },
+            Crs::LonLat,
+            None,
+            ColorHint::Gray,
+            "Float32",
+        )
+        .unwrap();
+        let mut s = Session::new(crate::Project::default());
+        s.map_mut().add_raster("Elevation", rustgis_map::RasterLayer::from_path(raster, "test.tif"));
+        s.queue_gp_files = true;
+        let result =
+            s.run("gp.run", &json!({"tool": "rasterToPmtiles", "params": {"input": "Elevation", "minZoom": 0, "maxZoom": 0}})).unwrap();
+        assert_eq!(result["pending"], true);
+        let files = s.take_gp_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, "Elevation.pmtiles");
+        assert!(files[0].2.starts_with(b"PMTiles\x03"));
+        assert_eq!(s.map().layers.len(), 1);
+        assert!(
+            s.run("gp.run", &json!({"tool": "rasterToPmtiles", "params": {"input": "Elevation", "minZoom": 2, "maxZoom": 1}})).is_err()
+        );
+    }
 
     fn record() -> GpRecord {
         GpRecord {
