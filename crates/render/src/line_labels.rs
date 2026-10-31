@@ -11,6 +11,7 @@ pub(super) const MAX_TURN: f32 = 0.436;
 pub(super) const MAX_CURVED_CHARS: usize = 200;
 
 /// A line in screen points, with how far along it each vertex is.
+#[derive(Debug)]
 struct Path {
     pts: Vec<(f32, f32)>,
     along: Vec<f32>,
@@ -128,6 +129,7 @@ fn angle(a: (f32, f32), b: (f32, f32)) -> f32 {
 
 /// A line in screen points as labels go along it: its path each way, built once for all the
 /// labels (and repeats) placed along it.
+#[derive(Debug)]
 pub(super) struct Line {
     fwd: Path,
     rev: Path,
@@ -166,6 +168,11 @@ impl Line {
         // Turned half round to stand upright: read from the other end.
         let flipped = (rustgis_tiles::symbols::upright(a_to_b) - a_to_b).abs() > 1.0;
         if flipped { Some((&self.rev, total - d)) } else { Some((&self.fwd, d)) }
+    }
+
+    /// A placement's centre on the path, without laying out its characters.
+    pub(super) fn anchor(&self, at: f32) -> Option<(f32, f32)> {
+        self.fwd.at(at)
     }
 
     /// Text `len` points long straight along the line, centred `at` points along it (its middle when
@@ -215,6 +222,30 @@ impl Line {
         }
         Some((centre, out))
     }
+}
+
+/// Middle first, then the nearest places either side, at most eight places in all.
+/// The ends allow the same overrun as ordinary line labels; no alternative is past that range.
+pub(super) fn positions(total: f32, width: f32, overrun: f32) -> Vec<f32> {
+    let mid = total / 2.0;
+    let room = mid - width / 2.0 + overrun.max(0.0);
+    let mut out = vec![mid];
+    if !room.is_finite() || room <= 0.0 || !width.is_finite() || width <= 0.0 {
+        return out;
+    }
+    let step = (width * 0.75).max(room / 4.0).max(1.0).min(room);
+    for k in 1..=4 {
+        let d = step * k as f32;
+        if d > room {
+            break;
+        }
+        for side in [-1.0, 1.0] {
+            if out.len() < 8 {
+                out.push(mid + side * d);
+            }
+        }
+    }
+    out
 }
 
 /// The most labels a line repeats a label in (the one at its middle among them).

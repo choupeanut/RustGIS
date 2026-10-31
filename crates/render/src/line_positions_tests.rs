@@ -1,0 +1,253 @@
+use super::*;
+use crate::tests::label;
+use rustgis_data::{Dataset, Field, FieldType, Value};
+use rustgis_map::LabelPlacement;
+use std::sync::Arc;
+
+fn curved(line: &[(f32, f32)]) -> Candidate {
+    let line = Arc::new(line_labels::Line::new(line).unwrap());
+    let positions = line_labels::positions(line.length(), 40.0, 10.0);
+    let (x, y) = line.anchor(line.length() / 2.0).unwrap();
+    Candidate {
+        label: PlacedLabel { x, y, ..label("road", x, None, 0.0) },
+        priority: 1.0,
+        row: 0,
+        key: (1, 0, 0, 0),
+        alternatives: Vec::new(),
+        curves: Some(label_places::Curves::new(
+            Arc::new(label_places::CurveSpec {
+                line,
+                chars: "road".chars().map(|c| c.to_string()).collect(),
+                advances: vec![10.0; 4],
+                gap: 0.0,
+                overrun: 10.0,
+            }),
+            positions,
+            None,
+        )),
+    }
+}
+
+#[test]
+fn curves_are_laid_out_only_until_a_place_fits() {
+    let c = curved(&[(20.0, 100.0), (380.0, 100.0)]);
+    label_places::LAYOUTS.with(|n| n.set(0));
+    let p = place_labels(vec![c.clone()], Vec::new(), 400.0, 200.0, false);
+    assert_eq!(p.keys[0].1, 0);
+    label_places::LAYOUTS.with(|n| assert_eq!(n.get(), 1));
+    let blocker = PlacedLabel { y: 100.0, ..label("BLOCKER", 200.0, None, 0.0) };
+    label_places::LAYOUTS.with(|n| n.set(0));
+    let p = place_labels(vec![c], vec![blocker], 400.0, 200.0, false);
+    let won = p.keys[0].1;
+    assert!(won > 0 && won < 8);
+    label_places::LAYOUTS.with(|n| assert_eq!(n.get(), usize::from(won) + 1));
+    assert_eq!(p.labels[1].glyphs.len(), 4);
+}
+
+#[test]
+fn a_sharp_middle_tries_a_straight_stretch_and_a_lock_replays_that_index() {
+    let c = curved(&[(0.0, 100.0), (200.0, 100.0), (200.0, 300.0)]);
+    assert!(c.curves.as_ref().unwrap().place(0, &mut c.label.clone()).is_none());
+    let p = place_labels(vec![c.clone()], Vec::new(), 400.0, 400.0, false);
+    let won = usize::from(p.keys[0].1);
+    assert!(won > 0);
+    let mut locked = c;
+    locked.curves.as_mut().unwrap().locked = Some(won);
+    // Shift the map projection: the same place and its characters move together.
+    turn_candidate(&mut locked, |x, y| Some((x + 12.0, y + 7.0)));
+    label_places::LAYOUTS.with(|n| n.set(0));
+    let q = place_labels(vec![locked], Vec::new(), 450.0, 450.0, true);
+    assert_eq!(usize::from(q.keys[0].1), won);
+    assert!((q.labels[0].x - p.labels[0].x - 12.0).abs() < 1e-4);
+    assert!((q.labels[0].y - p.labels[0].y - 7.0).abs() < 1e-4);
+    assert_eq!(q.labels[0].glyphs, p.labels[0].glyphs);
+    label_places::LAYOUTS.with(|n| assert_eq!(n.get(), 1));
+}
+
+#[test]
+fn all_curves_taken_are_unplaced_once_at_the_middle() {
+    let c = curved(&[(20.0, 100.0), (380.0, 100.0)]);
+    let blocker = PlacedLabel { y: 100.0, size: 200.0, ..label("XXXXXXXXXXXXXXXXXXXX", 200.0, None, 0.0) };
+    let p = place_labels(vec![c], vec![blocker], 400.0, 200.0, false);
+    assert_eq!(p.labels.len(), 1);
+    assert_eq!(p.unplaced.len(), 1);
+    assert_eq!((p.unplaced[0].x, p.unplaced[0].y), (200.0, 100.0));
+}
+
+#[test]
+fn turned_and_tilted_curves_defer_their_glyphs_until_placement() {
+    let c = curved(&[(20.0, 100.0), (380.0, 100.0)]);
+    for tilt in [false, true] {
+        label_places::LAYOUTS.with(|n| n.set(0));
+        // A 45-degree turn: each glyph follows its own projected baseline.
+        let at = |x, y| Some((200.0 + (x - y) * std::f32::consts::FRAC_1_SQRT_2, (x + y) * std::f32::consts::FRAC_1_SQRT_2));
+        let mut c = c.clone();
+        if tilt {
+            c = tilt_candidate(c, &at).unwrap();
+        } else {
+            turn_candidate(&mut c, at);
+        }
+        label_places::LAYOUTS.with(|n| assert_eq!(n.get(), 0));
+        let p = place_labels(vec![c], Vec::new(), 400.0, 400.0, false);
+        let l = &p.labels[0];
+        assert!((l.x - 270.7107).abs() < 1e-3 && (l.y - 212.132).abs() < 1e-3);
+        assert!(l.glyphs.iter().all(|g| (g.angle - std::f32::consts::FRAC_PI_4).abs() < 1e-4));
+        assert!(l.glyphs.windows(2).all(|w| w[1].dy > w[0].dy));
+        label_places::LAYOUTS.with(|n| assert_eq!(n.get(), 1));
+    }
+}
+
+fn map_with_line(blocked: bool) -> (Map, u32, View) {
+    let mut map = Map::new("lines");
+    map.basemap = rustgis_map::Basemap::Blank;
+    let mut ds = Dataset::new("roads", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+    ds.push(Some(Geometry::Line(vec![vec![Coord::new(-1.0, 0.0), Coord::new(1.0, 0.0)]])), vec![Value::Text("road".into())]);
+    let id = map.add_dataset(ds);
+    let layer = map.layer_mut(id).unwrap();
+    layer.labels.enabled = true;
+    layer.labels.default.field = "name".into();
+    layer.labels.default.size = 10.0;
+    layer.labels.default.placement = LabelPlacement::Parallel;
+    if blocked {
+        let mut ds = Dataset::new("blocker", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("BLOCKER".into())]);
+        let blocker = map.add_dataset(ds);
+        let l = map.layer_mut(blocker).unwrap();
+        l.labels.enabled = true;
+        l.labels.default.field = "name".into();
+        l.labels.default.placement = LabelPlacement::Center;
+    }
+    let camera = Camera { center: Coord::new(0.0, 0.0), res: 750.0, bearing: 0.0, pitch: 0.0 };
+    map.camera = camera;
+    (map, id, View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false })
+}
+
+#[test]
+fn rendering_retries_only_opted_in_nonrepeated_line_labels() {
+    for placement in [LabelPlacement::Parallel, LabelPlacement::Curved] {
+        let (mut map, id, view) = map_with_line(true);
+        map.layer_mut(id).unwrap().labels.default.placement = placement;
+        let before = render(&mut map, &view).unwrap();
+        assert!(before.labels.iter().all(|l| l.text != "road"));
+        assert!(before.labels.iter().any(|l| l.text == "BLOCKER"), "{:?}", before.labels);
+        let exported = render_complete(&mut map, &view).unwrap();
+        assert!(exported.labels.iter().any(|l| l.text == "BLOCKER"), "export labels: {:?}", exported.labels);
+        if let Ok(dir) = std::env::var("RUSTGIS_LINE_LABEL_EVIDENCE_DIR") {
+            std::fs::write(format!("{dir}/{placement:?}-before.png"), render_png(&mut map, &view).unwrap()).unwrap();
+        }
+        map.layer_mut(id).unwrap().labels.default.other_positions = true;
+        if let Ok(dir) = std::env::var("RUSTGIS_LINE_LABEL_EVIDENCE_DIR") {
+            std::fs::write(format!("{dir}/{placement:?}-after.png"), render_png(&mut map, &view).unwrap()).unwrap();
+        }
+        for (bearing, pitch) in [(0.0, 0.0), (35.0, 0.0), (20.0, 30.0)] {
+            let view = View { camera: Camera { bearing, pitch, ..view.camera }, ..view };
+            let r = render(&mut map, &view).unwrap();
+            assert!(r.labels.iter().any(|l| l.text == "road"), "{placement:?}, bearing {bearing}, pitch {pitch}");
+        }
+        // A saved lock selects the same alternative, including after a small pan.
+        map.label_display.locked = true;
+        let first = render(&mut map, &view).unwrap();
+        let key = map.label_lock.as_ref().unwrap().iter().find(|(k, _)| k.0 == id).copied().unwrap();
+        assert!(key.1 > 0);
+        let panned = View { camera: Camera { center: Coord::new(7500.0, 0.0), ..view.camera }, ..view };
+        let next = render(&mut map, &panned).unwrap();
+        let x = |r: &Rendered| r.labels.iter().find(|l| l.text == "road").unwrap().x;
+        assert!((x(&next) - x(&first) + 10.0).abs() < 0.05);
+        assert!(map.label_lock.as_ref().unwrap().contains(&key));
+
+        // Turning the option on changes neither an unblocked middle nor repeats.
+        for repeat in [None, Some(45.0)] {
+            let (mut clean, id, view) = map_with_line(false);
+            let c = &mut clean.layer_mut(id).unwrap().labels.default;
+            c.placement = placement;
+            c.repeat = repeat;
+            let before = render(&mut clean, &view).unwrap();
+            clean.layer_mut(id).unwrap().labels.default.other_positions = true;
+            let after = render(&mut clean, &view).unwrap();
+            assert_eq!(before.labels, after.labels);
+            assert_eq!(before.pixmap.data(), after.pixmap.data());
+        }
+    }
+}
+
+#[test]
+fn dense_curved_labels_have_a_bounded_lazy_layout_budget() {
+    let start = web_time::Instant::now();
+    label_places::LAYOUTS.with(|n| n.set(0));
+    let c = curved(&[(20.0, 100.0), (380.0, 100.0)]);
+    let candidates = (0..4000)
+        .map(|i| {
+            let mut c = c.clone();
+            c.key.1 = i;
+            c.priority = -(i as f64);
+            c
+        })
+        .collect::<Vec<_>>();
+    let p = place_labels(candidates, Vec::new(), 400.0, 200.0, false);
+    assert!(!p.labels.is_empty());
+    label_places::LAYOUTS.with(|n| assert!(n.get() <= 4000 * 8));
+    assert!(start.elapsed() < web_time::Duration::from_secs(5));
+}
+
+#[test]
+fn terrain_and_roofs_translate_ready_and_deferred_places_without_changing_glyph_offsets() {
+    let camera = Camera { center: Coord::new(0.0, 0.0), res: 600.0, bearing: 0.0, pitch: 45.0 };
+    let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+    let mut hill = crate::tests::hill_map();
+    hill.view.terrain =
+        Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer("dem".into()), exaggeration: 2.0 });
+    let ground = terrain::Ground::of(&hill, &camera).unwrap();
+    let mut blocks = Map::new("roofs");
+    let mut ds = Dataset::new("block", GeometryType::Polygon, vec![]);
+    ds.push(
+        Some(Geometry::Polygon(vec![vec![vec![
+            Coord::new(-0.1, -0.1),
+            Coord::new(0.1, -0.1),
+            Coord::new(0.0, 0.1),
+            Coord::new(-0.1, -0.1),
+        ]]])),
+        vec![],
+    );
+    let id = blocks.add_dataset(ds);
+    blocks.layer_mut(id).unwrap().extrusion = Some(rustgis_map::effects::Extrusion {
+        field: None,
+        height: 6000.0,
+        factor: 1.0,
+        face_culling: true,
+        lighting: true,
+        shadows: true,
+    });
+    for roof in [false, true] {
+        let mut c = curved(&[(20.0, 150.0), (380.0, 150.0)]);
+        c.key.0 = id;
+        c.key.1 = blocks.layer(id).unwrap().dataset.features[0].id as usize;
+        let before = c.curves.as_ref().unwrap().place(0, &mut c.label.clone()).unwrap();
+        c.alternatives.push(before.clone());
+        let mut candidates = vec![c];
+        if roof {
+            raise_labels(&blocks, &view, &mut candidates);
+        } else {
+            lift_labels(&view, &ground, &mut candidates);
+        }
+        let c = &candidates[0];
+        let after = c.curves.as_ref().unwrap().place(0, &mut c.label.clone()).unwrap();
+        assert!(after.y < before.y - 0.1, "roof {roof}");
+        assert_eq!(after.glyphs, before.glyphs);
+        assert_eq!(c.alternatives[0], after);
+    }
+}
+
+#[test]
+fn a_rendered_curved_label_can_leave_a_sharp_middle_bend() {
+    let (mut map, id, view) = map_with_line(false);
+    let layer = map.layer_mut(id).unwrap();
+    layer.dataset.features[0].geometry =
+        Some(Geometry::Line(vec![vec![Coord::new(-1.0, -1.0), Coord::new(1.0, -1.0), Coord::new(1.0, 1.0)]]));
+    layer.touch_geometry();
+    layer.labels.default.placement = LabelPlacement::Curved;
+    assert!(render(&mut map, &view).unwrap().labels.is_empty());
+    map.layer_mut(id).unwrap().labels.default.other_positions = true;
+    let r = render(&mut map, &view).unwrap();
+    assert_eq!(r.labels.len(), 1);
+    assert!(!r.labels[0].glyphs.is_empty());
+}
