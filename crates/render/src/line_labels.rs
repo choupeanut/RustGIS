@@ -10,6 +10,12 @@ pub(super) const MAX_TURN: f32 = 0.436;
 /// attribute value on many lines doesn't lay out, and draw, character by character.
 pub(super) const MAX_CURVED_CHARS: usize = 200;
 
+/// Length of curved text including spacing, with no trailing gap or backward character step.
+pub(super) fn curved_len(advances: &[f32], gap: f32) -> f32 {
+    let step = |adv: f32| (adv + gap).max(0.0);
+    advances.iter().map(|a| step(*a)).sum::<f32>() - advances.last().map_or(0.0, |a| step(*a) - a)
+}
+
 /// A line in screen points, with how far along it each vertex is.
 #[derive(Debug)]
 struct Path {
@@ -194,7 +200,7 @@ impl Line {
     pub(super) fn curved(&self, advances: &[f32], gap: f32, overrun: f32, at: Option<f32>) -> Option<((f32, f32), Vec<(f32, f32, f32)>)> {
         // Each step from a character to the next: its advance and the letter spacing (never back).
         let step = |adv: f32| (adv + gap).max(0.0);
-        let len: f32 = advances.iter().map(|a| step(*a)).sum::<f32>() - advances.last().map_or(0.0, |a| step(*a) - a);
+        let len = curved_len(advances, gap);
         let (path, mid) = self.upright(len, overrun, at)?;
         let centre = path.at(mid)?;
         let mut d = mid - len / 2.0;

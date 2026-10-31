@@ -1889,6 +1889,15 @@ impl LabelPlace {
     /// Transform this place using the candidate's font metrics, without moving its icon.
     fn transform(&mut self, l: &mut PlacedLabel, at: &impl Fn(f32, f32) -> Option<(f32, f32)>) -> bool {
         let Some((x, y)) = at(self.x, self.y) else { return false };
+        // A character left in the source view would be drawn at a stale offset. Reject the
+        // whole place, including a missing baseline direction, before mutating the template.
+        if self
+            .glyphs
+            .iter()
+            .any(|g| at(self.x + g.dx, self.y + g.dy).is_none() || turned_angle(self.x + g.dx, self.y + g.dy, g.angle, at).is_none())
+        {
+            return false;
+        }
         let icon = l.icon.take();
         self.swap(l);
         turn_with(l, at);
@@ -2296,13 +2305,32 @@ fn place_tilted_labels(map: &Map, view: &View, mut candidates: Vec<Candidate>, g
         // A line's repeats: each band numbers those on its own stretch, so they are told apart by
         // where they land (the same repeat in two bands lands in one place).
         (l, r, k, i) if i > 0 => seen_repeat.insert((l, r, k, near(c))),
+        // Deferred curves claim the key only once a band's candidate is placed.
+        _ if c.curves.is_some() => true,
         key => seen.insert(key),
     });
     raise_labels(map, view, &mut candidates);
     if let Some(g) = ground {
         lift_labels(view, g, &mut candidates);
     }
-    place_labels(candidates, Vec::new(), view.width as f32, view.height as f32, false)
+    // Group bands under one candidate slot, retaining their near-first order. A nearer
+    // band's unlayoutable curve must not suppress a later band's layoutable one.
+    let mut groups: Vec<Candidate> = Vec::new();
+    let mut curve_groups = std::collections::HashMap::new();
+    for mut candidate in candidates {
+        if let Some(curves) = &mut candidate.curves {
+            curves.deduplicate = true;
+            if let Some(&index) = curve_groups.get(&candidate.key)
+                && let Some(first) = groups.get_mut(index).and_then(|c: &mut Candidate| c.curves.as_mut())
+            {
+                first.fallbacks.push(candidate);
+                continue;
+            }
+            curve_groups.insert(candidate.key, groups.len());
+        }
+        groups.push(candidate);
+    }
+    place_labels(groups, Vec::new(), view.width as f32, view.height as f32, false)
 }
 
 /// Whether a turned or tilted `view` of `map` may be drawn on the GPU ([`gpu_turned`]): only
@@ -3360,6 +3388,7 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
             let layer: &rustgis_map::Layer = layer;
             // Its symbol by expression, compiled once for the drawing (none: the layer's own).
             let styler = layer.styler(Some(scale));
+            // Name labels by feature id so locks survive edits that move rows (#1046).
             let label_id = |row: usize| layer.dataset.features.get(row).map_or(row, |f| f.id as usize);
             let (labels, selection, ds_ptr) = (&layer.labels, &layer.selection, &layer.dataset);
             // The globe draws the lon/lat geometry itself; the flat map its Web Mercator copy.
@@ -3763,22 +3792,13 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                             // It may run past the line's ends by about a letter, as QGIS's overrun.
                             let overrun = size;
                             let repeat = class.repeat.map(|r| r * 1.33 * label_factor);
-                            if class.other_positions && repeat.is_none() {
-                                let (chars, advances): (Vec<String>, Vec<f32>) = if curving {
-                                    let chars: Vec<String> = text.graphemes(true).map(String::from).collect();
-                                    let advances = chars.iter().map(|c| text::measure_in(c, size, face)).collect();
-                                    (chars, advances)
-                                } else {
-                                    (Vec::new(), Vec::new())
-                                };
-                                let width = if curving {
-                                    advances.iter().map(|a| (a + spacing * 1.33).max(0.0)).sum::<f32>()
-                                        - advances.last().map_or(0.0, |a| (a + spacing * 1.33).max(0.0) - a)
-                                } else {
-                                    text::spaced_block_width(&text, size, face, spacing)
-                                };
-                                let positions = line_labels::positions(line.length(), width, overrun);
-                                if curving {
+                            let try_others = class.other_positions && repeat.is_none();
+                            if curving {
+                                let chars: Vec<String> = text.graphemes(true).map(String::from).collect();
+                                let advances: Vec<f32> = chars.iter().map(|c| text::measure_in(c, size, face)).collect();
+                                if try_others {
+                                    let width = line_labels::curved_len(&advances, spacing * 1.33);
+                                    let positions = line_labels::positions(line.length(), width, overrun);
                                     let Some((cx, cy)) = line.anchor(line.length() / 2.0) else { continue };
                                     let angle = line.parallel(width, overrun, None).map(|(_, _, a)| a);
                                     // The preview is also View Unplaced's middle when every curve fails.
@@ -3797,31 +3817,7 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                                         locked,
                                     ));
                                 } else {
-                                    for (i, at) in positions.into_iter().enumerate() {
-                                        if let Some((x, y, angle)) = line.parallel(width, overrun, Some(at)) {
-                                            if i == 0 {
-                                                places.push((0, x, y, Some(angle), Vec::new()));
-                                            } else {
-                                                line_alternatives.push(LabelPlace { x, y, angle: Some(angle), glyphs: Vec::new() });
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                let along = line_labels::repeats(line.length(), repeat);
-                                // A text too long to curve character by character goes straight.
-                                if !curving {
-                                    let width = text::spaced_block_width(&text, size, face, spacing);
-                                    for (i, at) in along {
-                                        if let Some((cx, cy, a)) = line.parallel(width, overrun, Some(at)) {
-                                            places.push((i, cx, cy, Some(a), Vec::new()));
-                                        }
-                                    }
-                                } else {
-                                    // Each character with its accents, drawn as one.
-                                    let chars: Vec<String> = text.graphemes(true).map(String::from).collect();
-                                    let advances: Vec<f32> = chars.iter().map(|c| text::measure_in(c, size, face)).collect();
-                                    for (i, at) in along {
+                                    for (i, at) in line_labels::repeats(line.length(), repeat) {
                                         let Some(((cx, cy), turns)) = line.curved(&advances, spacing * 1.33, overrun, Some(at)) else {
                                             continue;
                                         };
@@ -3831,6 +3827,26 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                                             .map(|(text, (dx, dy, angle))| LabelGlyph { text: text.clone(), dx, dy, angle })
                                             .collect();
                                         places.push((i, cx, cy, None, glyphs));
+                                    }
+                                }
+                            } else {
+                                // A text too long to curve character by character also goes straight.
+                                let width = text::spaced_block_width(&text, size, face, spacing);
+                                let along = if try_others {
+                                    line_labels::positions(line.length(), width, overrun).into_iter().enumerate().collect()
+                                } else {
+                                    line_labels::repeats(line.length(), repeat)
+                                };
+                                // Alternatives share one width/overrun and stay inside upright's
+                                // range: if the middle cannot fit, none can. Keep it as place 0
+                                // so a lock's alternative indices do not change.
+                                for (i, at) in along {
+                                    if let Some((x, y, angle)) = line.parallel(width, overrun, Some(at)) {
+                                        if try_others && i > 0 {
+                                            line_alternatives.push(LabelPlace { x, y, angle: Some(angle), glyphs: Vec::new() });
+                                        } else {
+                                            places.push((i, x, y, Some(angle), Vec::new()));
+                                        }
                                     }
                                 }
                             }
@@ -4757,13 +4773,24 @@ fn place_labels(cands: impl IntoIterator<Item = impl Into<Candidate>>, fixed: Ve
     }
     let mut out = Placement { labels: fixed, unplaced: Vec::new(), keys: Vec::new() };
     let outside = |b: &[f32; 4]| b[2] < 0.0 || b[3] < 0.0 || b[0] > w || b[1] > h;
-    for Candidate { label: mut l, key, alternatives, curves, .. } in cands.into_iter().take(20_000) {
-        let c = l.collide;
+    let mut placed_curves = std::collections::HashSet::new();
+    let mut failed_curves = std::collections::HashSet::new();
+    let mut unplaced = Vec::new();
+    let candidates = cands.into_iter().take(20_000).flat_map(|mut candidate| {
+        let fallbacks = candidate.curves.as_mut().map(|curves| std::mem::take(&mut curves.fallbacks)).unwrap_or_default();
+        std::iter::once(candidate).chain(fallbacks)
+    });
+    for Candidate { label: mut l, key, alternatives, curves, .. } in candidates {
+        let grouped = curves.as_ref().is_some_and(|curves| curves.deduplicate);
+        if grouped && placed_curves.contains(&key) {
+            continue;
+        }
+        let collide = l.collide;
         let (has_text, has_icon) = (!l.text.is_empty(), l.icon.is_some());
         // Its own place, else the first alternative where all of it shows (the text moves there;
         // an icon stays).
         let mut at = None;
-        let count = curves.as_ref().map_or(1 + alternatives.len(), |c| c.positions.len());
+        let count = curves.as_ref().map_or(1 + alternatives.len(), |curves| curves.positions.len());
         let original = LabelPlace::take(&mut l);
         // A failed curve at the middle still appears there once in View Unplaced.
         if curves.is_some() {
@@ -4775,7 +4802,7 @@ fn place_labels(cands: impl IntoIterator<Item = impl Into<Candidate>>, fixed: Ve
         let mut ready = std::iter::once(original).chain(alternatives);
         for i in 0..count {
             let place = match &curves {
-                Some(c) => c.place(i, &mut l),
+                Some(curves) => curves.place(i, &mut l),
                 None => ready.next(),
             };
             let Some(mut place) = place else { continue };
@@ -4796,15 +4823,15 @@ fn place_labels(cands: impl IntoIterator<Item = impl Into<Candidate>>, fixed: Ve
         let Some((i, mut place, text, icon, show_text, show_icon)) = at else { continue };
         place.swap(&mut l);
         if !show_text && !show_icon {
-            if out.unplaced.len() < 2000 && has_text {
-                out.unplaced.push(PlacedLabel { color: UNPLACED, halo: Some(halo_for(UNPLACED)), icon: None, ..l });
+            if unplaced.len() < 2000 && has_text && (!grouped || failed_curves.insert(key)) {
+                unplaced.push((grouped.then_some(key), PlacedLabel { color: UNPLACED, halo: Some(halo_for(UNPLACED)), icon: None, ..l }));
             }
             continue;
         }
-        if show_text && !c.text_ignore_placement {
+        if show_text && !collide.text_ignore_placement {
             text.iter().for_each(|b| grid.insert(*b));
         }
-        if show_icon && !c.icon_ignore_placement {
+        if show_icon && !collide.icon_ignore_placement {
             icon.iter().for_each(|b| grid.insert(*b));
         }
         if !show_text {
@@ -4813,9 +4840,14 @@ fn place_labels(cands: impl IntoIterator<Item = impl Into<Candidate>>, fixed: Ve
         if !show_icon {
             l.icon = None;
         }
+        if grouped {
+            placed_curves.insert(key);
+        }
         out.labels.push(l);
         out.keys.push((key, u8::try_from(i).unwrap_or(u8::MAX)));
     }
+    out.unplaced =
+        unplaced.into_iter().filter(|(key, _)| key.is_none_or(|key| !placed_curves.contains(&key))).map(|(_, label)| label).collect();
     out
 }
 

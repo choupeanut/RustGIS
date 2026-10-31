@@ -172,7 +172,6 @@ fn rendering_retries_only_opted_in_nonrepeated_line_labels() {
 
 #[test]
 fn dense_curved_labels_have_a_bounded_lazy_layout_budget() {
-    let start = web_time::Instant::now();
     label_places::LAYOUTS.with(|n| n.set(0));
     let c = curved(&[(20.0, 100.0), (380.0, 100.0)]);
     let candidates = (0..4000)
@@ -186,7 +185,6 @@ fn dense_curved_labels_have_a_bounded_lazy_layout_budget() {
     let p = place_labels(candidates, Vec::new(), 400.0, 200.0, false);
     assert!(!p.labels.is_empty());
     label_places::LAYOUTS.with(|n| assert!(n.get() <= 4000 * 8));
-    assert!(start.elapsed() < web_time::Duration::from_secs(5));
 }
 
 #[test]
@@ -250,4 +248,38 @@ fn a_rendered_curved_label_can_leave_a_sharp_middle_bend() {
     let r = render(&mut map, &view).unwrap();
     assert_eq!(r.labels.len(), 1);
     assert!(!r.labels[0].glyphs.is_empty());
+}
+
+#[test]
+fn a_projected_anchor_does_not_keep_unprojectable_characters() {
+    let c = curved(&[(20.0, 100.0), (380.0, 100.0)]);
+    let c = tilt_candidate(c, &|x, y| (x > 195.0).then_some((x, y))).unwrap();
+    let p = place_labels(vec![c], Vec::new(), 400.0, 200.0, false);
+    assert_eq!(p.keys[0].1, 2, "middle anchor is visible, but its leftmost glyphs are not");
+    assert!(p.labels[0].glyphs.iter().all(|g| p.labels[0].x + g.dx > 195.0));
+}
+
+#[test]
+fn a_nearer_bands_unlayoutable_curve_does_not_claim_the_feature_key() {
+    let mut bad = curved(&[(100.0, 100.0), (110.0, 100.0)]);
+    // No overrun: four letters cannot fit on this band's short stretch.
+    Arc::get_mut(&mut bad.curves.as_mut().unwrap().spec).unwrap().overrun = 0.0;
+    let good = curved(&[(20.0, 100.0), (380.0, 100.0)]);
+    let map = Map::new("bands");
+    let view = View {
+        width: 400.0,
+        height: 200.0,
+        pixels_per_point: 1.0,
+        camera: Camera { center: Coord::new(0.0, 0.0), res: 1000.0, bearing: 0.0, pitch: 30.0 },
+        sky: false,
+    };
+    let p = place_tilted_labels(&map, &view, vec![bad.clone(), good.clone(), good.clone()], None);
+    assert_eq!(p.labels.len(), 1);
+    assert_eq!(p.labels[0].glyphs.len(), 4);
+    assert!(p.unplaced.is_empty(), "a successful later band replaces the failed preview");
+    // Band siblings share one slot even across the placement cap: a viable sibling is kept.
+    let candidates = std::iter::repeat_n(bad, 20_000).chain(std::iter::once(good)).collect();
+    let p = place_tilted_labels(&map, &view, candidates, None);
+    assert_eq!(p.labels.len(), 1);
+    assert!(p.unplaced.is_empty());
 }

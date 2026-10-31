@@ -24,6 +24,8 @@ pub(super) struct Curves {
     pub spec: Arc<CurveSpec>,
     pub positions: Vec<f32>,
     pub locked: Option<usize>,
+    pub deduplicate: bool,
+    pub fallbacks: Vec<Candidate>,
     changes: Vec<Change>,
 }
 
@@ -35,7 +37,7 @@ impl std::fmt::Debug for Curves {
 
 impl Curves {
     pub fn new(spec: Arc<CurveSpec>, positions: Vec<f32>, locked: Option<usize>) -> Self {
-        Self { spec, positions, locked, changes: Vec::new() }
+        Self { spec, positions, locked, deduplicate: false, fallbacks: Vec::new(), changes: Vec::new() }
     }
 
     pub fn project(&mut self, at: impl Fn(f32, f32) -> Option<(f32, f32)> + Send + Sync + 'static) {
@@ -46,7 +48,7 @@ impl Curves {
         self.changes.push(Change::Shift(dx, dy));
     }
 
-    /// A cheap anchor for band deduplication and height lifting; no character layout.
+    /// The first in-sight anchor (middle first) for a tilted view's label; no character layout.
     pub fn anchor_in(&self, at: &impl Fn(f32, f32) -> Option<(f32, f32)>) -> Option<(f32, f32)> {
         for (i, d) in self.positions.iter().enumerate() {
             if self.locked.is_some_and(|won| won != i) {
