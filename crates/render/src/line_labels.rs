@@ -176,6 +176,32 @@ impl Line {
         if flipped { Some((&self.rev, total - d)) } else { Some((&self.fwd, d)) }
     }
 
+    /// Squared screen distance and distance along the path of its nearest point.
+    pub(super) fn nearest(&self, point: (f32, f32), overrun: f32) -> Option<(f32, f32)> {
+        let mut best = None;
+        let mut distance = f32::INFINITY;
+        for (i, edge) in self.fwd.pts.windows(2).enumerate() {
+            let (a, b) = (edge.first()?, edge.get(1)?);
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len = dx.hypot(dy);
+            if !len.is_finite() || len <= 0.0 {
+                continue;
+            }
+            let t = ((point.0 - a.0) * (dx / len) + (point.1 - a.1) * (dy / len)) / len;
+            // Locked overrun placements may lie beyond an end; carry the end segment on.
+            let reach = overrun.max(0.0) / len;
+            let low = if i == 0 { -reach } else { 0.0 };
+            let high = if i + 2 == self.fwd.pts.len() { 1.0 + reach } else { 1.0 };
+            let t = t.clamp(low, high);
+            let d = (point.0 - a.0 - t * dx).powi(2) + (point.1 - a.1 - t * dy).powi(2);
+            if d < distance {
+                distance = d;
+                best = Some((d, *self.fwd.along.get(i)? + t * len));
+            }
+        }
+        best
+    }
+
     /// A placement's centre on the path, without laying out its characters.
     pub(super) fn anchor(&self, at: f32) -> Option<(f32, f32)> {
         self.fwd.at(at)
@@ -234,7 +260,8 @@ impl Line {
 /// The ends allow the same overrun as ordinary line labels; no alternative is past that range.
 pub(super) fn positions(total: f32, width: f32, overrun: f32) -> Vec<f32> {
     let mid = total / 2.0;
-    let room = mid - width / 2.0 + overrun.max(0.0);
+    // Keep endpoints a few ULPs inside upright's strict fit bounds.
+    let room = (mid - width / 2.0 + overrun.max(0.0)) * (1.0 - 8.0 * f32::EPSILON);
     let mut out = vec![mid];
     if !room.is_finite() || room <= 0.0 || !width.is_finite() || width <= 0.0 {
         return out;

@@ -14,6 +14,7 @@ fn curved(line: &[(f32, f32)]) -> Candidate {
         row: 0,
         key: (1, 0, 0, 0),
         alternatives: Vec::new(),
+        line: Some(LinePlaces::default()),
         curves: Some(label_places::Curves::new(
             Arc::new(label_places::CurveSpec {
                 line,
@@ -277,9 +278,116 @@ fn a_nearer_bands_unlayoutable_curve_does_not_claim_the_feature_key() {
     assert_eq!(p.labels.len(), 1);
     assert_eq!(p.labels[0].glyphs.len(), 4);
     assert!(p.unplaced.is_empty(), "a successful later band replaces the failed preview");
-    // Band siblings share one slot even across the placement cap: a viable sibling is kept.
-    let candidates = std::iter::repeat_n(bad, 20_000).chain(std::iter::once(good)).collect();
+    // Every physical camera band remains available, with a hard bound on excess siblings.
+    let max = rustgis_map::camera::MAX_TILT_BANDS;
+    let candidates = std::iter::repeat_n(bad.clone(), max - 1).chain(std::iter::once(good.clone())).collect();
     let p = place_tilted_labels(&map, &view, candidates, None);
     assert_eq!(p.labels.len(), 1);
+    label_places::LAYOUTS.with(|n| n.set(0));
+    let candidates = std::iter::repeat_n(bad, 20_000).chain(std::iter::once(good)).collect();
+    let p = place_tilted_labels(&map, &view, candidates, None);
+    assert!(p.labels.is_empty());
+    assert_eq!(p.unplaced.len(), 1);
+    label_places::LAYOUTS.with(|n| assert!(n.get() <= max * 8));
+}
+
+#[test]
+fn locked_line_anchors_survive_changes_to_the_visible_stretch() {
+    for placement in [LabelPlacement::Parallel, LabelPlacement::Curved] {
+        let (mut map, id, view) = map_with_line(true);
+        let layer = map.layer_mut(id).unwrap();
+        layer.dataset.features[0].geometry = Some(Geometry::Line(vec![vec![Coord::new(-3.0, 0.0), Coord::new(3.0, 0.0)]]));
+        layer.touch_geometry();
+        layer.labels.default.placement = placement;
+        layer.labels.default.other_positions = true;
+        map.label_display.locked = true;
+        let first = render(&mut map, &view).unwrap();
+        let first = first.labels.iter().find(|l| l.text == "road").unwrap();
+        assert_eq!(map.label_lock_line_anchors.len(), 1);
+        let moved = View { camera: Camera { center: Coord::new(60_000.0, 0.0), ..view.camera }, ..view };
+        let next = render(&mut map, &moved).unwrap();
+        let next = next.labels.iter().find(|l| l.text == "road").unwrap();
+        assert!((next.x - first.x + 80.0).abs() < 0.1, "{placement:?}: {} -> {}", first.x, next.x);
+        let zoom = View { camera: Camera { res: view.camera.res * 2.0, ..view.camera }, ..view };
+        let zoomed = render(&mut map, &zoom).unwrap();
+        let zoomed = zoomed.labels.iter().find(|l| l.text == "road").unwrap();
+        assert!((zoomed.x - (200.0 + (first.x - 200.0) / 2.0)).abs() < 0.1);
+        let outside = View { camera: Camera { center: Coord::new(300_000.0, 0.0), ..view.camera }, ..view };
+        assert!(render(&mut map, &outside).unwrap().labels.iter().all(|l| l.text != "road"), "a lock never slides back into view");
+        assert!(serde_json::to_value(&map).unwrap().get("label_lock_line_anchors").is_none());
+    }
+}
+
+#[test]
+fn a_later_parallel_band_can_supply_a_free_place() {
+    let map = Map::new("bands");
+    let view = View {
+        width: 400.0,
+        height: 200.0,
+        pixels_per_point: 1.0,
+        camera: Camera { center: Coord::new(0.0, 0.0), res: 1000.0, bearing: 0.0, pitch: 30.0 },
+        sky: false,
+    };
+    let mut first = Candidate::from((PlacedLabel { y: 100.0, ..label("road", 100.0, None, 0.0) }, 1.0, (1, 0, 0, 0)));
+    first.line = Some(LinePlaces::default());
+    first.alternatives.push((110.0, 100.0).into());
+    let mut second = first.clone();
+    second.label.x = 300.0;
+    second.alternatives = vec![(320.0, 100.0).into()];
+    let blocker = Candidate::from((PlacedLabel { y: 100.0, ..label("BLOCKER", 100.0, None, 0.0) }, 9.0, (u32::MAX, 0, 0, 0)));
+    let p = place_tilted_labels(&map, &view, vec![blocker, first, second], None);
+    assert_eq!(p.labels.iter().filter(|l| l.text == "road").count(), 1);
+    assert_eq!(p.labels.iter().find(|l| l.text == "road").unwrap().x, 300.0);
     assert!(p.unplaced.is_empty());
+}
+
+#[test]
+fn turned_candidates_skip_failed_alternatives_without_renumbering_slots() {
+    let mut c = Candidate::from((label("road", 100.0, None, 0.0), 1.0, (1, 0, 0, 0)));
+    c.alternatives = vec![(200.0, 20.0).into(), (300.0, 20.0).into()];
+    turn_candidate(&mut c, |x, y| (x != 200.0).then_some((x + 50.0, y)));
+    let p = place_labels(vec![c], vec![label("BLOCKER", 150.0, None, 0.0)], 400.0, 200.0, false);
+    assert_eq!(p.keys[0].1, 2);
+    assert_eq!(p.labels[1].x, 350.0);
+}
+
+#[test]
+fn end_candidates_fit_and_nearest_anchors_keep_overrun() {
+    for total in [1.0, 10.0, 100.0, 1_000_000.0] {
+        let line = line_labels::Line::new(&[(0.0, 0.0), (total, 0.0)]).unwrap();
+        for width in [0.1, 1.0, 8.0, 20.0] {
+            for overrun in [0.0, 0.5, 12.0] {
+                if width > total + 2.0 * overrun {
+                    continue;
+                }
+                let positions = line_labels::positions(total, width, overrun);
+                assert!(positions.len() <= 8);
+                assert!(positions.into_iter().all(|at| line.parallel(width, overrun, Some(at)).is_some()));
+            }
+        }
+        assert!((line.nearest((-2.0, 0.0), 2.0).unwrap().1 + 2.0).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn locked_multipart_lines_do_not_follow_a_distant_parts_extension() {
+    let view = View {
+        width: 400.0,
+        height: 200.0,
+        pixels_per_point: 1.0,
+        camera: Camera { center: Coord::new(0.0, 0.0), res: 1.0, bearing: 0.0, pitch: 0.0 },
+        sky: false,
+    };
+    let ctx = Ctx {
+        view: &view,
+        ppp: 1.0,
+        wireframe: false,
+        cull: Extent::EMPTY,
+        globe: None,
+        sprites: Default::default(),
+        bursts: Default::default(),
+    };
+    let parts = vec![vec![Coord::new(-100.0, 0.0), Coord::new(-90.0, 0.0)], vec![Coord::new(-10.0, 0.0), Coord::new(10.0, 0.0)]];
+    let (line, at) = line_near_anchor(&ctx, &parts, (200.0, 100.0), 5.0).unwrap();
+    assert!((line.length() - 20.0).abs() < 1e-4 && (at - 10.0).abs() < 1e-4);
 }

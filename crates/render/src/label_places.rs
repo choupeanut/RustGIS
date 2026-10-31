@@ -24,8 +24,6 @@ pub(super) struct Curves {
     pub spec: Arc<CurveSpec>,
     pub positions: Vec<f32>,
     pub locked: Option<usize>,
-    pub deduplicate: bool,
-    pub fallbacks: Vec<Candidate>,
     changes: Vec<Change>,
 }
 
@@ -37,7 +35,7 @@ impl std::fmt::Debug for Curves {
 
 impl Curves {
     pub fn new(spec: Arc<CurveSpec>, positions: Vec<f32>, locked: Option<usize>) -> Self {
-        Self { spec, positions, locked, deduplicate: false, fallbacks: Vec::new(), changes: Vec::new() }
+        Self { spec, positions, locked, changes: Vec::new() }
     }
 
     pub fn project(&mut self, at: impl Fn(f32, f32) -> Option<(f32, f32)> + Send + Sync + 'static) {
