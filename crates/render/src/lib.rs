@@ -3867,6 +3867,11 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                                 if try_others {
                                     let width = line_labels::curved_len(&advances, spacing * 1.33);
                                     let positions = positions(width);
+                                    // A saved slot the curve cannot take has no truthful preview either (as for a
+                                    // straight line): never draw one at the anchor or the middle.
+                                    if lock.as_ref().and_then(|k| k.get(&key)).is_some_and(|won| usize::from(*won) >= positions.len()) {
+                                        continue;
+                                    }
                                     line_places = Some(LinePlaces { anchors: anchors(&positions), ..Default::default() });
                                     let Some((cx, cy)) = line.anchor(locked_at.unwrap_or(line.length() / 2.0)) else { continue };
                                     let angle = line.parallel(width, overrun, locked_at).map(|(_, _, a)| a);
@@ -4928,10 +4933,12 @@ fn place_labels_with_previews(
                         if curves.locked.is_some_and(|won| won != i) {
                             continue;
                         }
-                        if layouts_left == 0 {
+                        // The budget only limits alternatives: a label's own place is always tried,
+                        // so exhausting it never silently drops later curved labels.
+                        if layouts_left == 0 && i > 0 {
                             break;
                         }
-                        layouts_left -= 1;
+                        layouts_left = layouts_left.saturating_sub(1);
                         curves.place(i, &mut l)
                     }
                     None => ready.next(),

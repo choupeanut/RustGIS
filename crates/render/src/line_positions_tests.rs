@@ -575,6 +575,24 @@ fn an_invalid_locked_straight_slot_never_invents_a_middle_preview() {
 }
 
 #[test]
+fn an_invalid_locked_curved_slot_never_invents_a_middle_preview() {
+    let (mut map, id, view) = map_with_line(false);
+    let labels = &mut map.layer_mut(id).unwrap().labels;
+    labels.default.other_positions = true;
+    labels.default.placement = LabelPlacement::Curved;
+    map.label_display.locked = true;
+    map.label_display.show_unplaced = true;
+    render(&mut map, &view).unwrap();
+    assert!(!map.label_lock.as_ref().unwrap().is_empty());
+    let anchors = map.label_lock_line_anchors.clone();
+    map.label_lock.as_mut().unwrap()[0].1 = u8::MAX;
+    let r = render(&mut map, &view).unwrap();
+    assert!(r.labels.is_empty());
+    assert!(r.unplaced.is_empty());
+    assert_eq!(map.label_lock_line_anchors, anchors);
+}
+
+#[test]
 fn rejected_curved_places_reuse_grapheme_allocations() {
     let c = curved(&[(20.0, 100.0), (380.0, 100.0)]);
     let curves = c.curves.as_ref().unwrap();
