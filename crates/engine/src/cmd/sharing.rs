@@ -319,6 +319,7 @@ fn share(s: &mut Session, p: &Value, kind: &str) -> CmdResult {
     s.notify(format!("Shared {name} to {path}"), false);
     // After it, so the status bar, which shows the last notice, keeps saying it.
     note_label_classes(s, kind, p);
+    note_export(s, kind, p, &path);
     Ok(json!({"item": id, "path": path, "bytes": bytes.len()}))
 }
 
@@ -549,6 +550,37 @@ onresize=draw;draw();
     ))
 }
 
+/// Says, when a shared web map, web layer or OGC API Features item has layers that lost Z or M
+/// values on import, or whose positions are approximate or aren't longitude/latitude, what
+/// `target` lacks: one notice per kind, counting them ([`rustgis_data::export_notes`]). Run once
+/// the item is made, as [`note_label_classes`] is.
+pub(crate) fn note_export(s: &mut Session, kind: &str, p: &Value, target: &str) {
+    // Shared items are GeoJSON, longitude/latitude.
+    let notes = match kind {
+        "webLayer" => s
+            .layer_id(p)
+            .ok()
+            .and_then(|id| s.map().layer(id))
+            .map(|l| rustgis_data::export_notes([(&l.dataset, l.extent())], target, rustgis_data::raster::Crs::LonLat))
+            .unwrap_or_default(),
+        "webMap" | "geodataService" => map_of(s, p)
+            .ok()
+            .map(|m| {
+                let shared = |l: &&Layer| if kind == "webMap" { l.visible } else { !l.is_raster() && !l.graphics };
+                rustgis_data::export_notes(
+                    m.layers.iter().filter(shared).map(|l| (&l.dataset, l.extent())),
+                    target,
+                    rustgis_data::raster::Crs::LonLat,
+                )
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    for note in notes {
+        s.notify(note, false);
+    }
+}
+
 /// Says what a web layer or style (`kind`) leaves out of the labels: it labels every feature with
 /// the Default class's field and text symbol, since no SQL clause has a MapLibre filter written
 /// for it, and has no labels when Default is hidden (though the layer's labels are on). Run once
@@ -560,17 +592,32 @@ pub(crate) fn note_label_classes(s: &mut Session, kind: &str, p: &Value) {
     let Some(l) = s.layer_id(p).ok().and_then(|id| s.map().layer(id)).filter(|l| l.labels.enabled) else { return };
     let n = l.labels.classes.len().min(MAX_LABEL_CLASSES);
     let clause = l.labels.default.where_.as_deref().is_some_and(|w| !w.trim().is_empty());
+    // A Default class without a field has no labels in the style: by a text expression alone, or
+    // by nothing.
+    let no_field = l.labels.default.field.is_empty();
     let text = if !l.labels.default.visible {
         Some(match n {
             0 => format!("{}'s style has no labels: its Default class is hidden.", l.name),
             _ => format!("{}'s style has no labels: its Default class is hidden, and its other label classes aren't in it.", l.name),
+        })
+    } else if no_field {
+        Some(match l.labels.default.by.text {
+            Some(_) => format!("{}'s style has no labels: its Default class's text is an expression, which isn't in it.", l.name),
+            None => format!("{}'s style has no labels: its Default class has no label field.", l.name),
         })
     } else {
         (n > 0 || clause).then(|| {
             format!("{}'s style labels every feature with its Default class; its label classes' SQL clauses aren't in it.", l.name)
         })
     };
-    if let Some(text) = text {
+    // Its expressions have no MapLibre equivalent written for them.
+    let by = (l.labels.default.visible && !no_field && !l.labels.default.by.is_empty()).then(|| {
+        format!(
+            "{}'s style labels with the Default class's field and text symbol ({}); its label expressions aren't in it.",
+            l.name, l.labels.default.field
+        )
+    });
+    for text in text.into_iter().chain(by) {
         s.notify(text, false);
     }
 }

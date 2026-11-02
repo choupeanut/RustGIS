@@ -3150,11 +3150,13 @@ pub(crate) fn takes_layer(kind: ParamKind, l: &rustgis_engine::map::Layer) -> bo
 }
 
 /// Whether a tool's parameter of `kind` takes field `i` of `d`: a numeric one for a
-/// `NumericField`, one holding coordinates for a `CoordinateField`, any for a `Field`. False for
-/// a kind that isn't a field's.
+/// `NumericField`, one holding coordinates for a `CoordinateField`, one without a `,` or `;` for
+/// `FieldNames` (runners split the text list at commas, some at semicolons too, so such a name
+/// can't be one entry), any for a `Field`. False for a kind that isn't a field's.
 pub(crate) fn takes_field(kind: ParamKind, d: &rustgis_engine::data::Dataset, i: usize) -> bool {
     match kind {
         ParamKind::Field | ParamKind::Fields { .. } => true,
+        ParamKind::FieldNames => d.fields.get(i).is_some_and(|f| !f.name.contains([',', ';'])),
         ParamKind::NumericField => d.fields.get(i).is_some_and(|f| f.ty.is_numeric()),
         ParamKind::CoordinateField => rustgis_engine::analysis::holds_coordinates(d, i),
         _ => false,
@@ -3166,6 +3168,71 @@ pub(crate) fn first_layer(spec: &rustgis_engine::analysis::ToolSpec) -> Option<&
     spec.params
         .iter()
         .find(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::PointLayer | ParamKind::VectorLayer))
+}
+
+/// The most specific `<input>_…` prefix wins; otherwise use the first attribute input.
+pub(crate) fn layer_for_param<'a>(
+    spec: &'a rustgis_engine::analysis::ToolSpec,
+    param_name: &str,
+) -> Option<&'a rustgis_engine::analysis::ParamSpec> {
+    spec.params
+        .iter()
+        .filter(|p| {
+            matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::PointLayer | ParamKind::VectorLayer)
+                && param_name.strip_prefix(p.name).is_some_and(|rest| rest.starts_with('_'))
+        })
+        .max_by_key(|p| p.name.len())
+        .or_else(|| first_layer(spec))
+}
+
+/// Editable field names with suggestions: manifests may describe new columns, not just inputs.
+/// A list appends names without replacing its earlier entries; manually typed syntax is retained.
+/// `hint` shows in the empty box (the default a run uses).
+pub(crate) fn field_suggestions<'a>(
+    ui: &mut Ui,
+    id: egui::Id,
+    value: &mut String,
+    label: &str,
+    hint: &str,
+    fields: impl Iterator<Item = &'a str>,
+    multiple: bool,
+) -> egui::Response {
+    let mut picked = None;
+    let mut response = ui
+        .horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::ComboBox::from_id_salt(id)
+                    .selected_text(tl!("Fields"))
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        for field in fields {
+                            if ui.selectable_label(false, field).clicked() {
+                                picked = Some(field);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(tl!("Choose a field"));
+                ui.add(egui::TextEdit::singleline(&mut *value).hint_text(hint).desired_width(f32::INFINITY)).on_hover_text(label)
+            })
+            .inner
+        })
+        .inner;
+    if let Some(field) = picked {
+        if !multiple || value.trim().is_empty() {
+            value.clear();
+            value.push_str(field);
+            response.mark_changed();
+        } else if !value.split([',', ';']).any(|part| part.trim() == field) {
+            let separator = if value.contains(';') { ';' } else { ',' };
+            if !value.trim_end().ends_with([',', ';']) {
+                value.push(separator);
+            }
+            value.push_str(field);
+            response.mark_changed();
+        }
+    }
+    response
 }
 
 /// The layer or table of name `name`, as a tool finds its input: a layer by its name, else a
@@ -3363,6 +3430,7 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         app.session.map().layers.iter().filter(|l| takes_layer(kind, l)).map(|l| l.name.clone()).collect()
     };
     let plugin_tool = spec.id.starts_with(rustgis_engine::plugins::PREFIX);
+    #[cfg(not(target_arch = "wasm32"))]
     let first_layer = first_layer(spec).map(|p| p.name);
     // The file parameter whose Browse was pressed: picked once the form is drawn.
     let mut browse_for = None;
@@ -3435,9 +3503,10 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 continue;
             }
             ParamKind::PolygonLayer | ParamKind::PointLayer => Some(layer_names(p.kind)),
-            ParamKind::Field | ParamKind::NumericField | ParamKind::CoordinateField => {
-                let lname = first_layer.and_then(|n| app.gp.values.get(n)).cloned().unwrap_or_default();
-                let table = first_layer.and_then(|n| app.gp.tables.get(n)).copied();
+            ParamKind::Field | ParamKind::FieldNames | ParamKind::NumericField | ParamKind::CoordinateField => {
+                let target_param = layer_for_param(spec, p.name).map(|p| p.name);
+                let lname = target_param.and_then(|n| app.gp.values.get(n)).cloned().unwrap_or_default();
+                let table = target_param.and_then(|n| app.gp.tables.get(n)).copied();
                 // The table picked; else the layer or table of that name, as the tool finds it.
                 let ds = match table {
                     Some(id) => app.session.project.table(id).map(|t| &t.dataset),
@@ -3465,6 +3534,23 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         v
                     }
                 };
+                if spec.id.starts_with("geolibre:") || p.kind == ParamKind::FieldNames {
+                    if field_suggestions(
+                        ui,
+                        egui::Id::unique(("gp", p.name)),
+                        &mut cur,
+                        tl!(p.label),
+                        "",
+                        v.iter().map(String::as_str),
+                        p.kind == ParamKind::FieldNames,
+                    )
+                    .changed()
+                    {
+                        app.gp.values.insert(p.name, cur);
+                    }
+                    ui.add_space(4.0);
+                    continue;
+                }
                 // A field picked for another layer, which this one doesn't have: unset.
                 if ds.is_some() && !cur.is_empty() && !v.iter().any(|f| f.eq_ignore_ascii_case(&cur)) {
                     app.gp.values.remove(p.name);
@@ -4998,72 +5084,89 @@ fn symbol_by_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::map::
             .weak(),
         );
         for (key, label, cur) in rows {
-            let cur = cur.clone().unwrap_or_default();
-            let id = egui::Id::unique(("symbol_by", scope, key));
-            let (typing, failed) = (id.with("typing"), id.with("failed"));
-            let focused = ui.memory(|m| m.has_focus(id));
-            // Each kept with the expression it was typed over: one set meanwhile (by undo or a
-            // command) drops it. Typing left over from a box that stopped being drawn while
-            // focused is dropped too.
-            let over = |d: &mut egui::util::IdTypeMap, key: egui::Id| {
-                let v = d.get_temp::<(String, String)>(key);
-                if v.as_ref().is_some_and(|(was, _)| *was != cur) {
-                    d.remove::<(String, String)>(key);
-                }
-                v.filter(|(was, _)| *was == cur).map(|(_, text)| text)
-            };
-            if !focused {
-                ui.data_mut(|d| d.remove::<(String, String)>(typing));
-            }
-            // Text that didn't read, kept until it is changed or dropped.
-            let kept = ui.data_mut(|d| over(d, failed));
-            let mut buf = match focused {
-                true => ui.data_mut(|d| over(d, typing)).or_else(|| kept.clone()).unwrap_or_else(|| cur.clone()),
-                false => kept.clone().unwrap_or_else(|| cur.clone()),
-            };
-            let r = ui
-                .horizontal(|ui| {
-                    let input_label = ui
-                        .allocate_ui_with_layout(egui::vec2(96.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.set_min_width(96.0);
-                            ui.label(label)
-                        })
-                        .inner;
-                    ui.add(
-                        egui::TextEdit::singleline(&mut buf)
-                            .id(id)
-                            .hint_text(tl!("None"))
-                            .char_limit(rustgis_engine::data::query::MAX_LEN)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY),
-                    )
-                    .labelled_by(input_label.id)
-                })
-                .inner;
-            // Checked here, as Calculate Field checks it, only while it differs from what is set.
-            let text = buf.trim();
-            let error =
-                (text != cur.trim() && !text.is_empty()).then(|| rustgis_engine::data::query::parse(text, &l.dataset).err()).flatten();
-            if r.lost_focus() {
-                ui.data_mut(|d| d.remove::<(String, String)>(typing));
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    ui.data_mut(|d| d.remove::<(String, String)>(failed));
-                } else if error.is_some() {
-                    ui.data_mut(|d| d.insert_temp(failed, (cur.clone(), buf.clone())));
-                } else {
-                    ui.data_mut(|d| d.remove::<(String, String)>(failed));
-                    if text != cur.trim() {
-                        let _ = app.run("layer.symbolBy", json!({ key: text }));
-                    }
-                }
-            } else if r.has_focus() {
-                ui.data_mut(|d| d.insert_temp(typing, (cur.clone(), buf.clone())));
-            }
-            if let Some(e) = error.filter(|_| focused || r.lost_focus() || kept.is_some()) {
-                ui.label(egui::RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", &e)])).small().color(t.red));
+            if let Some(text) = expression_box(ui, egui::Id::unique(("symbol_by", scope, key)), label, cur.as_deref(), &l.dataset, t) {
+                let _ = app.run("layer.symbolBy", json!({ key: text }));
             }
         }
     });
+}
+
+/// One By Expression box: `label`, then the expression set (`cur`), checked against `ds` as it is
+/// typed. Gives the text to apply (blank: none) when the box loses focus with one that reads and
+/// differs from `cur`; one that doesn't read shows why, and stays in its box unapplied until it is
+/// fixed or Escape drops it.
+pub(crate) fn expression_box(
+    ui: &mut Ui,
+    id: egui::Id,
+    label: &str,
+    cur: Option<&str>,
+    ds: &rustgis_engine::data::Dataset,
+    t: &Tokens,
+) -> Option<String> {
+    let cur = cur.unwrap_or_default().to_string();
+    let (typing, failed) = (id.with("typing"), id.with("failed"));
+    let focused = ui.memory(|m| m.has_focus(id));
+    // Each kept with the expression it was typed over: one set meanwhile (by undo or a
+    // command) drops it. Typing left over from a box that stopped being drawn while
+    // focused is dropped too.
+    let over = |d: &mut egui::util::IdTypeMap, key: egui::Id| {
+        let v = d.get_temp::<(String, String)>(key);
+        if v.as_ref().is_some_and(|(was, _)| *was != cur) {
+            d.remove::<(String, String)>(key);
+        }
+        v.filter(|(was, _)| *was == cur).map(|(_, text)| text)
+    };
+    if !focused {
+        ui.data_mut(|d| d.remove::<(String, String)>(typing));
+    }
+    // Text that didn't read, kept until it is changed or dropped.
+    let kept = ui.data_mut(|d| over(d, failed));
+    let mut buf = match focused {
+        true => ui.data_mut(|d| over(d, typing)).or_else(|| kept.clone()).unwrap_or_else(|| cur.clone()),
+        false => kept.clone().unwrap_or_else(|| cur.clone()),
+    };
+    let r = ui
+        .horizontal(|ui| {
+            let input_label = ui
+                .allocate_ui_with_layout(egui::vec2(96.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.set_min_width(96.0);
+                    ui.label(label)
+                })
+                .inner;
+            ui.add(
+                egui::TextEdit::singleline(&mut buf)
+                    .id(id)
+                    .hint_text(tl!("None"))
+                    .char_limit(rustgis_engine::data::query::MAX_LEN)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY),
+            )
+            .labelled_by(input_label.id)
+        })
+        .inner;
+    // Checked here, as Calculate Field checks it, only while it differs from what is set.
+    let text = buf.trim();
+    let error = (text != cur.trim() && !text.is_empty()).then(|| rustgis_engine::data::query::parse(text, ds).err()).flatten();
+    let mut apply = None;
+    if r.lost_focus() {
+        ui.data_mut(|d| d.remove::<(String, String)>(typing));
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ui.data_mut(|d| d.remove::<(String, String)>(failed));
+        } else if error.is_some() {
+            ui.data_mut(|d| d.insert_temp(failed, (cur.clone(), buf.clone())));
+        } else {
+            ui.data_mut(|d| d.remove::<(String, String)>(failed));
+            if text != cur.trim() {
+                apply = Some(text.to_string());
+            }
+        }
+    } else if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(typing, (cur.clone(), buf.clone())));
+    }
+    if let Some(e) = error.filter(|_| focused || r.lost_focus() || kept.is_some()) {
+        ui.label(egui::RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", &e)])).small().color(t.red));
+    }
+    apply
 }
 
 /// The Strokes section of a line layer's symbology: strokes stacked in one symbol, each with
@@ -6229,6 +6332,62 @@ pub(crate) fn layout_menu(app: &mut RustGisApp, ui: &mut Ui, n: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_source_uses_the_longest_input_prefix() {
+        use rustgis_engine::analysis::{ParamSpec, ToolSpec};
+        const fn layer(name: &'static str) -> ParamSpec {
+            ParamSpec { name, label: name, kind: ParamKind::VectorLayer, required: true, default: "", help: "" }
+        }
+        const PARAMS: &[ParamSpec] = &[layer("input"), layer("input_points"), layer("denominator")];
+        let spec = ToolSpec {
+            id: "field_sources",
+            name: "",
+            toolbox: "",
+            summary: "",
+            params: PARAMS,
+            run: rustgis_engine::analysis::external_placeholder,
+        };
+        assert_eq!(layer_for_param(&spec, "input_points_weight_field").map(|p| p.name), Some("input_points"));
+        assert_eq!(layer_for_param(&spec, "denominator_weight_field").map(|p| p.name), Some("denominator"));
+        assert_eq!(layer_for_param(&spec, "denominators_field").map(|p| p.name), Some("input"), "prefix needs an underscore boundary");
+        assert_eq!(layer_for_param(&spec, "weight_field").map(|p| p.name), Some("input"));
+    }
+
+    /// A `FieldNames` list is split at `,` (and by some runners at `;`), so a name holding either
+    /// isn't offered for it; a single field takes any name.
+    #[test]
+    fn field_name_lists_leave_out_names_holding_a_separator() {
+        let opts = rustgis_engine::data::io::CsvOptions { delimiter: Some(b'\t'), ..Default::default() };
+        let (d, _) = rustgis_engine::data::io::read_csv_with("last,first\ta;b\tname\nx\ty\tz\n", "t", &opts).unwrap();
+        let names = |kind| (0..d.fields.len()).filter(|&i| takes_field(kind, &d, i)).map(|i| d.fields[i].name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names(ParamKind::FieldNames), ["name"]);
+        assert_eq!(names(ParamKind::Field), ["last,first", "a;b", "name"]);
+    }
+
+    #[test]
+    fn field_suggestions_append_without_erasing_typed_names() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(400.0, 150.0)).build_ui_state(
+            |ui, value: &mut String| {
+                field_suggestions(ui, egui::Id::unique("fields"), value, "Fields", "", ["name", "population"].into_iter(), true);
+            },
+            String::from("new_column"),
+        );
+        h.run_steps(3);
+        assert_eq!(h.state(), "new_column", "a name absent from the input is not cleared");
+        h.get_by_role(egui::accesskit::Role::ComboBox).click();
+        h.run_steps(3);
+        h.get_by_label("population").click();
+        h.run_steps(3);
+        assert_eq!(h.state(), "new_column,population", "append without replacing earlier names");
+        h.get_by_role(egui::accesskit::Role::TextInput).focus();
+        h.run_steps(2);
+        h.key_press(egui::Key::End);
+        h.event(egui::Event::Text(",typed_column".into()));
+        h.run_steps(3);
+        assert_eq!(h.state(), "new_column,population,typed_column");
+    }
 
     /// A run opened again from the History pane (#539) fills its tool's form as the form would
     /// have it: a standalone table, given by its id, by its name and picked by its id; numbers

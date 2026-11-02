@@ -209,6 +209,12 @@ Each layer keeps its look:
 Projects and styles from QGIS 1 and 2 read too: their legend gives the layers' order, and the
 older names of the same settings are read.
 
+A label's text that is an expression (not only a field) carries over as its class's text
+expression, and its data-defined size (turned from the text's unit into points), colour and
+rotation as its [expressions](cartography.md#labeling); QGIS 2's counterclockwise rotation is
+turned clockwise. Other data-defined label settings are noted by name, and a colour expression
+on see-through text is drawn opaque, noted.
+
 A symbol's data-defined size, fill and outline colours, outline width and marker angle carry over
 as the layer's [symbol expressions](cartography.md#symbols-by-expression), sizes turned from the
 symbol's unit (millimetres, points, pixels, inches; map units at the reference scale) into points, where RustGIS's [expression language](expressions.md) reads them. A marker of several layers
@@ -227,7 +233,7 @@ over the map, label backgrounds of other shapes drawn as rectangles, label dista
 and polygons, a distance around points moved straight up, labels wrapped at a shortest line
 length or justified, values outside a graduated renderer's ranges in its first or last class, file options
 such as `layerid` that RustGIS doesn't read) and what was skipped (arrow lines, other data-defined
-settings, draw effects, label callouts, labels from expressions, contours and other raster
+settings, draw effects, label callouts, contours and other raster
 renderers RustGIS has no match for, PostGIS, WFS
 and other sources RustGIS doesn't read, diagrams, joins, virtual fields, a layer's other styles,
 and the project's print layouts, annotations, bookmarks, map themes and relations). A database
@@ -274,6 +280,46 @@ reserve some shortcuts. In Command Search, right-click a command and choose **Ke
 to open it in the editor. If saved preferences are unreadable or exceed the supported limits, the
 original value is preserved and edits apply only to the current session. **Reset All** explicitly
 replaces the saved shortcuts with the defaults.
+
+Use **Import…** and **Export…** in the editor to back up shortcuts or share them between desktop,
+macOS and browser sessions. Export writes `rustgis-shortcuts.json`, containing only differences
+from the current defaults. `Mod` means Ctrl, or ⌘ on macOS, so the same file works across platforms.
+Import merges with your current shortcuts: review the counts of bindings, conflicts and unknown
+commands, then choose **Import** or **Cancel**. The file wins on conflicting keys; unrelated
+bindings stay unchanged. Unknown command ids are retained and become usable when their plugin is
+installed. Import only files you trust: pressing an imported key runs its command with the supplied
+parameters, which can include file writes or preference changes. Inspect shared JSON before importing.
+Invalid files are rejected without changing shortcuts. Files are limited to 100,100
+bytes (including version metadata) and 1,000 records. Merged preference data must fit 100,000 bytes. If saved preferences
+are unreadable, use **Reset All** before importing so they are not silently overwritten.
+
+The version 1 file format is:
+
+```json
+{
+  "rustgis_shortcuts": 1,
+  "bindings": [
+    { "keys": "D", "command": "tool.set", "params": { "tool": "select" } },
+    { "keys": "T", "command": "select.zoomTo" },
+    { "keys": "Mod+T", "command": "table.open", "remove": true }
+  ]
+}
+```
+
+Conflicts count distinct keys whose final imported assignment replaces a different current binding.
+Unknown-command counts cover distinct unknown command IDs among retained imported assignments, excluding
+removals and overwritten records.
+Records apply in file order; the last assignment to a key wins. A removal removes only the named
+command and parameters at that key, so a different user binding is preserved.
+
+Scripts and UI automation can use these UI-layer commands (the AI Assistant still refuses `ui.*`):
+
+| Command | Parameters and result |
+| --- | --- |
+| `ui.shortcuts.set` | `keys`, `command`, optional `params`; replaces the key's binding. With `remove: true`, removes only that command and parameters at the key. |
+| `ui.shortcuts.reset` | `keys` restores that key's default; no parameters resets all shortcuts. |
+| `ui.shortcuts.export` | No parameters opens Save/download; `path` writes a desktop file; `text: true` returns the document as `text` without a file dialog. |
+| `ui.shortcuts.import` | No parameters opens a file picker. `text`, base64 `data`, or desktop `path` validates and opens the preview, returning `bindings`, `conflicts`, `unknown_commands`. Pass the same document with `confirm: true` to merge and save it. |
 
 See the [keyboard shortcut reference](index.md#keyboard-shortcuts) for project, map and editing
 shortcuts, macOS bindings and text-field undo behavior. **Help › Shortcuts** lists the active
@@ -372,7 +418,10 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
   raster's edge, or across a line (a cross section), with gain, loss and a chart.
 - **Infographics** (Home tab) summarise what's in view: counts, totals and top categories.
 - **Offline**: Download Map takes the data in view into an offline area; open it to edit, then
-  Sync sends changed, new and deleted features back and refreshes it. **Feature Cache** prepares
+  Sync sends changed, new and deleted features back and refreshes it. A feature changed in the
+  map since the last sync and also edited or deleted offline takes the offline version, with a
+  warning naming it (Undo reverts the whole sync, restoring the map's version); an offline edit
+  to a feature since deleted from the map is dropped, with a warning too. **Feature Cache** prepares
   every layer's geometry for the current projection (Fill, Empty, Cancel, Auto Cache).
 - **Settings › Customize** chooses the ribbon's tabs and the Quick Access Toolbar's extra
   buttons. Settings and Help always remain visible. **Help** opens the user guide and the
