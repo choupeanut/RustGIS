@@ -1923,24 +1923,6 @@ impl LabelPlace {
     }
 }
 
-impl Candidate {
-    fn shift_places(&mut self, dx: f32, dy: f32) {
-        self.label.x += dx;
-        self.label.y += dy;
-        if let Some(i) = &mut self.label.icon {
-            i.x += dx;
-            i.y += dy;
-        }
-        for p in &mut self.alternatives {
-            p.x += dx;
-            p.y += dy;
-        }
-        if let Some(curves) = &mut self.curves {
-            curves.shift(dx, dy);
-        }
-    }
-}
-
 /// A label with no alternatives.
 impl From<(PlacedLabel, f64, rustgis_map::LabelKey)> for Candidate {
     fn from((label, priority, key): (PlacedLabel, f64, rustgis_map::LabelKey)) -> Candidate {
@@ -2441,16 +2423,32 @@ fn raise_labels(map: &Map, view: &View, candidates: &mut [Candidate]) {
                 by_id.get(&fid).copied()
             })
             .unwrap_or(usize::MAX);
-        let Some(m) = cam.try_to_map(f64::from(l.x), f64::from(l.y), w, h) else { continue };
-        // At the label's place (Web Mercator stretches the ground toward the poles).
-        let up = (effects::extrusion_metres(&layer.dataset, x, row)
-            / (flat.ground_per_unit(m) * map.body().ratio()).max(1e-9)
-            / cam.res.max(1e-9))
-        .clamp(0.0, 1e7);
-        let (u, v) = cam.ground_px(m);
-        let Some((sx, sy)) = cam.project_raised(u, v, up, w, h) else { continue };
-        let (dx, dy) = (sx as f32 - l.x, sy as f32 - l.y);
-        c.shift_places(dx, dy);
+        let metres = effects::extrusion_metres(&layer.dataset, x, row);
+        let offset = |x: f32, y: f32| {
+            let m = cam.try_to_map(f64::from(x), f64::from(y), w, h)?;
+            let up = (metres / (flat.ground_per_unit(m) * map.body().ratio()).max(1e-9) / cam.res.max(1e-9)).clamp(0.0, 1e7);
+            let (u, v) = cam.ground_px(m);
+            let (sx, sy) = cam.project_raised(u, v, up, w, h)?;
+            let delta = (sx as f32 - x, sy as f32 - y);
+            (delta.0.is_finite() && delta.1.is_finite()).then_some(delta)
+        };
+        if let Some((dx, dy)) = offset(l.x, l.y) {
+            l.x += dx;
+            l.y += dy;
+            if let Some(icon) = &mut l.icon {
+                icon.x += dx;
+                icon.y += dy;
+            }
+        }
+        for p in &mut c.alternatives {
+            if let Some((dx, dy)) = offset(p.x, p.y) {
+                p.x += dx;
+                p.y += dy;
+            }
+        }
+        if let Some(curves) = &mut c.curves {
+            curves.shift_each(&offset);
+        }
     }
 }
 
@@ -4899,99 +4897,100 @@ fn place_labels_with_previews(
     // Same work bound as 20,000 heads with eight positions, shared across all bands.
     let mut layouts_left = 20_000 * 8;
     let mut placed_groups = std::collections::HashSet::new();
-    let mut failed_groups = std::collections::HashSet::new();
     let mut unplaced = Vec::new();
-    let candidates = cands.into_iter().take(20_000).flat_map(|mut candidate| {
-        let fallbacks = candidate.line.as_mut().map(|line| std::mem::take(&mut line.fallbacks)).unwrap_or_default();
-        std::iter::once(candidate).chain(fallbacks)
-    });
-    for Candidate { label: mut l, key, alternatives, curves, line, .. } in candidates {
-        let grouped = line.as_ref().is_some_and(|line| line.deduplicate);
-        if grouped && placed_groups.contains(&key) {
-            continue;
-        }
-        let collide = l.collide;
-        let (has_text, has_icon) = (!l.text.is_empty(), l.icon.is_some());
-        // Its own place, else the first alternative where all of it shows (the text moves there;
-        // an icon stays).
-        let mut at = None;
-        let count = curves.as_ref().map_or(1 + alternatives.len(), |curves| curves.positions.len());
-        let original = LabelPlace::take(&mut l);
-        // A failed curve at the middle still appears there once in View Unplaced.
-        if curves.is_some() {
-            let (text, icon) = label_boxes(&l);
-            if !text.iter().chain(&icon).all(outside) {
-                at = Some((0, original.clone(), text, icon, false, false));
+    for mut head in cands.into_iter().take(20_000) {
+        let fallbacks = head.line.as_mut().map(|line| std::mem::take(&mut line.fallbacks)).unwrap_or_default();
+        // Siblings are contiguous: hold just one temporary preview until the group finishes.
+        let mut pending = None;
+        for Candidate { label: mut l, key, alternatives, curves, line, .. } in std::iter::once(head).chain(fallbacks) {
+            let grouped = line.as_ref().is_some_and(|line| line.deduplicate);
+            if grouped && placed_groups.contains(&key) {
+                continue;
             }
-        }
-        let mut ready = std::iter::once(original).chain(alternatives);
-        for i in 0..count {
-            let place = match &curves {
-                Some(curves) => {
-                    if curves.locked.is_some_and(|won| won != i) {
-                        continue;
-                    }
-                    if layouts_left == 0 {
-                        break;
-                    }
-                    layouts_left -= 1;
-                    curves.place(i, &mut l)
+            let collide = l.collide;
+            let (has_text, has_icon) = (!l.text.is_empty(), l.icon.is_some());
+            // Its own place, else the first alternative where all of it shows (the text moves there;
+            // an icon stays).
+            let mut at = None;
+            let count = curves.as_ref().map_or(1 + alternatives.len(), |curves| curves.positions.len());
+            let original = LabelPlace::take(&mut l);
+            // A failed curve at the middle still appears there once in View Unplaced.
+            if curves.is_some() {
+                let (text, icon) = label_boxes(&l);
+                if !text.iter().chain(&icon).all(outside) {
+                    at = Some((0, original.clone(), text, icon, false, false));
                 }
-                None => ready.next(),
-            };
-            let Some(mut place) = place else { continue };
-            if !place.x.is_finite() || !place.y.is_finite() {
-                continue;
             }
+            let mut ready = std::iter::once(original).chain(alternatives);
+            for i in 0..count {
+                let place = match &curves {
+                    Some(curves) => {
+                        if curves.locked.is_some_and(|won| won != i) {
+                            continue;
+                        }
+                        if layouts_left == 0 {
+                            break;
+                        }
+                        layouts_left -= 1;
+                        curves.place(i, &mut l)
+                    }
+                    None => ready.next(),
+                };
+                let Some(mut place) = place else { continue };
+                if !place.x.is_finite() || !place.y.is_finite() {
+                    continue;
+                }
+                place.swap(&mut l);
+                let (text, icon) = label_boxes(&l);
+                if text.iter().chain(&icon).all(outside) {
+                    continue;
+                }
+                let (show_text, show_icon) = shows(&l, &text, &icon, &grid, locked);
+                let whole = show_text == has_text && show_icon == has_icon;
+                if i == 0 || whole {
+                    at = Some((i, LabelPlace::take(&mut l), text, icon, show_text, show_icon));
+                }
+                if whole {
+                    break;
+                }
+            }
+            let Some((i, mut place, text, icon, show_text, show_icon)) = at else { continue };
             place.swap(&mut l);
-            let (text, icon) = label_boxes(&l);
-            if text.iter().chain(&icon).all(outside) {
+            if !show_text && !show_icon {
+                if show_unplaced && has_text && unplaced.len() < 2000 && pending.is_none() {
+                    pending =
+                        Some((grouped.then_some(key), PlacedLabel { color: UNPLACED, halo: Some(halo_for(UNPLACED)), icon: None, ..l }));
+                }
                 continue;
             }
-            let (show_text, show_icon) = shows(&l, &text, &icon, &grid, locked);
-            let whole = show_text == has_text && show_icon == has_icon;
-            if i == 0 || whole {
-                at = Some((i, LabelPlace::take(&mut l), text, icon, show_text, show_icon));
+            if show_text && !collide.text_ignore_placement {
+                text.iter().for_each(|b| grid.insert(*b));
             }
-            if whole {
-                break;
+            if show_icon && !collide.icon_ignore_placement {
+                icon.iter().for_each(|b| grid.insert(*b));
             }
-        }
-        let Some((i, mut place, text, icon, show_text, show_icon)) = at else { continue };
-        place.swap(&mut l);
-        if !show_text && !show_icon {
-            if show_unplaced && has_text && (!grouped || failed_groups.insert(key)) {
-                unplaced.push((grouped.then_some(key), PlacedLabel { color: UNPLACED, halo: Some(halo_for(UNPLACED)), icon: None, ..l }));
+            if !show_text {
+                l.text.clear();
             }
-            continue;
+            if !show_icon {
+                l.icon = None;
+            }
+            if grouped {
+                placed_groups.insert(key);
+            }
+            if let Some(anchor) = line.as_ref().and_then(|line| line.anchors.get(i)).copied().flatten() {
+                out.line_anchors.push((key, anchor));
+            }
+            out.labels.push(l);
+            out.keys.push((key, u8::try_from(i).unwrap_or(u8::MAX)));
         }
-        if show_text && !collide.text_ignore_placement {
-            text.iter().for_each(|b| grid.insert(*b));
+        if let Some((key, preview)) = pending
+            && key.is_none_or(|k| !placed_groups.contains(&k))
+        {
+            unplaced.push(preview);
         }
-        if show_icon && !collide.icon_ignore_placement {
-            icon.iter().for_each(|b| grid.insert(*b));
-        }
-        if !show_text {
-            l.text.clear();
-        }
-        if !show_icon {
-            l.icon = None;
-        }
-        if grouped {
-            placed_groups.insert(key);
-        }
-        if let Some(anchor) = line.as_ref().and_then(|line| line.anchors.get(i)).copied().flatten() {
-            out.line_anchors.push((key, anchor));
-        }
-        out.labels.push(l);
-        out.keys.push((key, u8::try_from(i).unwrap_or(u8::MAX)));
     }
-    out.unplaced = unplaced
-        .into_iter()
-        .filter(|(key, _)| key.is_none_or(|key| !placed_groups.contains(&key)))
-        .take(2000)
-        .map(|(_, label)| label)
-        .collect();
+    out.unplaced = unplaced;
     out
 }
 

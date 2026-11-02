@@ -7,7 +7,6 @@ type Projection = Arc<dyn Fn(f32, f32) -> Option<(f32, f32)> + Send + Sync>;
 #[derive(Clone)]
 enum Change {
     Project(Projection),
-    Shift(f32, f32),
     PlaceShifts(Vec<(f32, f32)>),
 }
 
@@ -43,10 +42,6 @@ impl Curves {
         self.changes.push(Change::Project(Arc::new(at)));
     }
 
-    pub fn shift(&mut self, dx: f32, dy: f32) {
-        self.changes.push(Change::Shift(dx, dy));
-    }
-
     /// Compute each placement's relief shift at its own transformed anchor, without laying out text.
     pub fn shift_each(&mut self, offset: &impl Fn(f32, f32) -> Option<(f32, f32)>) {
         let shifts = self
@@ -60,10 +55,6 @@ impl Curves {
                         Change::Project(at) => {
                             let Some(p) = at(x, y) else { return (0.0, 0.0) };
                             (x, y) = p;
-                        }
-                        Change::Shift(dx, dy) => {
-                            x += dx;
-                            y += dy;
                         }
                         Change::PlaceShifts(shifts) => {
                             if let Some((dx, dy)) = shifts.get(i) {
@@ -106,8 +97,20 @@ impl Curves {
         #[cfg(test)]
         LAYOUTS.with(|n| n.set(n.get() + 1));
         let ((x, y), turns) = self.spec.line.curved(&self.spec.advances, self.spec.gap, self.spec.overrun, Some(at))?;
-        let glyphs =
-            self.spec.chars.iter().zip(turns).map(|(text, (dx, dy, angle))| LabelGlyph { text: text.clone(), dx, dy, angle }).collect();
+        // Reuse the preceding rejected place's vector and String capacities. The accepted
+        // middle preview retains its own glyphs; later failed attempts can share this pool.
+        let mut glyphs = std::mem::take(&mut template.glyphs);
+        let mut count = 0;
+        for (i, (text, (dx, dy, angle))) in self.spec.chars.iter().zip(turns).enumerate() {
+            if let Some(glyph) = glyphs.get_mut(i) {
+                glyph.text.clone_from(text);
+                (glyph.dx, glyph.dy, glyph.angle) = (dx, dy, angle);
+            } else {
+                glyphs.push(LabelGlyph { text: text.clone(), dx, dy, angle });
+            }
+            count += 1;
+        }
+        glyphs.truncate(count);
         let mut p = LabelPlace { x, y, angle: None, glyphs };
         for change in &self.changes {
             match change {
@@ -116,7 +119,6 @@ impl Curves {
                         return None;
                     }
                 }
-                Change::Shift(dx, dy) => (p.x, p.y) = (p.x + dx, p.y + dy),
                 Change::PlaceShifts(shifts) => {
                     if let Some((dx, dy)) = shifts.get(i) {
                         (p.x, p.y) = (p.x + dx, p.y + dy);

@@ -216,7 +216,14 @@ fn terrain_and_roofs_translate_ready_and_deferred_places_without_changing_glyph_
         c.key.1 = blocks.layer(id).unwrap().dataset.features[0].id as usize;
         let before = c.curves.as_ref().unwrap().place(0, &mut c.label.clone()).unwrap();
         c.alternatives.push(before.clone());
-        let mut candidates = vec![c];
+        let mut distant = before.clone();
+        distant.y += 40.0;
+        c.alternatives.push(distant.clone());
+        let mut probe = c.clone();
+        probe.curves = None;
+        probe.alternatives.clear();
+        (probe.label.x, probe.label.y) = (distant.x, distant.y);
+        let mut candidates = vec![c, probe];
         if roof {
             raise_labels(&blocks, &view, &mut candidates);
         } else {
@@ -227,6 +234,8 @@ fn terrain_and_roofs_translate_ready_and_deferred_places_without_changing_glyph_
         assert!(after.y < before.y - 0.1, "roof {roof}");
         assert_eq!(after.glyphs, before.glyphs);
         assert_eq!(c.alternatives[0], after);
+        assert!((c.alternatives[1].x - candidates[1].label.x).abs() < 1e-4);
+        assert!((c.alternatives[1].y - candidates[1].label.y).abs() < 1e-4);
     }
 }
 
@@ -563,4 +572,16 @@ fn an_invalid_locked_straight_slot_never_invents_a_middle_preview() {
     assert!(r.labels.is_empty());
     assert!(r.unplaced.is_empty());
     assert_eq!(map.label_lock_line_anchors, anchors);
+}
+
+#[test]
+fn rejected_curved_places_reuse_grapheme_allocations() {
+    let c = curved(&[(20.0, 100.0), (380.0, 100.0)]);
+    let curves = c.curves.as_ref().unwrap();
+    let mut template = c.label.clone();
+    template.glyphs = curves.place(0, &mut c.label.clone()).unwrap().glyphs;
+    let allocations: Vec<_> = template.glyphs.iter().map(|g| g.text.as_ptr()).collect();
+    let next = curves.place(1, &mut template).unwrap();
+    assert_eq!(next.glyphs.iter().map(|g| g.text.as_ptr()).collect::<Vec<_>>(), allocations);
+    assert_eq!(next.glyphs.iter().map(|g| g.text.as_str()).collect::<String>(), "road");
 }
