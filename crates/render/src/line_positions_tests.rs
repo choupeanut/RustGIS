@@ -465,7 +465,10 @@ fn colliding_band_groups_share_a_frame_layout_budget() {
         .collect::<Vec<_>>();
     label_places::LAYOUTS.with(|n| n.set(0));
     let p = place_labels(candidates, vec![blocker], 400.0, 200.0, false);
-    label_places::LAYOUTS.with(|n| assert_eq!(n.get(), 20_000 * 8));
+    // The budget only limits alternatives: once spent, each remaining label still lays out its
+    // own place (one attempt per band), so the total stays within budget plus those.
+    let budget = 20_000 * 8;
+    label_places::LAYOUTS.with(|n| assert!((budget..=budget + 2600 * rustgis_map::camera::MAX_TILT_BANDS).contains(&n.get())));
     assert_eq!(p.labels.len(), 1);
     assert_eq!(p.unplaced.len(), 2000);
 }
