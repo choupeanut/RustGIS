@@ -4935,7 +4935,7 @@ fn place_labels_with_previews(
     let mut out = Placement { labels: fixed, unplaced: Vec::new(), keys: Vec::new(), line_anchors: Vec::new() };
     let outside = |b: &[f32; 4]| b[2] < 0.0 || b[3] < 0.0 || b[0] > w || b[1] > h;
     // Same work bound as 20,000 heads with eight positions, shared across all bands.
-    let mut layouts_left = 20_000 * 8;
+    let mut layouts_left: usize = 20_000 * 8;
     let mut placed_groups = std::collections::HashSet::new();
     let mut unplaced = Vec::new();
     for mut head in cands.into_iter().take(20_000) {

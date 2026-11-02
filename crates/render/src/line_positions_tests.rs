@@ -213,7 +213,7 @@ fn terrain_and_roofs_translate_ready_and_deferred_places_without_changing_glyph_
     for roof in [false, true] {
         let mut c = curved(&[(20.0, 150.0), (380.0, 150.0)]);
         c.key.0 = id;
-        c.key.1 = blocks.layer(id).unwrap().dataset.features[0].id as usize;
+        c.key.1 = blocks.layer(id).unwrap().dataset.features[0].id;
         let before = c.curves.as_ref().unwrap().place(0, &mut c.label.clone()).unwrap();
         c.alternatives.push(before.clone());
         let mut distant = before.clone();
