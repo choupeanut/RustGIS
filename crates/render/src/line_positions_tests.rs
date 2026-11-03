@@ -512,6 +512,22 @@ fn hidden_unplaced_previews_do_not_change_placement() {
 }
 
 #[test]
+fn a_place_without_a_back_projected_anchor_is_never_locked() {
+    // Locking is requested (anchors present) but the free place has none: it cannot be replayed,
+    // so it is not taken and no key is recorded. The next place with an anchor is.
+    let mut c = Candidate::from((PlacedLabel { y: 100.0, ..label("road", 100.0, None, 0.0) }, 1.0, (1, 0, 0, 0)));
+    c.alternatives = vec![LabelPlace::from((300.0, 100.0))];
+    c.line = Some(LinePlaces { anchors: vec![None, Some(Coord::new(2.0, 0.0))], ..Default::default() });
+    let placed = place_labels(vec![c.clone()], Vec::new(), 400.0, 200.0, false);
+    assert_eq!(placed.keys, vec![((1, 0, 0, 0), 1)]);
+    assert_eq!(placed.line_anchors, vec![((1, 0, 0, 0), Coord::new(2.0, 0.0))]);
+    c.alternatives.clear();
+    c.line.as_mut().unwrap().anchors = vec![None];
+    let placed = place_labels(vec![c], Vec::new(), 400.0, 200.0, false);
+    assert!(placed.keys.is_empty() && placed.line_anchors.is_empty());
+}
+
+#[test]
 fn invalid_straight_slots_keep_their_matching_anchor() {
     let mut c = Candidate::from((PlacedLabel { y: 100.0, ..label("road", 100.0, None, 0.0) }, 1.0, (1, 0, 0, 0)));
     c.alternatives = vec![LabelPlace::from((f32::NAN, f32::NAN)), LabelPlace::from((300.0, 100.0))];

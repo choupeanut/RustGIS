@@ -5005,6 +5005,11 @@ fn place_labels_with_previews(
                 if !place.x.is_finite() || !place.y.is_finite() {
                     continue;
                 }
+                // Locking: a place whose anchor cannot be back-projected cannot be replayed, so never
+                // take it (its key would be recorded without an anchor and the label would vanish later).
+                if line.as_ref().is_some_and(|line| !line.anchors.is_empty() && line.anchors.get(i).copied().flatten().is_none()) {
+                    continue;
+                }
                 place.swap(&mut l);
                 let (text, icon) = label_boxes(&l);
                 if text.iter().chain(&icon).all(outside) {
