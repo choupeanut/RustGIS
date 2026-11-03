@@ -44,8 +44,9 @@ impl TileOutput {
 }
 
 /// A tile style's label as the map places it (in its logical points), with its priority:
-/// sized, wrapped and anchored as MapLibre lays it out. `None` when it has nothing to show.
-pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> {
+/// sized, wrapped and anchored as MapLibre lays it out, its text, halo and icon at its tile
+/// layer's `opacity` (#1358). `None` when it has nothing to show.
+pub(crate) fn tile_label(l: rustgis_tiles::Label, opacity: f32) -> Option<(PlacedLabel, f64)> {
     // Styles often label in two scripts ("Syria\nسوريا"): only the lines the font can
     // draw are kept, so a name never shows as boxes, and a label left with neither text
     // nor an icon is left out.
@@ -73,7 +74,15 @@ pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> 
     let (th, em) = (crate::text::block_height(&text, size), l.size);
     let x = l.x + l.offset[0] * em;
     let y = l.y + l.anchor[1] * th + l.offset[1] * em;
-    let icon = l.icon.map(|i| PlacedIcon { image: i.image, x: l.x + i.dx, y: l.y + i.dy, w: i.width, h: i.height, angle: i.angle });
+    let icon = l.icon.map(|i| PlacedIcon {
+        image: i.image,
+        x: l.x + i.dx,
+        y: l.y + i.dy,
+        w: i.width,
+        h: i.height,
+        angle: i.angle,
+        alpha: opacity,
+    });
     let line_align = match l.justify {
         j if j < -0.25 => TextAlign::Left,
         j if j > 0.25 => TextAlign::Right,
@@ -85,8 +94,8 @@ pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> 
             x,
             y,
             size,
-            color: Rgba(l.color),
-            halo: l.halo.map(Rgba),
+            color: fade(l.color, opacity),
+            halo: l.halo.map(|h| fade(h, opacity)),
             halo_width: None,
             bold: l.bold,
             icon,
@@ -103,6 +112,12 @@ pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> 
         },
         l.priority,
     ))
+}
+
+/// A colour at a layer's opacity: its alpha scaled.
+fn fade(c: [u8; 4], opacity: f32) -> Rgba {
+    let k = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
+    Rgba([c[0], c[1], c[2], (f32::from(c[3]) * k).round() as u8])
 }
 
 /// How the tiles crate sees a tile layer.
@@ -328,7 +343,7 @@ pub(crate) fn draw(
                     *g.dirty = true;
                 }
                 let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
-                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, t.opacity, &mut out);
                 continue;
             }
             // A vector tile style as meshes, made once a tile and level and drawn at any zoom
@@ -348,7 +363,7 @@ pub(crate) fn draw(
                 }
                 let d =
                     rustgis_tiles::Drawn { labels: v.labels, attribution: v.attribution, pending: v.pending || waiting, error: v.error };
-                collect(d, &t.name, &mut out);
+                collect(d, &t.name, t.opacity, &mut out);
                 continue;
             }
             // A raster tile layer placed for every frame by the GPU map: the scene holds the layer.
@@ -364,7 +379,7 @@ pub(crate) fn draw(
             {
                 g.cmds.push(DrawCmd::LiveTiles { spec: s, opacity: t.opacity });
                 let d = rustgis_tiles::Drawn { labels: Vec::new(), attribution: p.attribution, pending: p.pending, error: p.error };
-                collect(d, &t.name, &mut out);
+                collect(d, &t.name, t.opacity, &mut out);
                 continue;
             }
             if let Some(g) = gpu.as_mut()
@@ -380,7 +395,7 @@ pub(crate) fn draw(
                         g.cmds.push(DrawCmd::Tiles { origin, tiles: p.tiles.iter().map(|q| quad(q, origin)).collect() });
                     }
                     let d = rustgis_tiles::Drawn { labels: p.labels, attribution: p.attribution, pending: p.pending, error: p.error };
-                    collect(d, &t.name, &mut out);
+                    collect(d, &t.name, t.opacity, &mut out);
                     continue;
                 }
             }
@@ -388,7 +403,7 @@ pub(crate) fn draw(
             if let Some(g) = gpu.as_mut() {
                 *g.dirty = true;
             }
-            collect(d, &t.name, &mut out);
+            collect(d, &t.name, t.opacity, &mut out);
         }
         return out;
     }
@@ -418,7 +433,7 @@ pub(crate) fn draw(
             run.clear();
             if let Some((pending, error)) = crate::single_image::draw(pm, &req, t, view, flat) {
                 let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
-                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, t.opacity, &mut out);
                 continue;
             }
         }
@@ -433,15 +448,15 @@ pub(crate) fn draw(
         run.clear();
         let (pending, error) = crate::native_tiles::draw(pm, &n, t, view, flat);
         let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
-        collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+        collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, t.opacity, &mut out);
     }
     mosaic(pm, &run, view, place, &mut out);
     out
 }
 
 /// What a tile layer drew, into what the map's tile layers drew: tiles on their way, credits,
-/// errors and labels.
-fn collect(d: rustgis_tiles::Drawn, name: &str, out: &mut TileOutput) {
+/// errors and labels, the labels at the layer's `opacity`.
+fn collect(d: rustgis_tiles::Drawn, name: &str, opacity: f32, out: &mut TileOutput) {
     out.pending |= d.pending;
     for a in d.attribution {
         if !out.attribution.contains(&a) {
@@ -451,7 +466,7 @@ fn collect(d: rustgis_tiles::Drawn, name: &str, out: &mut TileOutput) {
     if let Some(e) = d.error {
         out.errors.push(format!("{name}: {e}"));
     }
-    out.labels.extend(d.labels.into_iter().filter_map(tile_label));
+    out.labels.extend(d.labels.into_iter().filter_map(|l| tile_label(l, opacity)));
 }
 
 /// Tile layers (bottom first) on a map in another projection than Web Mercator, or the globe:
@@ -547,7 +562,7 @@ fn mosaic(pm: &mut Pixmap, layers: &[&TileLayer], view: &View, place: Place, out
     let mut scratch = None;
     for t in layers {
         let d = draw_layer(&mut mosaic, t, &frame, false, &mut scratch);
-        collect(d, &t.name, out);
+        collect(d, &t.name, t.opacity, out);
     }
     warp(pm, &mosaic, &frame, &to_lonlat, &to_merc);
 }
@@ -692,7 +707,8 @@ pub(crate) mod tests {
     use rustgis_geom::{Coord, lonlat_to_merc};
     use rustgis_map::{Camera, Map, Projection, TileKind, TileLayer};
 
-    use crate::View;
+    use super::{TileOutput, collect};
+    use crate::{PlacedLabel, View};
 
     /// The warp interpolating across cells puts every pixel where working it out pixel by pixel
     /// does: on a globe zoomed in, on a whole one with its edge in view, across the antimeridian
@@ -1284,5 +1300,60 @@ pub(crate) mod tests {
         m.projection = Projection::Globe;
         let p = pixel(&mut m);
         assert!(p[0] < 60 && p[1] < 40 && p[2] < 60, "{p:?}");
+    }
+
+    /// A tile layer's symbol labels fade with the layer, as its fills and lines do: the text,
+    /// the halo and the icon drawn at its opacity, and as before at 1 (#1358).
+    #[test]
+    fn symbol_labels_are_drawn_at_the_layers_opacity() {
+        use std::sync::Arc;
+        let label = || {
+            let mut icon = tiny_skia::Pixmap::new(4, 4).unwrap();
+            icon.fill(tiny_skia::Color::from_rgba8(0, 0, 255, 255));
+            rustgis_tiles::Label {
+                text: "Buoy".into(),
+                x: 20.0,
+                y: 20.0,
+                size: 12.0,
+                color: [0, 0, 0, 255],
+                halo: Some([255, 255, 255, 200]),
+                bold: false,
+                italic: false,
+                letter_spacing: 0.0,
+                max_width: 0.0,
+                justify: 0.0,
+                priority: 1.0,
+                anchor: [0.0, 0.0],
+                offset: [0.0, 0.0],
+                angle: None,
+                icon: Some(rustgis_tiles::LabelIcon { image: Arc::new(icon), width: 10.0, height: 10.0, dx: 0.0, dy: 0.0, angle: None }),
+                collide: Default::default(),
+            }
+        };
+        let placed = |opacity: f32| {
+            let mut out = TileOutput::default();
+            let d = rustgis_tiles::Drawn { labels: vec![label()], ..Default::default() };
+            collect(d, "style", opacity, &mut out);
+            out.labels.pop().unwrap().0
+        };
+        // The icon's drawn pixels: as strong as the layer lets them be.
+        let icon_alpha = |l: &PlacedLabel| {
+            let mut pm = tiny_skia::Pixmap::new(40, 40).unwrap();
+            crate::canvas::with_canvas(&mut pm, |c| crate::draw_icon(c, l.icon.as_ref().unwrap(), 1.0));
+            pm.pixel(20, 20).unwrap().alpha()
+        };
+        let (full, half) = (placed(1.0), placed(0.5));
+        assert_eq!((full.color.a(), full.halo.map(|h| h.a()), icon_alpha(&full)), (255, Some(200), 255));
+        assert_eq!((half.color.a(), half.halo.map(|h| h.a())), (128, Some(100)));
+        assert!((i16::from(icon_alpha(&half)) - 128).abs() <= 1, "{}", icon_alpha(&half));
+        // The text itself comes out lighter.
+        let ink = |l: &PlacedLabel| {
+            let mut pm = tiny_skia::Pixmap::new(80, 40).unwrap();
+            crate::canvas::with_canvas(&mut pm, |c| crate::text::draw(c, l, 1.0));
+            pm.pixels().iter().map(|p| u32::from(p.alpha())).sum::<u32>()
+        };
+        let no_icon = |l: PlacedLabel| PlacedLabel { icon: None, halo: None, ..l };
+        let (a, b) = (ink(&no_icon(full)), ink(&no_icon(half)));
+        assert!(a > 0 && b * 10 < a * 6 && b * 10 > a * 4, "{a} {b}");
     }
 }

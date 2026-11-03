@@ -257,6 +257,8 @@ pub struct PlacedIcon {
     pub h: f32,
     /// Turned with the map (an arrow along a street), in radians clockwise; `None` is upright.
     pub angle: Option<f32>,
+    /// How much of it shows, 0 to 1: its tile layer's opacity (#1358). 1 is as drawn.
+    pub alpha: f32,
 }
 
 pub struct Rendered {
@@ -4371,7 +4373,8 @@ fn draw_icon(pm: &mut Canvas, icon: &PlacedIcon, ppp: f32) {
     // Scaled about its centre, turned there, then put in place.
     let turn = icon.angle.filter(|a| a.is_finite()).map_or(0.0, f32::to_degrees);
     let t = Transform::from_translate(-iw / 2.0, -ih / 2.0).post_scale(sx, sy).post_rotate(turn).post_translate(cx, cy);
-    let paint = PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..PixmapPaint::default() };
+    let opacity = if icon.alpha.is_finite() { icon.alpha.clamp(0.0, 1.0) } else { 1.0 };
+    let paint = PixmapPaint { opacity, quality: tiny_skia::FilterQuality::Bilinear, ..PixmapPaint::default() };
     pm.draw_pixmap(0, 0, Pixmap::as_ref(&icon.image), &paint, t, None);
 }
 
@@ -5481,7 +5484,7 @@ mod tests {
         let icon = |x: f32| {
             let mut p = Pixmap::new(4, 4).unwrap();
             p.fill(tiny_skia::Color::from_rgba8(0, 0, 255, 255));
-            PlacedIcon { image: std::sync::Arc::new(p), x, y: 20.0, w: 10.0, h: 10.0, angle: None }
+            PlacedIcon { image: std::sync::Arc::new(p), x, y: 20.0, w: 10.0, h: 10.0, angle: None, alpha: 1.0 }
         };
         // Two icons on the same spot collide even with no text; one far away doesn't.
         let cands = vec![
@@ -5505,7 +5508,7 @@ mod tests {
     fn icon_at(x: f32, y: f32, w: f32, h: f32, angle: Option<f32>) -> PlacedIcon {
         let mut p = Pixmap::new(4, 4).unwrap();
         p.fill(tiny_skia::Color::from_rgba8(0, 0, 255, 255));
-        PlacedIcon { image: std::sync::Arc::new(p), x, y, w, h, angle }
+        PlacedIcon { image: std::sync::Arc::new(p), x, y, w, h, angle, alpha: 1.0 }
     }
 
     fn texts(p: &Placement) -> Vec<&str> {
@@ -5806,7 +5809,7 @@ mod tests {
             icon: None,
             collide: Default::default(),
         };
-        let (p, pri) = tiles::tile_label(l.clone()).unwrap();
+        let (p, pri) = tiles::tile_label(l.clone(), 1.0).unwrap();
         // text-size 12 is a 12-pixel font.
         assert!((p.size * 1.33 - 12.0).abs() < 1e-3);
         assert_eq!(pri, 7.5);
@@ -5821,7 +5824,7 @@ mod tests {
         // Along a line, never wrapped; turned with it.
         let along =
             rustgis_tiles::Label { max_width: 0.0, angle: Some(0.5), text: "West 42nd Street & Avenue of the Americas".into(), ..l };
-        let (p, _) = tiles::tile_label(along).unwrap();
+        let (p, _) = tiles::tile_label(along, 1.0).unwrap();
         assert_eq!((text::line_count(&p.text), p.angle), (1, Some(0.5)));
     }
 
