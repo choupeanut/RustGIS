@@ -3862,6 +3862,11 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                             let repeat = class.repeat.map(|r| r * 1.33 * label_factor);
                             let try_others = class.other_positions && repeat.is_none();
                             let saved_anchor = lock.as_ref().and(map.label_lock_line_anchors.get(&key)).copied().filter(|_| try_others);
+                            // A lock naming this label without its saved anchor (a failed back-projection) has
+                            // no place to hold: sliding it to whatever stretch shows now would move it.
+                            if try_others && saved_anchor.is_none() && lock.as_ref().is_some_and(|k| k.contains_key(&key)) {
+                                continue;
+                            }
                             let (line, locked_at) = if let Some(anchor) = saved_anchor {
                                 let target = match &globe {
                                     Some(globe) => globe.forward(anchor),

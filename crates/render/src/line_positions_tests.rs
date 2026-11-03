@@ -578,6 +578,20 @@ fn an_invalid_locked_straight_slot_never_invents_a_middle_preview() {
 }
 
 #[test]
+fn a_locked_line_without_its_saved_anchor_does_not_slide() {
+    let (mut map, id, view) = map_with_line(false);
+    map.layer_mut(id).unwrap().labels.default.other_positions = true;
+    map.label_display.locked = true;
+    render(&mut map, &view).unwrap();
+    assert!(!map.label_lock.as_ref().unwrap().is_empty());
+    assert!(!map.label_lock_line_anchors.is_empty());
+    // The anchor is gone (a failed back-projection): the label is not re-placed on another stretch.
+    map.label_lock_line_anchors.clear();
+    let r = render(&mut map, &view).unwrap();
+    assert!(r.labels.is_empty());
+}
+
+#[test]
 fn an_invalid_locked_curved_slot_never_invents_a_middle_preview() {
     let (mut map, id, view) = map_with_line(false);
     let labels = &mut map.layer_mut(id).unwrap().labels;
