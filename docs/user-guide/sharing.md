@@ -6,8 +6,11 @@
 tile credits. The ribbon exports at 192 DPI; `share.exportMap` accepts `width` and `height`
 in pixels and a `dpi` value (96 by default). **Print Map** opens a PDF of the map view, kept as
 vectors as a layout's PDF is (see Layouts), in the system viewer on desktop; **Capture To
-Clipboard** copies a map image. **Export To 3D** writes a layer as a Wavefront OBJ model with
-polygons extruded by a field.
+Clipboard** copies a map image. **Export To 3D** writes a layer as a Wavefront OBJ or binary STL model
+with polygons extruded by a field (`share.export3d` writes STL when `path` ends in `.stl`). STL
+holds triangles only: lines are left out, zero-area triangles are skipped, and the notices say
+how many. Both files use metres east, up and south of the layer's south-west corner, with no
+CRS; STL stores them as 32-bit floats and has no units, so set the unit when you import it.
 
 **Data › Export** (or `share.exportLayer`, **Export Features**) writes a layer to GeoJSON, CSV,
 GeoPackage, GeoParquet, Shapefile (including a zip), FlatGeobuf, KML, KMZ or GPX (see

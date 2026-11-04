@@ -2684,15 +2684,16 @@ fn share_groups(app: &mut RustGisApp, ui: &mut Ui) {
                     menu_item(ui, app, "save_as", "Save As Presentation File…", "ui.saveItem", json!({"kind": "presentation"}));
                 },
             );
-            small(
+            small_menu(
                 ui,
                 app,
                 "export_layer",
                 "Export To 3D",
-                "Export the selected layer as a 3D model (OBJ), polygons extruded.",
-                "ui.saveItem",
-                json!({"kind": "obj"}),
-                false,
+                "Export the selected layer as a 3D model (OBJ or STL), polygons extruded.",
+                |ui, app| {
+                    menu_item(ui, app, "export_layer", "Wavefront OBJ…", "ui.saveItem", json!({"kind": "obj"}));
+                    menu_item(ui, app, "export_layer", "STL 3D Model…", "ui.saveItem", json!({"kind": "stl"}));
+                },
             );
         });
     });
