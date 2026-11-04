@@ -2673,6 +2673,9 @@ fn share_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 menu_item(ui, app, "save_as", "Save As Report File…", "ui.saveItem", json!({"kind": "report"}));
                 menu_item(ui, app, "save_as", "Save As Report Template…", "ui.saveItem", json!({"kind": "reportTemplate"}));
             });
+        });
+        // A column holds three rows: Presentation and Export To 3D get one of their own.
+        col(ui, |ui| {
             small_menu(
                 ui,
                 app,
