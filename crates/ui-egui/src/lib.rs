@@ -909,6 +909,13 @@ impl Default for UiState {
     }
 }
 
+/// The resolution of a layout copied to the clipboard.
+const CAPTURE_DPI: f64 = 192.0;
+/// The most pixels a layout copied to the clipboard has (a page above it is copied at a lower dpi).
+const CAPTURE_PIXELS: f64 = 16_000_000.0;
+/// The lowest dpi a layout is copied at, the least the renderer draws.
+const CAPTURE_MIN_DPI: f64 = 36.0;
+
 pub struct RustGisApp {
     pub session: Session,
     pub ui: UiState,
@@ -3058,6 +3065,35 @@ impl RustGisApp {
                 let size = [pm.width() as usize, pm.height() as usize];
                 self.ui.copy_image = Some(egui::ColorImage::from_rgba_premultiplied(size, pm.data()));
                 self.session.notify(tl!("Copied the map to the clipboard"), false);
+            }
+            // Copies the open layout's page as an image: at 192 dpi, lower for a page that would
+            // pass the clipboard's pixel budget (and says so).
+            "ui.captureLayout" => {
+                let li = self.session.active_layout.ok_or("open a layout first")?;
+                let (w_mm, h_mm) = self.session.project.layouts.get(li).map(|l| (l.width, l.height)).ok_or("open a layout first")?;
+                let wanted = CAPTURE_DPI;
+                let area = (w_mm / 25.4) * (h_mm / 25.4);
+                let fit = if area.is_finite() && area > 0.0 { (CAPTURE_PIXELS / area).sqrt() } else { wanted };
+                let dpi = wanted.min(fit).max(CAPTURE_MIN_DPI);
+                let session = &mut self.session;
+                let png = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rustgis_engine::cmd::layout::layout_bytes(session, li, false, dpi, false)
+                }))
+                .unwrap_or_else(|_| Err("the capture failed unexpectedly".into()))?;
+                let pm = rustgis_engine::render::decode_png(&png).ok_or("could not draw the layout")?;
+                let size = [pm.width() as usize, pm.height() as usize];
+                self.ui.copy_image = Some(egui::ColorImage::from_rgba_premultiplied(size, pm.data()));
+                if dpi < wanted {
+                    self.session.notify(
+                        i18n::fmt(
+                            "Copied the layout to the clipboard at {dpi} dpi, not {wanted}: the page is too large for a larger image",
+                            &[("dpi", &format!("{dpi:.0}")), ("wanted", &format!("{wanted:.0}"))],
+                        ),
+                        false,
+                    );
+                } else {
+                    self.session.notify(tl!("Copied the layout to the clipboard"), false);
+                }
             }
             "ui.printMap" => {
                 let session = &mut self.session;
