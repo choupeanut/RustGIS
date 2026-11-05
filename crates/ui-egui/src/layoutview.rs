@@ -3152,6 +3152,22 @@ mod tests {
         assert_eq!(h.state().ui.right, Some(Format));
     }
 
+    /// Capture To Clipboard draws the text still being typed into the Format pane.
+    #[test]
+    fn a_capture_keeps_the_text_being_typed() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layout.new", json!({"name": "Typing"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().id;
+        app.layout.typing.insert((li, title, "text"), "Typed".into());
+        app.run("ui.captureLayout", json!(null)).unwrap();
+        let text = match &app.session.project.layouts[li].element(title).unwrap().kind {
+            super::ElementKind::Text { text, .. } => text.clone(),
+            _ => String::new(),
+        };
+        assert_eq!(text, "Typed");
+    }
+
     /// Text being typed when another project opens is for the old one: it never reaches the
     /// element of the same id in the new one, whether the app opened it or an agent did through
     /// the session itself (the MCP relay, the file bridge).
