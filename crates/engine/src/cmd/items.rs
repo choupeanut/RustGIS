@@ -902,18 +902,22 @@ impl Orient {
 }
 
 impl Mesh {
-    fn vertex(&mut self, x: f64, y: f64, z: f64, bare: bool) {
+    // Each push checks the size first, so one huge feature can't build past it.
+    fn vertex(&mut self, x: f64, y: f64, z: f64, bare: bool) -> Result<(), String> {
+        self.grow(36)?;
         self.items.push(Item::Vertex([x, y, z], bare));
         self.vertices += 1;
-        self.bytes += 36;
+        Ok(())
     }
 
-    fn face(&mut self, item: Item) {
-        self.bytes += 24;
+    fn face(&mut self, item: Item) -> Result<(), String> {
+        self.grow(24)?;
         self.items.push(item);
+        Ok(())
     }
 
-    fn check_size(&self) -> Result<(), String> {
+    fn grow(&mut self, bytes: usize) -> Result<(), String> {
+        self.bytes += bytes;
         if self.bytes > MAX_OBJ { Err("the 3D file would be too large; export fewer features".into()) } else { Ok(()) }
     }
 }
@@ -973,10 +977,10 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
                     let n: usize = open.iter().map(Vec::len).sum();
                     let v = mesh.vertices;
                     for (x, y) in open.iter().flatten() {
-                        mesh.vertex(*x, 0.0, -y, false);
+                        mesh.vertex(*x, 0.0, -y, false)?;
                     }
                     for (x, y) in open.iter().flatten() {
-                        mesh.vertex(*x, h, -y, false);
+                        mesh.vertex(*x, h, -y, false)?;
                     }
                     // Walls round every ring, holes included. The OBJ winding faces right of the
                     // ring's direction: outward for a counter-clockwise outer ring or a clockwise
@@ -988,7 +992,7 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
                         let wall = orient(if counter_clockwise == (ri == 0) { Orient::Keep } else { Orient::Flip });
                         for i in 0..m {
                             let (a, b) = (first + i, first + (i + 1) % m);
-                            mesh.face(Item::Quad([v + a, v + b, v + n + b, v + n + a], wall));
+                            mesh.face(Item::Quad([v + a, v + b, v + n + b, v + n + a], wall))?;
                         }
                         first += m;
                     }
@@ -996,18 +1000,17 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
                     match rustgis_geom::triangulate::triangulate(outer, open.get(1..).unwrap_or(&[])) {
                         Some(tris) => {
                             for [a, b, c] in tris {
-                                mesh.face(Item::Tri([v + n + a, v + n + b, v + n + c], orient(Orient::Up)));
-                                mesh.face(Item::Tri([v + c, v + b, v + a], orient(Orient::Down)));
+                                mesh.face(Item::Tri([v + n + a, v + n + b, v + n + c], orient(Orient::Up)))?;
+                                mesh.face(Item::Tri([v + c, v + b, v + a], orient(Orient::Down)))?;
                             }
                         }
                         None => {
                             let m = outer.len();
-                            mesh.face(Item::Poly((0..m).map(|i| v + n + i).collect(), orient(Orient::Up)));
-                            mesh.face(Item::Poly((0..m).rev().map(|i| v + i).collect(), orient(Orient::Down)));
+                            mesh.face(Item::Poly((0..m).map(|i| v + n + i).collect(), orient(Orient::Up)))?;
+                            mesh.face(Item::Poly((0..m).rev().map(|i| v + i).collect(), orient(Orient::Down)))?;
                             mesh.fanned += 1;
                         }
                     }
-                    mesh.check_size()?;
                 }
             }
             Some(Geometry::Line(parts)) => {
@@ -1023,10 +1026,9 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
                     let v = mesh.vertices;
                     for c in part {
                         let (x, y) = xy(*c);
-                        mesh.vertex(x, h, -y, false);
+                        mesh.vertex(x, h, -y, false)?;
                     }
-                    mesh.face(Item::Polyline((0..n).map(|i| v + i).collect()));
-                    mesh.check_size()?;
+                    mesh.face(Item::Polyline((0..n).map(|i| v + i).collect()))?;
                 }
             }
             Some(g @ (Geometry::Point(_) | Geometry::MultiPoint(_))) => {
@@ -1041,17 +1043,16 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
                     let (x, y) = xy(c);
                     let v = mesh.vertices;
                     for (dx, dz) in [(-r, -r), (r, -r), (r, r), (-r, r)] {
-                        mesh.vertex(x + dx, 0.0, -y + dz, true);
+                        mesh.vertex(x + dx, 0.0, -y + dz, true)?;
                     }
                     for (dx, dz) in [(-r, -r), (r, -r), (r, r), (-r, r)] {
-                        mesh.vertex(x + dx, h, -y + dz, false);
+                        mesh.vertex(x + dx, h, -y + dz, false)?;
                     }
                     // The OBJ cube is wound inward, so STL flips every face.
                     for [a, b, c, d] in [[1, 2, 6, 5], [2, 3, 7, 6], [3, 4, 8, 7], [4, 1, 5, 8], [5, 6, 7, 8], [4, 3, 2, 1]] {
-                        mesh.face(Item::Quad([v + a - 1, v + b - 1, v + c - 1, v + d - 1], orient(Orient::Flip)));
+                        mesh.face(Item::Quad([v + a - 1, v + b - 1, v + c - 1, v + d - 1], orient(Orient::Flip)))?;
                     }
                 }
-                mesh.check_size()?;
             }
             None => {}
         }
