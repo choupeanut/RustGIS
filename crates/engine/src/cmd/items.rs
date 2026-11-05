@@ -931,6 +931,10 @@ fn export_3d(s: &mut Session, p: &Value) -> CmdResult {
 /// Largest OBJ text or STL file written (512 MiB).
 const MAX_OBJ: usize = 512 << 20;
 
+/// Largest estimated mesh held while it is built. Above the file caps: a file that is too large is
+/// refused by its exact size, and this only bounds memory.
+const MAX_MESH: usize = 2 * MAX_OBJ;
+
 /// How a face is turned into triangles for STL, as OBJ's winding is not always outward.
 #[derive(Clone, Copy, PartialEq)]
 enum Orient {
@@ -959,7 +963,7 @@ enum Item {
 struct Mesh {
     items: Vec<Item>,
     vertices: usize,
-    /// Rough size of the OBJ text, to stop a runaway export early.
+    /// Rough size of the file, to stop a runaway export early.
     bytes: usize,
     /// Polylines, which STL can't hold.
     lines: usize,
@@ -967,6 +971,12 @@ struct Mesh {
     fanned: usize,
     /// Whether polylines are kept (OBJ) or only counted (STL, which can't hold them).
     keep_lines: bool,
+    /// Polygons left out because their outer ring has fewer than 3 vertices.
+    skipped: usize,
+    /// Holes left out because they have fewer than 3 vertices, so their areas stay solid.
+    holes_dropped: usize,
+    /// Features whose height field isn't a finite number, so they took the default height.
+    default_heights: usize,
 }
 
 impl Orient {
@@ -991,14 +1001,21 @@ impl Mesh {
     }
 
     fn face(&mut self, item: Item) -> Result<(), String> {
-        self.grow(24)?;
+        // STL writes 50 bytes a triangle: a quad is two, and an n-gon is a fan of n - 2.
+        let bytes = match &item {
+            Item::Tri(..) if !self.keep_lines => 50,
+            Item::Quad(..) if !self.keep_lines => 100,
+            Item::Poly(v, _) if !self.keep_lines => 50 * v.len().saturating_sub(2),
+            _ => 24,
+        };
+        self.grow(bytes)?;
         self.items.push(item);
         Ok(())
     }
 
     fn grow(&mut self, bytes: usize) -> Result<(), String> {
         self.bytes += bytes;
-        if self.bytes > MAX_OBJ { Err("the 3D file would be too large; export fewer features".into()) } else { Ok(()) }
+        if self.bytes > MAX_MESH { Err("the 3D file would be too large; export fewer features".into()) } else { Ok(()) }
     }
 }
 
@@ -1026,7 +1043,18 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
         if rows.get(row) != Some(&true) {
             continue;
         }
-        let h = hf.and_then(|fi| l.dataset.value(row, fi).as_f64()).filter(|h| h.is_finite()).unwrap_or(base_h) * zs;
+        // A height that isn't a finite number takes the default, and is counted.
+        let height = match hf {
+            Some(fi) => match l.dataset.value(row, fi).as_f64().filter(|h| h.is_finite()) {
+                Some(h) => h,
+                None => {
+                    mesh.default_heights += 1;
+                    base_h
+                }
+            },
+            None => base_h,
+        };
+        let h = height * zs;
         // A negative height builds the solid below its base, so its STL facets turn inside out
         // unless reversed.
         let below = h < 0.0;
@@ -1046,13 +1074,16 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
                     // A degenerate outer ring drops the polygon (a hole mustn't become solid);
                     // degenerate holes are left out.
                     if open.first().is_none_or(|r| r.len() < 3) {
+                        mesh.skipped += 1;
                         continue;
                     }
+                    let rings_before = open.len();
                     let mut k = 0;
                     open.retain(|r| {
                         k += 1;
                         k == 1 || r.len() >= 3
                     });
+                    mesh.holes_dropped += rings_before - open.len();
                     let Some(outer) = open.first() else { continue };
                     let n: usize = open.iter().map(Vec::len).sum();
                     let v = mesh.vertices;
@@ -1157,8 +1188,9 @@ fn ring_area(r: &[(f64, f64)]) -> f64 {
 }
 
 /// A feature layer as Wavefront OBJ text.
-fn obj_text(s: &Session, p: &Value) -> Result<String, String> {
+fn obj_text(s: &mut Session, p: &Value) -> Result<String, String> {
     let mesh = layer_mesh(s, p, true)?;
+    mesh_notices(s, &mesh);
     let mut obj = String::new();
     let l = s.layer_id(p).ok().and_then(|id| s.map().layer(id));
     let name = l.map(|l| l.name.replace(char::is_whitespace, "_")).unwrap_or_default();
@@ -1216,10 +1248,24 @@ pub(crate) fn stl_with_cap(s: &Session, p: &Value, cap: usize) -> Result<usize, 
     mesh_stl(&layer_mesh(s, p, false)?, cap).map(|(_, r)| r.triangles)
 }
 
+/// Says what a layer's mesh left out, or used in place of a feature's own value.
+fn mesh_notices(s: &mut Session, mesh: &Mesh) {
+    if mesh.skipped > 0 {
+        s.notify(format!("Skipped {} polygon(s) whose outer ring has fewer than 3 vertices", mesh.skipped), false);
+    }
+    if mesh.holes_dropped > 0 {
+        s.notify(format!("Dropped {} hole(s) with fewer than 3 vertices: their areas are filled in", mesh.holes_dropped), false);
+    }
+    if mesh.default_heights > 0 {
+        s.notify(format!("{} feature(s) without a numeric height used the default height instead", mesh.default_heights), false);
+    }
+}
+
 /// A feature layer as binary STL, noting what it leaves out.
 fn stl_bytes(s: &mut Session, p: &Value) -> Result<(Vec<u8>, StlReport), String> {
     let mesh = layer_mesh(s, p, false)?;
     let (bytes, report) = mesh_stl(&mesh, MAX_STL_TRIANGLES)?;
+    mesh_notices(s, &mesh);
     if report.lines > 0 {
         s.notify(format!("STL holds triangles only: left out {} polyline(s)", report.lines), false);
     }
@@ -1229,7 +1275,7 @@ fn stl_bytes(s: &mut Session, p: &Value) -> Result<(Vec<u8>, StlReport), String>
     if report.fanned > 0 {
         s.notify(
             format!(
-                "{} polygon cap(s) couldn't be triangulated and are fanned over the outer ring, so any holes are filled",
+                "{} polygon cap(s) couldn't be triangulated and are approximated by fans over the outer ring: holes are filled, and concave parts may spill outside",
                 report.fanned
             ),
             false,

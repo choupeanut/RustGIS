@@ -28828,6 +28828,47 @@ fn stl_of_lines_only_says_why_there_is_nothing() {
     assert!(crate::cmd::items::item_bytes(&mut s, "obj", &json!({"heightField": "h"})).is_ok());
 }
 
+#[test]
+fn stl_fans_a_cap_past_the_triangulator_limit_and_says_so() {
+    // A circle of 5001 vertices is past the triangulator's limit, so its cap is fanned. It has a hole too.
+    let mut ring: Vec<[f64; 2]> = (0..5001)
+        .map(|i| {
+            let a = i as f64 * std::f64::consts::TAU / 5001.0;
+            [0.01 * a.cos(), 0.01 * a.sin()]
+        })
+        .collect();
+    let first = ring[0];
+    ring.push(first);
+    let hole = json!([[0.001, -0.001], [0.002, -0.001], [0.002, 0.001], [0.001, 0.001], [0.001, -0.001]]);
+    let mut s = mesh_session(json!([mesh_feature(json!({"type": "Polygon", "coordinates": [ring, hole]}), 30.0)]));
+    let (_, bytes) = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap();
+    assert!(!stl_triangles(&bytes).is_empty());
+    let said = |part: &str| s.notices.iter().any(|n| n.text.contains(part));
+    assert!(said("1 polygon cap(s) couldn't be triangulated"));
+    assert!(said("holes are filled"));
+}
+
+#[test]
+fn layer_meshes_say_what_they_leave_out_or_default() {
+    // A hole of two vertices is dropped, and a height that isn't a number takes the default.
+    let two_vertex_hole = json!({"type": "Polygon", "coordinates": [
+        [[0.0, 0.0], [0.01, 0.0], [0.01, 0.01], [0.0, 0.01], [0.0, 0.0]],
+        [[0.002, 0.002], [0.003, 0.003], [0.002, 0.002]]]});
+    let mut s = mesh_session(json!([
+        mesh_feature(two_vertex_hole, 30.0),
+        {"type": "Feature", "geometry": square(0.02, false), "properties": {"h": "tall"}},
+    ]));
+    crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap();
+    let said = |part: &str| s.notices.iter().any(|n| n.text.contains(part));
+    assert!(said("Dropped 1 hole(s)"));
+    assert!(said("used the default height"));
+    // Clean input says neither, for OBJ or STL.
+    let mut clean = mesh_session(json!([mesh_feature(square(0.0, false), 30.0)]));
+    crate::cmd::items::item_bytes(&mut clean, "obj", &json!({"heightField": "h"})).unwrap();
+    crate::cmd::items::item_bytes(&mut clean, "stl", &json!({"heightField": "h"})).unwrap();
+    assert!(!clean.notices.iter().any(|n| n.text.contains("hole") || n.text.contains("default height")));
+}
+
 /// Add Data's and Load All's reads made before the command runs (the desktop app's, on a thread
 /// of their own) are the ones the command takes: it adds what they read, without reading again.
 #[cfg(not(target_arch = "wasm32"))]
