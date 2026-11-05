@@ -3072,10 +3072,11 @@ impl RustGisApp {
             "ui.captureLayout" => {
                 let li = self.session.active_layout.ok_or("open a layout first")?;
                 // Text still being typed into the Format pane is part of the page.
-                layoutview::save_drafts(self);
+                layoutview::commit_drafts(self);
                 let (w_mm, h_mm) = self.session.project.layouts.get(li).map(|l| (l.width, l.height)).ok_or("open a layout first")?;
                 let area = (w_mm / 25.4) * (h_mm / 25.4);
-                let dpi = CAPTURE_DPI.min((CAPTURE_PIXELS / area).sqrt());
+                let side = rustgis_engine::render::layout::MAX_SIDE * 25.4 / w_mm.max(h_mm);
+                let dpi = CAPTURE_DPI.min((CAPTURE_PIXELS / area).sqrt()).min(side);
                 if dpi < CAPTURE_MIN_DPI {
                     return Err("the page is too large to copy to the clipboard: export it instead".into());
                 }
@@ -3087,11 +3088,12 @@ impl RustGisApp {
                 let pm = rustgis_engine::render::decode_png(&png).ok_or("could not draw the layout")?;
                 let size = [pm.width() as usize, pm.height() as usize];
                 self.ui.copy_image = Some(egui::ColorImage::from_rgba_premultiplied(size, pm.data()));
-                // The renderer draws a page past its largest side at a lower resolution, so the
-                // dpi reported is the one the image has (a whole pixel short is only rounding).
-                let short = (w_mm / 25.4 * dpi).floor() - f64::from(pm.width()) > 1.0;
+                // The dpi reported is the one the image has, on its smaller scale (a whole pixel
+                // short is only rounding).
+                let (px_w, px_h) = (f64::from(pm.width()), f64::from(pm.height()));
+                let short = (w_mm / 25.4 * dpi).floor() - px_w > 1.0 || (h_mm / 25.4 * dpi).floor() - px_h > 1.0;
                 if dpi < CAPTURE_DPI || short {
-                    let got = (f64::from(pm.width()) * 25.4 / w_mm).floor();
+                    let got = (px_w * 25.4 / w_mm).min(px_h * 25.4 / h_mm).floor();
                     self.session.notify(
                         i18n::fmt(
                             "Copied the layout to the clipboard at {dpi} dpi, not {wanted}: the page is too large for a larger image",
