@@ -885,6 +885,20 @@ struct Mesh {
     lines: usize,
     /// Caps that couldn't be triangulated and are fanned from their first vertex.
     fanned: usize,
+    /// Whether polylines count toward the size limit (they do for OBJ; STL leaves them out).
+    count_lines: bool,
+}
+
+impl Orient {
+    /// The other way round, for a solid extruded below its base.
+    fn reversed(self) -> Orient {
+        match self {
+            Orient::Keep => Orient::Flip,
+            Orient::Flip => Orient::Keep,
+            Orient::Up => Orient::Down,
+            Orient::Down => Orient::Up,
+        }
+    }
 }
 
 impl Mesh {
@@ -905,7 +919,7 @@ impl Mesh {
 }
 
 /// A feature layer as a mesh.
-fn layer_mesh(s: &Session, p: &Value) -> Result<Mesh, String> {
+fn layer_mesh(s: &Session, p: &Value, count_lines: bool) -> Result<Mesh, String> {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
     let hf = ps(p, "heightField").map(|n| l.dataset.field_index(n).ok_or_else(|| format!("no field '{n}'"))).transpose()?;
@@ -922,13 +936,17 @@ fn layer_mesh(s: &Session, p: &Value) -> Result<Mesh, String> {
         let m = rustgis_geom::lonlat_to_merc(c);
         ((m.x - origin.x) * k, (m.y - origin.y) * k)
     };
-    let mut mesh = Mesh::default();
+    let mut mesh = Mesh { count_lines, ..Mesh::default() };
     let rows = l.visible_rows();
     for (row, ft) in l.dataset.features.iter().enumerate() {
         if rows.get(row) != Some(&true) {
             continue;
         }
         let h = hf.and_then(|fi| l.dataset.value(row, fi).as_f64()).filter(|h| h.is_finite()).unwrap_or(base_h) * zs;
+        // A negative height builds the solid below its base, so its STL facets turn inside out
+        // unless reversed.
+        let below = h < 0.0;
+        let orient = |o: Orient| if below { o.reversed() } else { o };
         match &ft.geometry {
             Some(Geometry::Polygon(polys)) => {
                 for rings in polys {
@@ -967,10 +985,10 @@ fn layer_mesh(s: &Session, p: &Value) -> Result<Mesh, String> {
                     for (ri, r) in open.iter().enumerate() {
                         let m = r.len();
                         let counter_clockwise = ring_area(r) > 0.0;
-                        let orient = if counter_clockwise == (ri == 0) { Orient::Keep } else { Orient::Flip };
+                        let wall = orient(if counter_clockwise == (ri == 0) { Orient::Keep } else { Orient::Flip });
                         for i in 0..m {
                             let (a, b) = (first + i, first + (i + 1) % m);
-                            mesh.face(Item::Quad([v + a, v + b, v + n + b, v + n + a], orient));
+                            mesh.face(Item::Quad([v + a, v + b, v + n + b, v + n + a], wall));
                         }
                         first += m;
                     }
@@ -978,14 +996,14 @@ fn layer_mesh(s: &Session, p: &Value) -> Result<Mesh, String> {
                     match rustgis_geom::triangulate::triangulate(outer, open.get(1..).unwrap_or(&[])) {
                         Some(tris) => {
                             for [a, b, c] in tris {
-                                mesh.face(Item::Tri([v + n + a, v + n + b, v + n + c], Orient::Up));
-                                mesh.face(Item::Tri([v + c, v + b, v + a], Orient::Down));
+                                mesh.face(Item::Tri([v + n + a, v + n + b, v + n + c], orient(Orient::Up)));
+                                mesh.face(Item::Tri([v + c, v + b, v + a], orient(Orient::Down)));
                             }
                         }
                         None => {
                             let m = outer.len();
-                            mesh.face(Item::Poly((0..m).map(|i| v + n + i).collect(), Orient::Up));
-                            mesh.face(Item::Poly((0..m).rev().map(|i| v + i).collect(), Orient::Down));
+                            mesh.face(Item::Poly((0..m).map(|i| v + n + i).collect(), orient(Orient::Up)));
+                            mesh.face(Item::Poly((0..m).rev().map(|i| v + i).collect(), orient(Orient::Down)));
                             mesh.fanned += 1;
                         }
                     }
@@ -998,13 +1016,16 @@ fn layer_mesh(s: &Session, p: &Value) -> Result<Mesh, String> {
                     if n < 2 {
                         continue;
                     }
-                    let v = mesh.vertices;
+                    let (v, bytes) = (mesh.vertices, mesh.bytes);
                     for c in part {
                         let (x, y) = xy(*c);
                         mesh.vertex(x, h, -y, false);
                     }
                     mesh.face(Item::Polyline((0..n).map(|i| v + i).collect()));
                     mesh.lines += 1;
+                    if !mesh.count_lines {
+                        mesh.bytes = bytes;
+                    }
                     mesh.check_size()?;
                 }
             }
@@ -1027,7 +1048,7 @@ fn layer_mesh(s: &Session, p: &Value) -> Result<Mesh, String> {
                     }
                     // The OBJ cube is wound inward, so STL flips every face.
                     for [a, b, c, d] in [[1, 2, 6, 5], [2, 3, 7, 6], [3, 4, 8, 7], [4, 1, 5, 8], [5, 6, 7, 8], [4, 3, 2, 1]] {
-                        mesh.face(Item::Quad([v + a - 1, v + b - 1, v + c - 1, v + d - 1], Orient::Flip));
+                        mesh.face(Item::Quad([v + a - 1, v + b - 1, v + c - 1, v + d - 1], orient(Orient::Flip)));
                     }
                 }
                 mesh.check_size()?;
@@ -1053,7 +1074,7 @@ fn ring_area(r: &[(f64, f64)]) -> f64 {
 
 /// A feature layer as Wavefront OBJ text.
 fn obj_text(s: &Session, p: &Value) -> Result<String, String> {
-    let mesh = layer_mesh(s, p)?;
+    let mesh = layer_mesh(s, p, true)?;
     let mut obj = String::new();
     let l = s.layer_id(p).ok().and_then(|id| s.map().layer(id));
     let name = l.map(|l| l.name.replace(char::is_whitespace, "_")).unwrap_or_default();
@@ -1108,12 +1129,12 @@ const MAX_STL_TRIANGLES: usize = (MAX_OBJ - 84) / 50;
 /// [`stl_bytes`] with a smaller triangle cap, to test the size guard.
 #[cfg(test)]
 pub(crate) fn stl_with_cap(s: &Session, p: &Value, cap: usize) -> Result<usize, String> {
-    mesh_stl(&layer_mesh(s, p)?, cap).map(|(_, r)| r.triangles)
+    mesh_stl(&layer_mesh(s, p, false)?, cap).map(|(_, r)| r.triangles)
 }
 
 /// A feature layer as binary STL, noting what it leaves out.
 fn stl_bytes(s: &mut Session, p: &Value) -> Result<(Vec<u8>, StlReport), String> {
-    let mesh = layer_mesh(s, p)?;
+    let mesh = layer_mesh(s, p, false)?;
     let (bytes, report) = mesh_stl(&mesh, MAX_STL_TRIANGLES)?;
     if report.lines > 0 {
         s.notify(format!("STL holds triangles only: left out {} polyline(s)", report.lines), false);
@@ -1122,7 +1143,13 @@ fn stl_bytes(s: &mut Session, p: &Value) -> Result<(Vec<u8>, StlReport), String>
         s.notify(format!("Skipped {} zero-area triangle(s), such as walls of zero height", report.degenerate), false);
     }
     if report.fanned > 0 {
-        s.notify(format!("{} polygon cap(s) couldn't be triangulated and are approximated as fans", report.fanned), false);
+        s.notify(
+            format!(
+                "{} polygon cap(s) couldn't be triangulated and are fanned over the outer ring, so any holes are filled",
+                report.fanned
+            ),
+            false,
+        );
     }
     s.notify("STL has no units: coordinates are metres east, up and south of the layer's south-west corner, in 32-bit floats", false);
     Ok((bytes, report))
@@ -1142,6 +1169,11 @@ fn mesh_stl(mesh: &Mesh, max_triangles: usize) -> Result<(Vec<u8>, StlReport), S
         let (Some(a), Some(b), Some(c)) = (at(ids[0]), at(ids[1]), at(ids[2])) else {
             return Err("the 3D mesh refers to a missing vertex".into());
         };
+        // The file stores f32: judge and orient the triangle as written.
+        let [a, b, c] = [a, b, c].map(|v| v.map(|x| f64::from(x as f32)));
+        if [a, b, c].iter().flatten().any(|x| !x.is_finite()) {
+            return Err("a coordinate is too large for a 32-bit STL file".into());
+        }
         let n = normal(a, b, c);
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
         if len < 1e-9 {
@@ -1190,7 +1222,11 @@ fn mesh_stl(mesh: &Mesh, max_triangles: usize) -> Result<(Vec<u8>, StlReport), S
         }
     }
     if count == 0 {
-        return Err("nothing to export: the layer has no polygons or points".into());
+        return Err(if degenerate > 0 {
+            "nothing to export: every triangle has zero area".into()
+        } else {
+            "nothing to export: the layer has no polygons or points".into()
+        });
     }
     let n = u32::try_from(count).map_err(|_| "the STL file would be too large; export fewer features".to_string())?;
     if let Some(slot) = out.get_mut(80..84) {

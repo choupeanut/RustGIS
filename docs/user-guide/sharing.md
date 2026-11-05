@@ -10,7 +10,7 @@ Clipboard** copies a map image. **Export To 3D** writes a layer as a Wavefront O
 with polygons extruded by a field (`share.export3d` writes STL when `path` ends in `.stl`). STL
 holds triangles only: lines are left out, zero-area triangles are skipped, and the notices say
 how many. Both files use metres east, up and south of the layer's south-west corner, with no
-CRS; STL stores them as 32-bit floats and has no units, so set the unit when you import it.
+CRS; STL stores them as unitless 32-bit floats, so set the unit (metres) when you import it.
 
 **Data › Export** (or `share.exportLayer`, **Export Features**) writes a layer to GeoJSON, CSV,
 GeoPackage, GeoParquet, Shapefile (including a zip), FlatGeobuf, KML, KMZ or GPX (see
