@@ -26975,8 +26975,10 @@ fn stl_export_has_the_binary_layout_and_closed_outward_solids() {
         let tris = stl_triangles(&bytes);
         assert_eq!(tris.len(), 12);
         assert_eq!(bytes.len(), 84 + 50 * 12);
-        // Centre of the solid: (556.6, 15, -556.6) in x, up, south metres.
-        let centre = [1113.19_f32 / 2.0, 15.0, -1113.19 / 2.0];
+        // Centre of the solid: (556.6, 556.6, 15) in east, north, up metres.
+        let centre = [1113.19_f32 / 2.0, 1113.19 / 2.0, 15.0];
+        // Z is up, and every vertex is in the all-positive octant.
+        assert!(tris.iter().all(|(_, v)| v.iter().flatten().all(|x| *x >= 0.0)), "positive octant");
         let mut area_sum = [0.0_f64; 3];
         for (n, v) in &tris {
             let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -27050,7 +27052,7 @@ fn stl_solids_below_their_base_still_face_outward() {
         // Both shapes are convex, so the mean of the corners is inside.
         let corners: Vec<[f64; 3]> = tris.iter().flat_map(|(_, v)| v.iter().map(|p| p.map(f64::from))).collect();
         let centre: [f64; 3] = std::array::from_fn(|k| corners.iter().map(|p| p[k]).sum::<f64>() / corners.len() as f64);
-        assert!(centre[1] < 0.0);
+        assert!(centre[2] < 0.0);
         for (n, v) in &tris {
             let (a, b, c) = (v[0].map(f64::from), v[1].map(f64::from), v[2].map(f64::from));
             let (u, w) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
@@ -27075,4 +27077,12 @@ fn stl_refuses_coordinates_beyond_f32_and_all_flat_layers() {
     )]));
     let e = crate::cmd::items::item_bytes(&mut flat, "stl", &json!({"heightField": "h"})).unwrap_err();
     assert!(e.contains("zero area"), "{e}");
+}
+
+#[test]
+fn stl_of_lines_only_says_why_there_is_nothing() {
+    let mut s = mesh_session(json!([mesh_feature(json!({"type": "LineString", "coordinates": [[0.0, 0.0], [0.01, 0.0]]}), 5.0)]));
+    let e = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap_err();
+    assert!(e.contains("not lines"), "{e}");
+    assert!(crate::cmd::items::item_bytes(&mut s, "obj", &json!({"heightField": "h"})).is_ok());
 }

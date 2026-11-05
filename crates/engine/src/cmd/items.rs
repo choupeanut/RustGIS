@@ -885,8 +885,8 @@ struct Mesh {
     lines: usize,
     /// Caps that couldn't be triangulated and are fanned from their first vertex.
     fanned: usize,
-    /// Whether polylines count toward the size limit (they do for OBJ; STL leaves them out).
-    count_lines: bool,
+    /// Whether polylines are kept (OBJ) or only counted (STL, which can't hold them).
+    keep_lines: bool,
 }
 
 impl Orient {
@@ -919,7 +919,7 @@ impl Mesh {
 }
 
 /// A feature layer as a mesh.
-fn layer_mesh(s: &Session, p: &Value, count_lines: bool) -> Result<Mesh, String> {
+fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
     let hf = ps(p, "heightField").map(|n| l.dataset.field_index(n).ok_or_else(|| format!("no field '{n}'"))).transpose()?;
@@ -936,7 +936,7 @@ fn layer_mesh(s: &Session, p: &Value, count_lines: bool) -> Result<Mesh, String>
         let m = rustgis_geom::lonlat_to_merc(c);
         ((m.x - origin.x) * k, (m.y - origin.y) * k)
     };
-    let mut mesh = Mesh { count_lines, ..Mesh::default() };
+    let mut mesh = Mesh { keep_lines, ..Mesh::default() };
     let rows = l.visible_rows();
     for (row, ft) in l.dataset.features.iter().enumerate() {
         if rows.get(row) != Some(&true) {
@@ -1016,16 +1016,16 @@ fn layer_mesh(s: &Session, p: &Value, count_lines: bool) -> Result<Mesh, String>
                     if n < 2 {
                         continue;
                     }
-                    let (v, bytes) = (mesh.vertices, mesh.bytes);
+                    mesh.lines += 1;
+                    if !mesh.keep_lines {
+                        continue;
+                    }
+                    let v = mesh.vertices;
                     for c in part {
                         let (x, y) = xy(*c);
                         mesh.vertex(x, h, -y, false);
                     }
                     mesh.face(Item::Polyline((0..n).map(|i| v + i).collect()));
-                    mesh.lines += 1;
-                    if !mesh.count_lines {
-                        mesh.bytes = bytes;
-                    }
                     mesh.check_size()?;
                 }
             }
@@ -1057,6 +1057,9 @@ fn layer_mesh(s: &Session, p: &Value, count_lines: bool) -> Result<Mesh, String>
         }
     }
     if mesh.vertices == 0 {
+        if mesh.lines > 0 && !mesh.keep_lines {
+            return Err("nothing to export: STL holds polygons and points, not lines".into());
+        }
         return Err("nothing to export".into());
     }
     Ok(mesh)
@@ -1151,17 +1154,19 @@ fn stl_bytes(s: &mut Session, p: &Value) -> Result<(Vec<u8>, StlReport), String>
             false,
         );
     }
-    s.notify("STL has no units: coordinates are metres east, up and south of the layer's south-west corner, in 32-bit floats", false);
+    s.notify("STL has no units: coordinates are metres east, north and up from the layer's south-west corner, in 32-bit floats", false);
     Ok((bytes, report))
 }
 
 /// A mesh as binary STL: an 80-byte header, the triangle count, then per triangle a normal and
 /// three vertices as little-endian f32 and a zero attribute.
 fn mesh_stl(mesh: &Mesh, max_triangles: usize) -> Result<(Vec<u8>, StlReport), String> {
-    let verts: Vec<[f64; 3]> = mesh.items.iter().filter_map(|it| if let Item::Vertex(v, _) = it { Some(*v) } else { None }).collect();
+    // The mesh is east, up and south; STL is written east, north and up, as slicers expect.
+    let verts: Vec<[f64; 3]> =
+        mesh.items.iter().filter_map(|it| if let Item::Vertex([x, y, z], _) = it { Some([*x, -*z, *y]) } else { None }).collect();
     let at = |n: usize| verts.get(n).copied();
     // Each triangle is written as it comes (50 bytes), and the count filled in at the end.
-    let mut out = b"RustGIS binary STL, metres, Y up".to_vec();
+    let mut out = b"RustGIS binary STL, metres, Z up".to_vec();
     out.resize(84, 0);
     let mut count = 0usize;
     let mut degenerate = 0;
@@ -1183,8 +1188,8 @@ fn mesh_stl(mesh: &Mesh, max_triangles: usize) -> Result<(Vec<u8>, StlReport), S
         let flip = match orient {
             Orient::Keep => false,
             Orient::Flip => true,
-            Orient::Up => n[1] < 0.0,
-            Orient::Down => n[1] > 0.0,
+            Orient::Up => n[2] < 0.0,
+            Orient::Down => n[2] > 0.0,
         };
         count += 1;
         if count > max_triangles || count > u32::MAX as usize {
