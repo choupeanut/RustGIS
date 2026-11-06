@@ -2128,6 +2128,8 @@ impl RustGisApp {
             self.ui.web_file = None;
             // A deletion asked for in the old project never reaches a namesake in the new one.
             self.map.deleting = None;
+            // Column views are the old project's tables'.
+            self.table.forget_views();
             // A recording's steps name the old project's layers: it ends here, and says so.
             if let Some(steps) = self.ws.recording.take() {
                 let n = steps.len().to_string();
@@ -2147,6 +2149,8 @@ impl RustGisApp {
                 self.session.notify(why, false);
             }
         }
+        // Fields and layers can go while the table is closed: its column views follow them.
+        table::prune_views(self);
         // Undo and redo can move vertices: an index chosen before may now name another vertex.
         // A step moved or deleted, from the pane, Command Search, the assistant or a script: the
         // step being edited (and the current one) follow it, so Save writes where it was typed.

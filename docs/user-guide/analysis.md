@@ -33,7 +33,8 @@ after sorting or filtering. It is not a dataset field: do not use it as a geopro
 Right-click a column header for **Hide Column**, **Move Left**, **Move Right** and **Show All
 Columns**. A hidden column is only left out of the table: export, selection, expressions and the
 map are unchanged. The toolbar says how many columns are hidden, and clicking it shows them all.
-The order and hidden columns are kept per table while RustGIS is open, not saved in the project.
+Hiding the column the rows are sorted by clears the sort. The order and hidden columns are kept
+per table until another project is opened, and are not saved in the project.
 
 <figure markdown="span">
   ![The attribute table docked under the map: the 14 African countries of more than 30 million people, selected by attributes, highlighted on the map and in the table](https://assets.rustgis.app/images/attribute-table.webp)

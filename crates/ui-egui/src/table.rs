@@ -25,8 +25,36 @@ pub struct TableState {
     views: HashMap<ViewKey, ColumnView>,
 }
 
-/// A table's identity for its view: the layer, or else the standalone table.
-type ViewKey = (Option<u32>, Option<u32>);
+/// A table's identity for its view: a live layer, by its instance (so a layer that takes a removed
+/// one's id, after an undo or in another project, starts afresh), or a standalone table's id.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum ViewKey {
+    Layer(u64),
+    Table(u32),
+}
+
+impl TableState {
+    /// Forgets every table's column view: another project replaced this one.
+    pub(crate) fn forget_views(&mut self) {
+        self.views.clear();
+    }
+}
+
+/// Brings each column view up to date with its table's fields, and forgets those whose layer or
+/// table is gone. Run after every command, so a field deleted and added again while the table is
+/// closed still starts visible.
+pub(crate) fn prune_views(app: &mut RustGisApp) {
+    let project = &app.session.project;
+    app.table.views.retain(|key, view| {
+        let fields = match *key {
+            ViewKey::Layer(instance) => {
+                project.maps.iter().flat_map(|m| &m.layers).find(|l| l.instance_id() == instance).map(|l| &l.dataset.fields)
+            }
+            ViewKey::Table(id) => project.table(id).map(|t| &t.dataset.fields),
+        };
+        fields.map(|f| view.repair(f)).is_some()
+    });
+}
 
 /// What a column's right-click menu asked for.
 #[derive(Clone, Copy)]
@@ -43,7 +71,14 @@ enum ColumnAction {
 #[derive(Default, Clone, Debug, PartialEq)]
 struct ColumnView {
     order: Vec<String>,
-    hidden: Vec<String>,
+    /// A hidden field's name, and which of the fields of that name it is (a file can repeat one).
+    hidden: Vec<(String, usize)>,
+}
+
+/// Field `i`'s name, and how many fields of that name come before it.
+fn tag(fields: &[Field], i: usize) -> Option<(String, usize)> {
+    let name = &fields.get(i)?.name;
+    Some((name.clone(), fields.iter().take(i).filter(|f| &f.name == name).count()))
 }
 
 impl ColumnView {
@@ -51,7 +86,7 @@ impl ColumnView {
     fn repair(&mut self, fields: &[Field]) {
         let has = |n: &String| fields.iter().any(|f| &f.name == n);
         self.order.retain(has);
-        self.hidden.retain(has);
+        self.hidden.retain(|(n, k)| fields.iter().filter(|f| &f.name == n).count() > *k);
     }
 
     /// Every field's index in display order, hidden ones included.
@@ -69,7 +104,7 @@ impl ColumnView {
     }
 
     fn is_hidden(&self, fields: &[Field], i: usize) -> bool {
-        fields.get(i).is_some_and(|f| self.hidden.contains(&f.name))
+        tag(fields, i).is_some_and(|t| self.hidden.contains(&t))
     }
 
     /// The field indices to show, in display order.
@@ -82,10 +117,10 @@ impl ColumnView {
     }
 
     fn hide(&mut self, fields: &[Field], i: usize) {
-        if let Some(f) = fields.get(i)
-            && !self.hidden.contains(&f.name)
+        if let Some(t) = tag(fields, i)
+            && !self.hidden.contains(&t)
         {
-            self.hidden.push(f.name.clone());
+            self.hidden.push(t);
         }
     }
 
@@ -157,18 +192,18 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         .frame(egui::Frame::NONE.fill(t.pane))
         .show(ui, |ui| {
             // Data source: a layer or a standalone table.
-            let (ds, selection, title): (Dataset, Vec<usize>, String) = match layer_id.and_then(|id| app.session.map().layer(id)) {
-                Some(l) => (l.dataset.clone(), l.selection.clone(), l.name.clone()),
-                None => match app.session.table_standalone.and_then(|id| app.session.project.table(id)) {
-                    Some(tb) => (tb.dataset.clone(), Vec::new(), tb.name.clone()),
-                    None => {
-                        app.session.table_standalone = None;
-                        return;
-                    }
-                },
-            };
+            let (ds, selection, title, key): (Dataset, Vec<usize>, String, ViewKey) =
+                match layer_id.and_then(|id| app.session.map().layer(id)) {
+                    Some(l) => (l.dataset.clone(), l.selection.clone(), l.name.clone(), ViewKey::Layer(l.instance_id())),
+                    None => match app.session.table_standalone.and_then(|id| app.session.project.table(id)) {
+                        Some(tb) => (tb.dataset.clone(), Vec::new(), tb.name.clone(), ViewKey::Table(tb.id)),
+                        None => {
+                            app.session.table_standalone = None;
+                            return;
+                        }
+                    },
+                };
             let is_layer = layer_id.is_some();
-            let key: ViewKey = (layer_id, if layer_id.is_none() { app.session.table_standalone } else { None });
             let view = app.table.views.entry(key).or_default();
             view.repair(&ds.fields);
             let shown = view.shown(&ds.fields);
@@ -201,7 +236,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                 .size(11.5)
                                 .color(t.accent),
                         ))
-                        .on_hover_text(tl!("Show all columns"))
+                        .on_hover_text(tl!("Show All Columns"))
                         .clicked()
                 {
                     show_all = true;
@@ -284,8 +319,8 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                 .on_hover_text(tl!("Feature identifier, not a dataset field or a row position."));
                         });
                         for &i in &shown {
-                            let Some(fd) = ds.fields.get(i) else { continue };
                             h.col(|ui| {
+                                let Some(fd) = ds.fields.get(i) else { return };
                                 let arrow = match app.table.sort {
                                     Some((c, true)) if c == i => " ↑",
                                     Some((c, false)) if c == i => " ↓",
@@ -401,7 +436,13 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             }
             if let Some(view) = app.table.views.get_mut(&key) {
                 match column_action {
-                    Some((i, ColumnAction::Hide)) => view.hide(&ds.fields, i),
+                    Some((i, ColumnAction::Hide)) => {
+                        view.hide(&ds.fields, i);
+                        // Rows aren't left ordered by a column that can't be seen.
+                        if app.table.sort.is_some_and(|(c, _)| c == i) {
+                            app.table.sort = None;
+                        }
+                    }
                     Some((i, ColumnAction::Left)) => view.shift(&ds.fields, i, true),
                     Some((i, ColumnAction::Right)) => view.shift(&ds.fields, i, false),
                     None => {}
@@ -623,6 +664,55 @@ mod tests {
         assert_eq!(names(&fs, &v.shown(&fs)), ["c", "b", "e"]);
     }
 
+    /// Two fields of one name, as a file can have, are hidden apart.
+    #[test]
+    fn columns_of_one_name_hide_apart() {
+        let fs = fields(&["a", "a", "b"]);
+        let mut v = ColumnView::default();
+        v.hide(&fs, 1);
+        assert_eq!(v.shown(&fs), vec![0, 2]);
+        assert_eq!(v.hidden_count(&fs), 1);
+        // With the second gone, the one left is shown.
+        let fs = fields(&["a", "b"]);
+        v.repair(&fs);
+        assert_eq!(v.shown(&fs), vec![0, 1]);
+    }
+
+    /// A column view follows commands run while the table is closed, and belongs to its project:
+    /// a field deleted and added again starts visible, a removed layer's view is forgotten, and
+    /// another project starts with every column shown.
+    #[test]
+    fn column_views_follow_commands_and_projects() {
+        let mut app = RustGisApp::with_sample();
+        assert_eq!(app.session.table_layer, None, "the table is closed");
+        let hidden = |app: &RustGisApp, name: &str| {
+            let l = app.session.map().layers.iter().find(|l| l.name == name).unwrap();
+            let fields = &l.dataset.fields;
+            app.table.views.get(&ViewKey::Layer(l.instance_id())).map(|v| v.hidden_count(fields))
+        };
+        let hide = |app: &mut RustGisApp, name: &str, field: &str| {
+            let l = app.session.map().layers.iter().find(|l| l.name == name).unwrap();
+            let i = l.dataset.field_index(field).unwrap();
+            let mut v = ColumnView::default();
+            v.hide(&l.dataset.fields, i);
+            app.table.views.insert(ViewKey::Layer(l.instance_id()), v);
+        };
+        hide(&mut app, "Countries", "pop_est");
+        assert_eq!(hidden(&app, "Countries"), Some(1));
+        app.run("edit.deleteField", json!({"layer": "Countries", "field": "pop_est"})).unwrap();
+        app.run("edit.addField", json!({"layer": "Countries", "name": "pop_est", "type": "long"})).unwrap();
+        assert_eq!(hidden(&app, "Countries"), Some(0), "added again, shown");
+        // A removed layer's view goes with it.
+        hide(&mut app, "Cities", "name");
+        app.run("layer.remove", json!({"layer": "Cities"})).unwrap();
+        assert_eq!(app.table.views.len(), 1, "only Countries' view is left");
+        // Another project: its layers reuse the ids and names, but none of the views.
+        hide(&mut app, "Countries", "pop_est");
+        app.run("project.sample", json!({})).unwrap();
+        assert!(app.table.views.is_empty());
+        assert_eq!(hidden(&app, "Countries"), None);
+    }
+
     /// Typing into a cell of a reordered table, with a column hidden before it, writes the field
     /// shown there, not the one at that position in the dataset.
     #[test]
@@ -644,7 +734,8 @@ mod tests {
         }
         let shown = v.shown(&fields);
         assert_eq!(shown.first(), Some(&col));
-        app.table.views.insert((Some(id), None), v);
+        let instance = app.session.map().layer(id).map(|l| l.instance_id()).unwrap();
+        app.table.views.insert(ViewKey::Layer(instance), v);
         let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
             |ui, app: &mut RustGisApp| {
                 let ctx = ui.ctx().clone();
@@ -667,7 +758,7 @@ mod tests {
             assert_eq!(value(h.state(), c), want, "field {c}");
         }
         // The view survives the frames, and the table drew only the shown columns.
-        assert_eq!(h.state().table.views.get(&(Some(id), None)).map(|v| v.shown(&fields)), Some(shown));
+        assert_eq!(h.state().table.views.get(&ViewKey::Layer(instance)).map(|v| v.shown(&fields)), Some(shown));
     }
 
     #[test]
