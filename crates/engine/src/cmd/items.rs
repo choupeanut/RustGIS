@@ -1281,7 +1281,11 @@ fn stl_bytes(s: &mut Session, p: &Value) -> Result<(Vec<u8>, StlReport), String>
             false,
         );
     }
-    s.notify("STL has no units: coordinates are metres east, north and up from the model's south-west corner, in 32-bit floats", false);
+    // Said on every export, as an assumed coordinate system is: STL can't record its unit.
+    s.notify(
+        "STL has no units: coordinates are metres east and north of the model's south-west corner and up from the features' base (below 0 for a negative height), in 32-bit floats",
+        false,
+    );
     Ok((bytes, report))
 }
 
