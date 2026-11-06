@@ -28742,6 +28742,18 @@ fn stl_export_has_the_binary_layout_and_closed_outward_solids() {
     }
 }
 
+/// A point at the layer's corner becomes a cube reaching past it: the model still starts at zero.
+#[test]
+fn stl_point_cubes_stay_in_the_positive_octant() {
+    let pts = [[0.0, 0.0], [0.01, 0.01]].map(|c| mesh_feature(json!({"type": "Point", "coordinates": c}), 30.0));
+    let mut s = mesh_session(json!(pts));
+    let (_, bytes) = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap();
+    let tris = stl_triangles(&bytes);
+    assert_eq!(tris.len(), 24, "two cubes");
+    let low = |k: usize| tris.iter().flat_map(|(_, v)| v.iter().map(move |p| p[k])).fold(f32::INFINITY, f32::min);
+    assert_eq!((low(0), low(1), low(2)), (0.0, 0.0, 0.0));
+}
+
 #[test]
 fn stl_leaves_out_lines_and_skips_flat_triangles_and_says_so() {
     let mut s = mesh_session(json!([
@@ -28955,4 +28967,4 @@ fn reads_made_ahead_are_taken_by_the_command() {
     control.cancel();
     assert!(ahead.run(&control).err().unwrap().contains("cancelled"));
     let _ = std::fs::remove_dir_all(&dir);
->}
+}

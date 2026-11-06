@@ -1281,7 +1281,7 @@ fn stl_bytes(s: &mut Session, p: &Value) -> Result<(Vec<u8>, StlReport), String>
             false,
         );
     }
-    s.notify("STL has no units: coordinates are metres east, north and up from the layer's south-west corner, in 32-bit floats", false);
+    s.notify("STL has no units: coordinates are metres east, north and up from the model's south-west corner, in 32-bit floats", false);
     Ok((bytes, report))
 }
 
@@ -1289,8 +1289,15 @@ fn stl_bytes(s: &mut Session, p: &Value) -> Result<(Vec<u8>, StlReport), String>
 /// three vertices as little-endian f32 and a zero attribute.
 fn mesh_stl(mesh: &Mesh, max_triangles: usize) -> Result<(Vec<u8>, StlReport), String> {
     // The mesh is east, up and south; STL is written east, north and up, as slicers expect.
-    let verts: Vec<[f64; 3]> =
+    let mut verts: Vec<[f64; 3]> =
         mesh.items.iter().filter_map(|it| if let Item::Vertex([x, y, z], _) = it { Some([*x, -*z, *y]) } else { None }).collect();
+    // Point cubes reach past the layer's corner: start east and north at the model's own corner.
+    let low = |k: usize| verts.iter().map(|v| v[k]).fold(f64::INFINITY, f64::min);
+    let (x0, y0) = (low(0), low(1));
+    for v in &mut verts {
+        v[0] -= x0;
+        v[1] -= y0;
+    }
     let at = |n: usize| verts.get(n).copied();
     // Each triangle is written as it comes (50 bytes), and the count filled in at the end.
     let mut out = b"RustGIS binary STL, metres, Z up".to_vec();
