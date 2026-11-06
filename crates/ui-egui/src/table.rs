@@ -64,18 +64,20 @@ enum ColumnAction {
     Right,
 }
 
-/// The order and visibility of a table's field columns. Fields are kept by name, not by index, so
-/// deleting or adding a field leaves the other columns' state where it was. Fields missing from
-/// `order` (added since) follow at the end, in dataset order; names no longer in the dataset are
-/// dropped by [`ColumnView::repair`].
+/// The order and visibility of a table's field columns. Fields are kept by [`tag`] (name, and
+/// which field of that name), not by index, so deleting or adding a field leaves the other columns'
+/// state where it was. Fields missing from `order` (added since) follow at the end, in dataset
+/// order; tags no longer in the dataset are dropped by [`ColumnView::repair`].
 #[derive(Default, Clone, Debug, PartialEq)]
 struct ColumnView {
-    order: Vec<String>,
-    /// A hidden field's name, and which of the fields of that name it is (a file can repeat one).
+    /// Fields' tags in display order.
+    order: Vec<(String, usize)>,
+    /// Hidden fields' tags.
     hidden: Vec<(String, usize)>,
 }
 
-/// Field `i`'s name, and how many fields of that name come before it.
+/// Field `i`'s name, and how many fields of that name come before it: which of them it is, as a
+/// file can repeat a name.
 fn tag(fields: &[Field], i: usize) -> Option<(String, usize)> {
     let name = &fields.get(i)?.name;
     Some((name.clone(), fields.iter().take(i).filter(|f| &f.name == name).count()))
@@ -84,25 +86,30 @@ fn tag(fields: &[Field], i: usize) -> Option<(String, usize)> {
 impl ColumnView {
     /// Forget fields that are gone, so a field added later under the same name starts visible.
     fn repair(&mut self, fields: &[Field]) {
-        let has = |n: &String| fields.iter().any(|f| &f.name == n);
+        let has = |(n, k): &(String, usize)| fields.iter().filter(|f| &f.name == n).count() > *k;
         self.order.retain(has);
-        self.hidden.retain(|(n, k)| fields.iter().filter(|f| &f.name == n).count() > *k);
+        self.hidden.retain(has);
     }
 
     /// Every field's index in display order, hidden ones included.
     fn layout(&self, fields: &[Field]) -> Vec<usize> {
+        let tags: Vec<_> = (0..fields.len()).map(|i| tag(fields, i)).collect();
         let mut used = vec![false; fields.len()];
         let mut out = Vec::with_capacity(fields.len());
-        for name in &self.order {
-            if let Some(i) = (0..fields.len()).find(|&i| !used[i] && fields[i].name == *name) {
-                used[i] = true;
+        for t in &self.order {
+            if let Some(i) = tags.iter().position(|u| u.as_ref() == Some(t))
+                && let Some(u) = used.get_mut(i)
+                && !*u
+            {
+                *u = true;
                 out.push(i);
             }
         }
-        out.extend((0..fields.len()).filter(|&i| !used[i]));
+        out.extend((0..fields.len()).filter(|&i| used.get(i) == Some(&false)));
         out
     }
 
+    /// Whether field `i` is hidden.
     fn is_hidden(&self, fields: &[Field], i: usize) -> bool {
         tag(fields, i).is_some_and(|t| self.hidden.contains(&t))
     }
@@ -112,10 +119,12 @@ impl ColumnView {
         self.layout(fields).into_iter().filter(|&i| !self.is_hidden(fields, i)).collect()
     }
 
+    /// How many fields are hidden.
     fn hidden_count(&self, fields: &[Field]) -> usize {
         (0..fields.len()).filter(|&i| self.is_hidden(fields, i)).count()
     }
 
+    /// Hides field `i`.
     fn hide(&mut self, fields: &[Field], i: usize) {
         if let Some(t) = tag(fields, i)
             && !self.hidden.contains(&t)
@@ -124,6 +133,7 @@ impl ColumnView {
         }
     }
 
+    /// Shows every field again, keeping the order.
     fn show_all(&mut self) {
         self.hidden.clear();
     }
@@ -141,7 +151,7 @@ impl ColumnView {
         let mut full = self.layout(fields);
         let (Some(a), Some(b)) = (full.iter().position(|&c| c == i), full.iter().position(|&c| c == j)) else { return };
         full.swap(a, b);
-        self.order = full.into_iter().filter_map(|c| fields.get(c).map(|f| f.name.clone())).collect();
+        self.order = full.into_iter().filter_map(|c| tag(fields, c)).collect();
     }
 }
 
@@ -527,6 +537,7 @@ fn fits(text: &str, ty: rustgis_engine::data::FieldType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::kittest::Queryable;
 
     /// A value typed into a cell is kept on Enter, and Escape leaves the cell as it was (not the
     /// tool: the shortcuts run first, egui has dropped the focus on Escape by then). The editor
@@ -678,6 +689,26 @@ mod tests {
         assert_eq!(v.shown(&fs), vec![0, 1]);
     }
 
+    /// Two fields of one name move apart, and a third added later follows them, not before.
+    #[test]
+    fn columns_of_one_name_move_apart() {
+        let mut fs = fields(&["a", "a", "b"]);
+        let mut v = ColumnView::default();
+        v.shift(&fs, 1, true);
+        assert_eq!(v.shown(&fs), vec![1, 0, 2]);
+        v.shift(&fs, 1, false);
+        v.shift(&fs, 2, true);
+        assert_eq!(v.shown(&fs), vec![0, 2, 1]);
+        fs.push(Field::new("a", rustgis_engine::data::FieldType::Text));
+        v.repair(&fs);
+        assert_eq!(v.shown(&fs), vec![0, 2, 1, 3]);
+        // The last one gone, the others keep their places.
+        fs.pop();
+        fs.remove(1);
+        v.repair(&fs);
+        assert_eq!(names(&fs, &v.shown(&fs)), ["a", "b"]);
+    }
+
     /// A column view follows commands run while the table is closed, and belongs to its project:
     /// a field deleted and added again starts visible, a removed layer's view is forgotten, and
     /// another project starts with every column shown.
@@ -745,10 +776,26 @@ mod tests {
             app,
         );
         h.run_steps(4);
-        // The editor opens on the real field index, as the display column maps to it.
-        h.state_mut().table.editing =
-            Some(CellEdit::new(Some(id), h.state().session.map().layer(id).unwrap().dataset.features[0].id, col, before[col].clone()));
+        // Double-click the first row's cell in the first column shown: the editor opens on the
+        // field drawn there, not the dataset's first.
+        let cell = h
+            .query_all_by_label(&before[col])
+            .map(|n| n.rect())
+            .min_by(|a, b| (a.min.y, a.min.x).partial_cmp(&(b.min.y, b.min.x)).unwrap_or(std::cmp::Ordering::Equal))
+            .expect("the cell is drawn");
+        h.event(egui::Event::PointerMoved(cell.center()));
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton {
+                    pos: cell.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+        }
         h.run_steps(2);
+        assert_eq!(h.state().table.editing.as_ref().map(|e| e.col), Some(col), "edits the field drawn there");
         h.event(egui::Event::Text("Zed".into()));
         h.run_steps(2);
         h.key_press(egui::Key::Enter);
