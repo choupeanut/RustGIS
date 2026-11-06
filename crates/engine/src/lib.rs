@@ -451,6 +451,8 @@ pub struct TopologyIssue {
 pub struct Notice {
     pub text: String,
     pub error: bool,
+    /// How the troubleshooting history files it (an error, a warning or information).
+    pub(crate) severity: rustgis_data::diagnostics::Severity,
 }
 
 const UNDO_LIMIT: usize = 40;
@@ -639,6 +641,10 @@ pub struct Session {
     /// A notebook is running: it may not start another, even through a task or model (no
     /// unbounded recursion).
     pub(crate) notebook_running: bool,
+    /// How many commands are running other commands as their steps by calling them directly
+    /// (a script's lines, a plugin's host calls): what those steps do is the script's, not the
+    /// user's own move, so a Zarr step they move to is read before the next line runs.
+    pub(crate) steps_running: u32,
     /// How many geoprocessing history records came with the opened project (from its file).
     pub history_from_file: usize,
     /// The report open in the Report pane, if any.
@@ -663,9 +669,9 @@ pub struct Session {
     /// What the project replaced during the command running held beside itself, to give back if
     /// the command fails ([`PutAside`]); and how deep commands run within commands now.
     put_aside: Option<Box<PutAside>>,
-    depth: u32,
+    pub(crate) depth: u32,
     /// Only the command's registered id, never its parameters. Nested commands restore this.
-    diagnostic_source: Option<&'static str>,
+    pub(crate) diagnostic_source: Option<&'static str>,
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
@@ -737,6 +743,16 @@ pub struct Session {
     /// one succeeds) through this. Python leaves it unset: a run there holds the interpreter's
     /// lock and can't be interrupted, so it keeps the Script pane's bounds.
     pub long_runs: Option<fn(&str, f64)>,
+    /// Zarr layers that follow the time slider read a step not read yet on a thread of their
+    /// own, showing the step before until it lands (the desktop app; see
+    /// [`Session::follow_time_landed`]). Off, as for scripts and the command line, a slider move
+    /// waits for the step.
+    pub zarr_off_frame: bool,
+    /// The Zarr steps landed that [`Session::follow_time_landed`] has seen.
+    zarr_seen: u64,
+    /// A read the app made on a thread of its own for the command it runs next, which takes it
+    /// instead of reading again ([`cmd::reads`]).
+    pub(crate) read_ahead: Option<cmd::reads::Read>,
     /// Set where a person at a terminal waits on a command (`rustgis-cli run` with stdin and
     /// stderr a terminal), who can stop it with Ctrl-C: tools and rasters take no work cap
     /// ([`rustgis_analysis::control::Control::stoppable`]). A program that calls it (an agent, a
@@ -835,10 +851,12 @@ fn fresh_source_ids(before: &Project, after: &mut Project) {
 /// A lock names each label by its feature's id, and [`rustgis_data::Dataset::push`] hands the
 /// largest id out again once its feature is deleted: the new feature would take the lock's place
 /// without having been placed (#1135). Saved moved-label positions have the same identity rule.
-/// So a command that removes features removes their locks and saved moves,
+/// So a command that removes features removes their locks, line anchors and saved moves,
 /// whichever way it removes them. Undo brings them back with the rest of the project. A streamed
 /// layer holds only the window in view, so its other features aren't gone. It compares ids, so an
 /// id a single command both removes and hands out stays locked: only restoring from an archive can.
+/// A command that removes a layer removes its locks and line anchors too, or each frame would read
+/// them for nothing.
 fn forget_label_state_of_removed_features(before: &Project, after: &mut Project) {
     for (i, m) in after.maps.iter_mut().enumerate() {
         let was = before.maps.get(i).filter(|o| o.name == m.name);
@@ -866,7 +884,13 @@ fn forget_label_state_of_removed_features(before: &Project, after: &mut Project)
             if let Some(lock) = &mut m.label_lock {
                 lock.retain(|((layer, id, ..), _)| *layer != l.id || !gone.contains(id));
             }
+            m.label_lock_line_anchors.retain(|(layer, id, ..), _| *layer != l.id || !gone.contains(id));
         }
+        let kept: std::collections::HashSet<u32> = m.layers.iter().map(|l| l.id).collect();
+        if let Some(lock) = &mut m.label_lock {
+            lock.retain(|((layer, ..), _)| kept.contains(layer));
+        }
+        m.label_lock_line_anchors.retain(|(layer, ..), _| kept.contains(layer));
     }
 }
 
@@ -940,6 +964,7 @@ impl Session {
             project_starts: 0,
             trusted_notebooks: Default::default(),
             notebook_running: false,
+            steps_running: 0,
             history_from_file: 0,
             active_report: None,
             active_presentation: None,
@@ -987,6 +1012,9 @@ impl Session {
             raster_results: Vec::new(),
             raster_runs: Vec::new(),
             long_runs: None,
+            zarr_off_frame: false,
+            zarr_seen: 0,
+            read_ahead: None,
             stoppable: false,
         };
         for text in label_notices {
@@ -1119,6 +1147,28 @@ impl Session {
     }
     pub fn map_mut(&mut self) -> &mut Map {
         self.project.map_mut()
+    }
+
+    /// Whether a Zarr layer on the active map that follows the time slider is waiting for its
+    /// step to be read off the frame ([`Session::zarr_off_frame`]): playing holds its next step.
+    pub fn zarr_waiting(&self) -> bool {
+        self.zarr_off_frame && cmd::zarr::waiting(self)
+    }
+
+    /// Drops a read placed for a command ([`cmd::reads::Read::placed`]) that the command didn't
+    /// take: one refused before it read, or that read another way.
+    pub fn drop_read(&mut self) {
+        self.read_ahead = None;
+    }
+
+    /// Shows the Zarr steps read off the frame ([`Session::zarr_off_frame`]) once they land: the
+    /// app asks each frame. True when one landed, so the map draws again.
+    pub fn follow_time_landed(&mut self) -> bool {
+        if !cmd::zarr::landed_since(&mut self.zarr_seen) {
+            return false;
+        }
+        cmd::zarr::follow_time(self);
+        true
     }
 
     /// Moves the map to the view of a style added with `"view": true` once the style has loaded,
@@ -1650,11 +1700,16 @@ impl Session {
 
     fn notice_redacted(&mut self, text: rustgis_data::diagnostics::Redacted, severity: rustgis_data::diagnostics::Severity) {
         self.diagnostics.push_redacted(severity, self.diagnostic_source.unwrap_or("Application"), &text);
-        self.notices.push(Notice { text: text.into_string(), error: severity == rustgis_data::diagnostics::Severity::Error });
+        self.notices.push(Notice { text: text.into_string(), error: severity == rustgis_data::diagnostics::Severity::Error, severity });
         self.notices_given += 1;
         if self.notices.len() > 200 {
             self.notices.remove(0);
         }
+    }
+
+    /// How many notices were given in this session, including ones no longer kept.
+    pub(crate) fn notices_given(&self) -> u64 {
+        self.notices_given
     }
 
     /// A mark to pass to [`Session::notices_since`].
