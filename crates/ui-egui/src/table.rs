@@ -1,9 +1,11 @@
 //! The attribute table, docked under the map: sort, filter to the selection, select rows (synced
 //! with the map) and edit values in place.
 
+use std::collections::HashMap;
+
 use egui::{Sense, Stroke, Ui, vec2};
 use egui_extras::{Column, TableBuilder};
-use rustgis_engine::data::{Dataset, Value as V};
+use rustgis_engine::data::{Dataset, Field, Value as V};
 use serde_json::{Value, json};
 
 use crate::theme::{Tokens, semibold};
@@ -19,6 +21,93 @@ pub struct TableState {
     /// The pass the cell editor last had the focus in (see [`had_focus`]).
     focus_pass: Option<u64>,
     filter: String,
+    /// Which columns are hidden and in what order, per table (view only, kept for the session).
+    views: HashMap<ViewKey, ColumnView>,
+}
+
+/// A table's identity for its view: the layer, or else the standalone table.
+type ViewKey = (Option<u32>, Option<u32>);
+
+/// What a column's right-click menu asked for.
+#[derive(Clone, Copy)]
+enum ColumnAction {
+    Hide,
+    Left,
+    Right,
+}
+
+/// The order and visibility of a table's field columns. Fields are kept by name, not by index, so
+/// deleting or adding a field leaves the other columns' state where it was. Fields missing from
+/// `order` (added since) follow at the end, in dataset order; names no longer in the dataset are
+/// dropped by [`ColumnView::repair`].
+#[derive(Default, Clone, Debug, PartialEq)]
+struct ColumnView {
+    order: Vec<String>,
+    hidden: Vec<String>,
+}
+
+impl ColumnView {
+    /// Forget fields that are gone, so a field added later under the same name starts visible.
+    fn repair(&mut self, fields: &[Field]) {
+        let has = |n: &String| fields.iter().any(|f| &f.name == n);
+        self.order.retain(has);
+        self.hidden.retain(has);
+    }
+
+    /// Every field's index in display order, hidden ones included.
+    fn layout(&self, fields: &[Field]) -> Vec<usize> {
+        let mut used = vec![false; fields.len()];
+        let mut out = Vec::with_capacity(fields.len());
+        for name in &self.order {
+            if let Some(i) = (0..fields.len()).find(|&i| !used[i] && fields[i].name == *name) {
+                used[i] = true;
+                out.push(i);
+            }
+        }
+        out.extend((0..fields.len()).filter(|&i| !used[i]));
+        out
+    }
+
+    fn is_hidden(&self, fields: &[Field], i: usize) -> bool {
+        fields.get(i).is_some_and(|f| self.hidden.contains(&f.name))
+    }
+
+    /// The field indices to show, in display order.
+    fn shown(&self, fields: &[Field]) -> Vec<usize> {
+        self.layout(fields).into_iter().filter(|&i| !self.is_hidden(fields, i)).collect()
+    }
+
+    fn hidden_count(&self, fields: &[Field]) -> usize {
+        (0..fields.len()).filter(|&i| self.is_hidden(fields, i)).count()
+    }
+
+    fn hide(&mut self, fields: &[Field], i: usize) {
+        if let Some(f) = fields.get(i)
+            && !self.hidden.contains(&f.name)
+        {
+            self.hidden.push(f.name.clone());
+        }
+    }
+
+    fn show_all(&mut self) {
+        self.hidden.clear();
+    }
+
+    /// The shown column `i` would swap places with (`left` or right), if any.
+    fn neighbour(&self, fields: &[Field], i: usize, left: bool) -> Option<usize> {
+        let shown = self.shown(fields);
+        let p = shown.iter().position(|&c| c == i)?;
+        if left { p.checked_sub(1).and_then(|q| shown.get(q)) } else { shown.get(p + 1) }.copied()
+    }
+
+    /// Moves column `i` past the shown column beside it (hidden ones keep their place).
+    fn shift(&mut self, fields: &[Field], i: usize, left: bool) {
+        let Some(j) = self.neighbour(fields, i, left) else { return };
+        let mut full = self.layout(fields);
+        let (Some(a), Some(b)) = (full.iter().position(|&c| c == i), full.iter().position(|&c| c == j)) else { return };
+        full.swap(a, b);
+        self.order = full.into_iter().filter_map(|c| fields.get(c).map(|f| f.name.clone())).collect();
+    }
 }
 
 /// Whether a cell was being typed in during the pass before `pass`: egui takes the focus away on
@@ -79,6 +168,12 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 },
             };
             let is_layer = layer_id.is_some();
+            let key: ViewKey = (layer_id, if layer_id.is_none() { app.session.table_standalone } else { None });
+            let view = app.table.views.entry(key).or_default();
+            view.repair(&ds.fields);
+            let shown = view.shown(&ds.fields);
+            let hidden_n = view.hidden_count(&ds.fields);
+            let mut show_all = false;
             // Header.
             let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
             ui.painter().rect_filled(hr, 0.0, t.pane_header);
@@ -99,6 +194,18 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     .size(11.5)
                     .color(t.text_dim),
                 );
+                if hidden_n > 0
+                    && ui
+                        .add(egui::Button::new(
+                            egui::RichText::new(crate::i18n::fmt("Hidden columns: {n}", &[("n", &hidden_n.to_string())]))
+                                .size(11.5)
+                                .color(t.accent),
+                        ))
+                        .on_hover_text(tl!("Show all columns"))
+                        .clicked()
+                {
+                    show_all = true;
+                }
                 ui.add_space(10.0);
                 if is_layer {
                     small(
@@ -153,13 +260,13 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     if asc { o } else { o.reverse() }
                 });
             }
-            let nf = ds.fields.len();
             let mut clicked: Option<(usize, bool)> = None;
             let mut commits: Vec<(u64, usize, String, String)> = Vec::new();
             // Whether the cell being typed in was laid out (its row scrolled into view).
             let mut drawn = false;
             let mut cancel: Option<(u64, usize)> = None;
             let mut sort_click: Option<usize> = None;
+            let mut column_action: Option<(usize, ColumnAction)> = None;
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 let mut tb = TableBuilder::new(ui)
                     .striped(true)
@@ -167,7 +274,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     .sense(Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::initial(90.0).at_least(54.0));
-                for _ in 0..nf {
+                for _ in &shown {
                     tb = tb.column(Column::initial(120.0).at_least(50.0).clip(true));
                 }
                 tb.min_scrolled_height(0.0)
@@ -176,7 +283,8 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                             ui.label(egui::RichText::new(tl!("Feature ID")).font(semibold(11.5)).color(t.text_dim))
                                 .on_hover_text(tl!("Feature identifier, not a dataset field or a row position."));
                         });
-                        for (i, fd) in ds.fields.iter().enumerate() {
+                        for &i in &shown {
+                            let Some(fd) = ds.fields.get(i) else { continue };
                             h.col(|ui| {
                                 let arrow = match app.table.sort {
                                     Some((c, true)) if c == i => " ↑",
@@ -187,14 +295,33 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                     egui::Label::new(egui::RichText::new(format!("{}{arrow}", fd.display())).font(semibold(11.5)))
                                         .sense(Sense::click()),
                                 );
-                                if r.on_hover_text(crate::i18n::fmt(
-                                    "{field} ({type}) · click to sort",
+                                let r = r.on_hover_text(crate::i18n::fmt(
+                                    "{field} ({type}) · click to sort, right-click for columns",
                                     &[("field", &fd.name), ("type", tl_raw!(fd.ty.label()))],
-                                ))
-                                .clicked()
-                                {
+                                ));
+                                if r.clicked() {
                                     sort_click = Some(i);
                                 }
+                                r.context_menu(|ui| {
+                                    if ui.button(tl!("Hide Column")).clicked() {
+                                        column_action = Some((i, ColumnAction::Hide));
+                                        ui.close();
+                                    }
+                                    let can = |left| app.table.views.get(&key).is_some_and(|v| v.neighbour(&ds.fields, i, left).is_some());
+                                    if ui.add_enabled(can(true), egui::Button::new(tl!("Move Left"))).clicked() {
+                                        column_action = Some((i, ColumnAction::Left));
+                                        ui.close();
+                                    }
+                                    if ui.add_enabled(can(false), egui::Button::new(tl!("Move Right"))).clicked() {
+                                        column_action = Some((i, ColumnAction::Right));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.add_enabled(hidden_n > 0, egui::Button::new(tl!("Show All Columns"))).clicked() {
+                                        show_all = true;
+                                        ui.close();
+                                    }
+                                });
                             });
                         }
                     })
@@ -207,7 +334,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                             row.col(|ui| {
                                 ui.label(egui::RichText::new(oid.to_string()).size(11.5).color(t.text_dim));
                             });
-                            for c in 0..nf {
+                            for &c in &shown {
                                 row.col(|ui| {
                                     let editing = app.table.editing.as_ref().is_some_and(|e| e.fid == oid && e.col == c);
                                     if editing {
@@ -271,6 +398,17 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     Some((c, false)) if c == i => None,
                     _ => Some((i, true)),
                 };
+            }
+            if let Some(view) = app.table.views.get_mut(&key) {
+                match column_action {
+                    Some((i, ColumnAction::Hide)) => view.hide(&ds.fields, i),
+                    Some((i, ColumnAction::Left)) => view.shift(&ds.fields, i, true),
+                    Some((i, ColumnAction::Right)) => view.shift(&ds.fields, i, false),
+                    None => {}
+                }
+                if show_all {
+                    view.show_all();
+                }
             }
             if let Some((r, add)) = clicked
                 && is_layer
@@ -424,6 +562,112 @@ mod tests {
         h.state_mut().session.table_layer = None;
         h.run_steps(2);
         assert!(h.state().table.editing.is_none(), "dropped when the table closed");
+    }
+
+    fn fields(names: &[&str]) -> Vec<Field> {
+        names.iter().map(|n| Field::new(*n, rustgis_engine::data::FieldType::Text)).collect()
+    }
+
+    fn names(fields: &[Field], idx: &[usize]) -> Vec<String> {
+        idx.iter().filter_map(|&i| fields.get(i)).map(|f| f.name.clone()).collect()
+    }
+
+    #[test]
+    fn columns_hide_reorder_and_show_all() {
+        let fs = fields(&["a", "b", "c", "d"]);
+        let mut v = ColumnView::default();
+        assert_eq!(v.shown(&fs), vec![0, 1, 2, 3]);
+        // The ends can't move outward.
+        assert_eq!(v.neighbour(&fs, 0, true), None);
+        assert_eq!(v.neighbour(&fs, 3, false), None);
+        v.shift(&fs, 2, true);
+        assert_eq!(names(&fs, &v.shown(&fs)), ["a", "c", "b", "d"]);
+        v.shift(&fs, 0, false);
+        assert_eq!(names(&fs, &v.shown(&fs)), ["c", "a", "b", "d"]);
+        // A hidden column is skipped, and keeps its place among the others.
+        v.hide(&fs, 0);
+        v.hide(&fs, 0);
+        assert_eq!(v.hidden_count(&fs), 1);
+        assert_eq!(names(&fs, &v.shown(&fs)), ["c", "b", "d"]);
+        v.shift(&fs, 1, true);
+        assert_eq!(names(&fs, &v.shown(&fs)), ["b", "c", "d"]);
+        v.shift(&fs, 1, false);
+        v.show_all();
+        assert_eq!(v.hidden_count(&fs), 0);
+        assert_eq!(names(&fs, &v.layout(&fs)), ["c", "a", "b", "d"]);
+    }
+
+    #[test]
+    fn columns_survive_added_and_deleted_fields() {
+        let mut fs = fields(&["a", "b", "c"]);
+        let mut v = ColumnView::default();
+        v.hide(&fs, 1);
+        v.shift(&fs, 2, true);
+        v.shift(&fs, 0, false);
+        assert_eq!(names(&fs, &v.shown(&fs)), ["c", "a"]);
+        // A field deleted before the hidden one: "b" stays hidden, the rest keep their order.
+        fs.remove(0);
+        v.repair(&fs);
+        assert_eq!(names(&fs, &v.shown(&fs)), ["c"]);
+        assert_eq!(v.hidden_count(&fs), 1);
+        // A new field shows, at the end.
+        fs.push(Field::new("e", rustgis_engine::data::FieldType::Text));
+        v.repair(&fs);
+        assert_eq!(names(&fs, &v.shown(&fs)), ["c", "e"]);
+        // A deleted then re-added field starts visible, not hidden again.
+        fs.remove(0);
+        v.repair(&fs);
+        fs.insert(0, Field::new("b", rustgis_engine::data::FieldType::Text));
+        v.repair(&fs);
+        assert_eq!(v.hidden_count(&fs), 0);
+        assert_eq!(names(&fs, &v.shown(&fs)), ["c", "b", "e"]);
+    }
+
+    /// Typing into a cell of a reordered table, with a column hidden before it, writes the field
+    /// shown there, not the one at that position in the dataset.
+    #[test]
+    fn a_cell_in_a_reordered_table_writes_its_own_field() {
+        let mut app = RustGisApp::with_sample();
+        let id = app.session.map().layers.first().map(|l| l.id).unwrap();
+        app.session.table_layer = Some(id);
+        let ds = &app.session.map().layer(id).unwrap().dataset;
+        let text = |c: usize| (0..ds.features.len()).all(|r| matches!(ds.value(r, c), V::Text(_)));
+        let col = (1..ds.fields.len()).find(|&c| text(c)).expect("a text field");
+        let value = |app: &RustGisApp, c: usize| app.session.map().layer(id).unwrap().dataset.value(0, c).to_string();
+        let before: Vec<String> = (0..ds.fields.len()).map(|c| value(&app, c)).collect();
+        let fields = ds.fields.clone();
+        // Hide field 0 and move `col` to the front.
+        let mut v = ColumnView::default();
+        v.hide(&fields, 0);
+        while v.neighbour(&fields, col, true).is_some() {
+            v.shift(&fields, col, true);
+        }
+        let shown = v.shown(&fields);
+        assert_eq!(shown.first(), Some(&col));
+        app.table.views.insert((Some(id), None), v);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        // The editor opens on the real field index, as the display column maps to it.
+        h.state_mut().table.editing =
+            Some(CellEdit::new(Some(id), h.state().session.map().layer(id).unwrap().dataset.features[0].id, col, before[col].clone()));
+        h.run_steps(2);
+        h.event(egui::Event::Text("Zed".into()));
+        h.run_steps(2);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        for (c, was) in before.iter().enumerate() {
+            let want = if c == col { format!("{was}Zed") } else { was.clone() };
+            assert_eq!(value(h.state(), c), want, "field {c}");
+        }
+        // The view survives the frames, and the table drew only the shown columns.
+        assert_eq!(h.state().table.views.get(&(Some(id), None)).map(|v| v.shown(&fields)), Some(shown));
     }
 
     #[test]
