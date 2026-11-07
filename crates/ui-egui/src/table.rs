@@ -23,6 +23,8 @@ pub struct TableState {
     filter: String,
     /// Which columns are hidden and in what order, per table (view only, kept for the session).
     views: HashMap<ViewKey, ColumnView>,
+    /// The project the views are for ([`rustgis_engine::Session::opened`]).
+    opened: u64,
 }
 
 /// A table's identity for its view: a live layer, by its instance (so a layer that takes a removed
@@ -33,17 +35,16 @@ enum ViewKey {
     Table(u32),
 }
 
-impl TableState {
-    /// Forgets every table's column view: another project replaced this one.
-    pub(crate) fn forget_views(&mut self) {
-        self.views.clear();
-    }
-}
-
 /// Brings each column view up to date with its table's fields, and forgets those whose layer or
 /// table is gone. Run after every command, so a field deleted and added again while the table is
 /// closed still starts visible.
 pub(crate) fn prune_views(app: &mut RustGisApp) {
+    // Another project, however it was opened (the app, an agent, a script): its tables' ids start
+    // again at 1, so no view carries over.
+    if app.table.opened != app.session.opened {
+        app.table.views.clear();
+        app.table.opened = app.session.opened;
+    }
     let project = &app.session.project;
     app.table.views.retain(|key, view| {
         let fields = match *key {
@@ -214,6 +215,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     },
                 };
             let is_layer = layer_id.is_some();
+            prune_views(app);
             let view = app.table.views.entry(key).or_default();
             view.repair(&ds.fields);
             let shown = view.shown(&ds.fields);
@@ -715,6 +717,8 @@ mod tests {
     #[test]
     fn column_views_follow_commands_and_projects() {
         let mut app = RustGisApp::with_sample();
+        // The table follows this project from here.
+        prune_views(&mut app);
         assert_eq!(app.session.table_layer, None, "the table is closed");
         let hidden = |app: &RustGisApp, name: &str| {
             let l = app.session.map().layers.iter().find(|l| l.name == name).unwrap();
@@ -744,11 +748,39 @@ mod tests {
         assert_eq!(hidden(&app, "Countries"), None);
     }
 
+    /// A project opened past the app (an agent's or a script's command, run on the session) still
+    /// leaves the old one's views behind: a standalone table there, under the same id and with the
+    /// same fields, shows every column.
+    #[test]
+    fn column_views_are_forgotten_when_an_agent_opens_a_project() {
+        let table = |app: &mut RustGisApp| {
+            let fields = fields(&["a", "b"]);
+            let id = app.session.project.add_table(Dataset::new("Notes", rustgis_engine::data::GeometryType::Point, fields.clone()));
+            (id, fields)
+        };
+        let mut app = RustGisApp::with_sample();
+        // The table follows this project from here.
+        prune_views(&mut app);
+        let (id, fs) = table(&mut app);
+        let mut v = ColumnView::default();
+        v.hide(&fs, 0);
+        app.table.views.insert(ViewKey::Table(id), v);
+        prune_views(&mut app);
+        assert_eq!(app.table.views.get(&ViewKey::Table(id)).map(|v| v.hidden_count(&fs)), Some(1), "kept in its project");
+        app.session.run("project.new", &json!({})).unwrap();
+        let (again, _) = table(&mut app);
+        assert_eq!(again, id, "the new project's table takes the same id");
+        prune_views(&mut app);
+        assert!(app.table.views.is_empty());
+    }
+
     /// Typing into a cell of a reordered table, with a column hidden before it, writes the field
     /// shown there, not the one at that position in the dataset.
     #[test]
     fn a_cell_in_a_reordered_table_writes_its_own_field() {
         let mut app = RustGisApp::with_sample();
+        // The table follows this project from here.
+        prune_views(&mut app);
         let id = app.session.map().layers.first().map(|l| l.id).unwrap();
         app.session.table_layer = Some(id);
         let ds = &app.session.map().layer(id).unwrap().dataset;
