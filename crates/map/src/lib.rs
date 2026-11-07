@@ -122,6 +122,16 @@ pub enum NoFill {
     Symbols,
 }
 
+/// What No Fill hid ([`Layer::hidden_fills`]), for Restore Fill to put back.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HiddenFills {
+    /// The renderer before No Fill: its fills' opacities and its classes' own fills.
+    pub renderer: Renderer,
+    /// The layer's own fills before No Fill.
+    #[serde(default, deserialize_with = "fills::de_fills")]
+    pub fills: Vec<fills::FillLayer>,
+}
+
 /// A layer: a dataset drawn with a renderer and labels.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layer {
@@ -186,6 +196,9 @@ pub struct Layer {
     /// fill in the symbol's colour shows them again. A fill colour chosen transparent isn't this.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_no_fill")]
     pub no_fill: Option<NoFill>,
+    /// What No Fill hid, while it is on: Restore Fill puts back what wasn't changed since.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_no_fill")]
+    pub hidden_fills: Option<Box<HiddenFills>>,
     /// Draws the stacked strokes in levels (symbol levels): every feature's strokes of one
     /// [`LineStroke::level`] before any of the next, so road casings join under the cores
     /// instead of cutting across them where lines meet.
@@ -425,6 +438,7 @@ impl Layer {
             line_strokes: Vec::new(),
             fill_layers: Vec::new(),
             no_fill: None,
+            hidden_fills: None,
             stroke_levels: false,
             marker_rotation: None,
             diagram: None,
@@ -2734,16 +2748,16 @@ pub const REFERENCE_SCALES: (f64, f64) = (1.0, 1e9);
 /// far in, its lines would otherwise be drawn thousands of pixels wide.
 pub const SIZE_FACTORS: (f64, f64) = (0.01, 32.0);
 
-/// A [`Layer::no_fill`] this version doesn't know (a later variant, another type, or edited by
-/// hand) reads as off, rather than failing the whole project.
-fn de_no_fill<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<NoFill>, D::Error> {
+/// A [`Layer::no_fill`] (or [`Layer::hidden_fills`]) this version doesn't know (a later variant,
+/// another type, or edited by hand) reads as off, rather than failing the whole project.
+fn de_no_fill<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Read {
-        Known(NoFill),
+    enum Read<T> {
+        Known(T),
         Other(serde::de::IgnoredAny),
     }
-    Ok(match Option::<Read>::deserialize(d)? {
+    Ok(match Option::<Read<T>>::deserialize(d)? {
         Some(Read::Known(how)) => Some(how),
         Some(Read::Other(_)) | None => None,
     })
@@ -2877,6 +2891,7 @@ impl Layer {
             line_strokes: _,
             fill_layers: _,
             no_fill: _,
+            hidden_fills: _,
             stroke_levels: _,
             marker_rotation: _,
             symbol_by: _,

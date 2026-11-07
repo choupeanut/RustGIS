@@ -129,8 +129,10 @@ For polygons, **No Fill** in the Symbology pane or **Style › Drawing** draws o
 It keeps each symbol's outline colour and width, including in Unique Values and Graduated Colors,
 without changing the classes. Change the outline with **Outline color** and **Outline width** in
 the Single Symbol editor, or `layer.outline` for all classes. Undo restores the previous fills;
-the button also changes to **Restore Fill**, which shows the existing colours again. Symbols
-made transparent by No Fill use the default polygon opacity. By command:
+the button also changes to **Restore Fill**, which puts the fills back as they were: their
+colours and opacities, the layer's own fill layers and each class's. A fill that was transparent
+before No Fill stays transparent, and what you change while No Fill is on, such as a class colour,
+is kept. By command:
 
 ```text
 layer.noFill={"layer":"Countries"}

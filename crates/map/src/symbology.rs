@@ -1769,7 +1769,7 @@ impl Renderer {
     }
 
     /// Applies `f` to every symbol.
-    pub fn map_symbols(&mut self, f: impl Fn(&mut Symbol)) {
+    pub fn map_symbols(&mut self, mut f: impl FnMut(&mut Symbol)) {
         match self {
             Renderer::Single(s) => f(s),
             Renderer::Unique { classes, other, .. } => {

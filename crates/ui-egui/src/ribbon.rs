@@ -5034,9 +5034,7 @@ mod tests {
         let mut h = drawing_harness();
         h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
         h.run();
-        let mut renderer = h.state().session.map().layer_by_name("Countries").unwrap().renderer.clone();
-        // No Fill does not retain the old alpha; Restore Fill uses the default polygon opacity.
-        renderer.map_symbols(|s| s.fill = s.fill.with_alpha(170));
+        let renderer = h.state().session.map().layer_by_name("Countries").unwrap().renderer.clone();
         h.get_by_label("No Fill").click();
         h.run();
         assert!(h.state().session.map().layer_by_name("Countries").unwrap().no_fill.is_some());

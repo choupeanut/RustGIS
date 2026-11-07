@@ -23040,13 +23040,15 @@ fn fills_come_back_after_no_fill() {
             let l = s.map().layer(id).unwrap();
             let over = matches!(l.fill_layers.as_slice(), [f] if f.color.is_some_and(|c| c.a() == 0));
             assert_eq!(over, case != "memory", "{case}: No Fill's path");
-            assert_eq!(l.no_fill, Some(if over { rustgis_map::NoFill::Override } else { rustgis_map::NoFill::Symbols }));
+            let l_no_fill = Some(if over { rustgis_map::NoFill::Override } else { rustgis_map::NoFill::Symbols });
+            assert_eq!(l.no_fill, l_no_fill);
             s.run(step["command"].as_str().unwrap(), &step["params"]).unwrap();
             assert!(filled(&s), "{case}: {step} after No Fill draws fills");
             if step["command"] == "layer.restoreFill" {
                 assert!(s.map().layer(id).unwrap().no_fill.is_none());
                 s.run("edit.undo", &Value::Null).unwrap();
                 assert!(!filled(&s), "{case}: undo restores No Fill");
+                assert_eq!(s.map().layer(id).unwrap().no_fill, l_no_fill, "{case}: undo restores No Fill's marker");
                 s.run("edit.redo", &Value::Null).unwrap();
                 assert!(filled(&s), "{case}: redo restores fills");
             }
@@ -23093,8 +23095,66 @@ fn fills_come_back_after_no_fill() {
     s.run("layer.color", &json!({"color": "#33669900"})).unwrap();
     s.run("layer.symbology", &json!({"type": "unique", "field": "kind"})).unwrap();
     assert!(!filled(&s), "a chosen transparent fill stays");
-    s.run("layer.restoreFill", &Value::Null).unwrap();
-    assert!(!filled(&s), "Restore Fill leaves an explicit transparent colour unchanged");
+    assert!(s.run("layer.restoreFill", &Value::Null).is_err(), "Restore Fill is off without No Fill");
+    assert!(!filled(&s), "an explicit transparent colour stays");
+}
+
+/// #1299: Restore Fill puts back what No Fill hid, as it was: each fill's opacity, a fill made
+/// transparent before No Fill, a class's own fills and the layer's, also after the project is
+/// saved and opened again; a colour chosen while No Fill is on stays. Off, it changes nothing.
+#[test]
+fn restore_fill_puts_back_what_no_fill_hid() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
+    for mixed in [false, true] {
+        let mut ds = Dataset::new("parcels", GeometryType::Polygon, vec![Field::new("kind", FieldType::Text)]);
+        for (i, kind) in ["a", "b", "c"].into_iter().enumerate() {
+            let x = i as f64 * 2.0;
+            let ring = vec![Coord::new(x, 0.0), Coord::new(x + 1.0, 0.0), Coord::new(x + 1.0, 1.0), Coord::new(x, 0.0)];
+            ds.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Attr::Text(kind.into())]);
+        }
+        if mixed {
+            ds.push(Some(Geometry::Point(Coord::new(10.0, 0.5))), vec![Attr::Text("a".into())]);
+        }
+        let mut s = Session::new(Project::default());
+        let id = s.map_mut().add_dataset(ds);
+        s.active_layer = Some(id);
+        s.run("layer.symbology", &json!({"type": "unique", "field": "kind"})).unwrap();
+        s.run("layer.classStyle", &json!({"value": "a", "color": "#33669964"})).unwrap();
+        s.run("layer.classStyle", &json!({"value": "b", "color": "#33669900"})).unwrap();
+        s.run("layer.fillLayers", &json!({"value": "a", "fills": [{"pattern": "hatch", "angle": 45}]})).unwrap();
+        s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "angle": 135}]})).unwrap();
+        let before = s.map().layer(id).unwrap().clone();
+        // Off, it is refused before it runs: no undo step, so the redo one stays.
+        s.run("layer.outline", &json!({"color": "#000000"})).unwrap();
+        s.run("edit.undo", &Value::Null).unwrap();
+        assert!(s.run("layer.restoreFill", &Value::Null).is_err(), "mixed {mixed}: off");
+        s.run("edit.redo", &Value::Null).unwrap();
+        s.run("edit.undo", &Value::Null).unwrap();
+        s.run("layer.noFill", &Value::Null).unwrap();
+        // Again changes nothing it keeps.
+        s.run("layer.noFill", &Value::Null).unwrap();
+        // Saved and opened again.
+        let project: Project = serde_json::from_str(&serde_json::to_string(&s.project).unwrap()).unwrap();
+        let mut s = Session::new(project);
+        s.active_layer = Some(id);
+        s.run("layer.restoreFill", &Value::Null).unwrap();
+        let l = s.map().layer(id).unwrap();
+        assert_eq!(l.renderer, before.renderer, "mixed {mixed}: the classes as they were");
+        assert_eq!(l.fill_layers, before.fill_layers, "mixed {mixed}: the layer's fills");
+        assert!(l.no_fill.is_none() && l.hidden_fills.is_none(), "mixed {mixed}: off");
+        assert!(s.run("layer.restoreFill", &Value::Null).is_err(), "mixed {mixed}: off again");
+        // A class made transparent while No Fill is on stays so; the others come back.
+        s.run("layer.noFill", &Value::Null).unwrap();
+        s.run("layer.classStyle", &json!({"value": "c", "color": "#11223300"})).unwrap();
+        s.run("layer.restoreFill", &Value::Null).unwrap();
+        let (rustgis_map::Renderer::Unique { classes: now, .. }, rustgis_map::Renderer::Unique { classes: was, .. }) =
+            (&s.map().layer(id).unwrap().renderer, &before.renderer)
+        else {
+            panic!("unique")
+        };
+        assert_eq!(now[2].1.fill.a(), 0, "mixed {mixed}: c stays transparent");
+        assert_eq!(now[..2], was[..2], "mixed {mixed}: a and b as they were");
+    }
 }
 
 /// #1456: a definition query on a streamed source the view filters as it reads (FlatGeobuf)
