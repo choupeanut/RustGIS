@@ -1003,6 +1003,8 @@ struct Mesh {
     holes_dropped: usize,
     /// Features whose height field isn't a finite number, so they took the default height.
     default_heights: usize,
+    /// Line parts left out because they have a single vertex.
+    short_lines: usize,
 }
 
 impl Orient {
@@ -1066,7 +1068,8 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
     let mut mesh = Mesh { keep_lines, ..Mesh::default() };
     let rows = l.visible_rows();
     for (row, ft) in l.dataset.features.iter().enumerate() {
-        if rows.get(row) != Some(&true) {
+        // A feature with no geometry draws nothing, so its height is neither used nor reported.
+        if rows.get(row) != Some(&true) || ft.geometry.is_none() {
             continue;
         }
         // A height that isn't a finite number takes the default, and is counted.
@@ -1154,6 +1157,7 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
                 for part in parts {
                     let n = part.len();
                     if n < 2 {
+                        mesh.short_lines += usize::from(n == 1);
                         continue;
                     }
                     mesh.lines += 1;
@@ -1195,7 +1199,7 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
         }
     }
     if mesh.vertices == 0 {
-        if mesh.lines > 0 && !mesh.keep_lines {
+        if mesh.lines + mesh.short_lines > 0 && !mesh.keep_lines {
             return Err("nothing to export: STL holds polygons and points, not lines".into());
         }
         return Err("nothing to export".into());
@@ -1281,6 +1285,9 @@ fn mesh_notices(s: &mut Session, mesh: &Mesh) {
     }
     if mesh.holes_dropped > 0 {
         s.notify(format!("Dropped {} hole(s) with fewer than 3 vertices: their areas are filled in", mesh.holes_dropped), false);
+    }
+    if mesh.short_lines > 0 {
+        s.notify(format!("Skipped {} line part(s) with a single vertex", mesh.short_lines), false);
     }
     if mesh.default_heights > 0 {
         s.notify(format!("{} feature(s) without a numeric height used the default height instead", mesh.default_heights), false);

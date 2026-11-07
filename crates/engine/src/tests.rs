@@ -32075,6 +32075,28 @@ fn stl_fans_a_cap_past_the_triangulator_limit_and_says_so() {
 }
 
 #[test]
+fn layer_meshes_report_single_vertex_lines_and_skip_heights_of_empty_features() {
+    // A one-vertex line part is left out and said; a feature without geometry draws nothing, so
+    // its unusable height isn't counted as defaulted.
+    let mut s = mesh_session(json!([
+        mesh_feature(square(0.0, false), 30.0),
+        mesh_feature(json!({"type": "LineString", "coordinates": [[0.0, 0.02]]}), 5.0),
+        {"type": "Feature", "geometry": null, "properties": {"h": "tall"}},
+    ]));
+    for kind in ["obj", "stl"] {
+        s.notices.clear();
+        crate::cmd::items::item_bytes(&mut s, kind, &json!({"heightField": "h"})).unwrap();
+        let said = |part: &str| s.notices.iter().any(|n| n.text.contains(part));
+        assert!(said("Skipped 1 line part(s) with a single vertex"), "{kind}");
+        assert!(!said("default height"), "{kind}");
+    }
+    // A layer whose only line has one vertex says why STL has nothing.
+    let mut lines = mesh_session(json!([mesh_feature(json!({"type": "LineString", "coordinates": [[0.0, 0.0]]}), 5.0)]));
+    let e = crate::cmd::items::item_bytes(&mut lines, "stl", &json!({"heightField": "h"})).unwrap_err();
+    assert!(e.contains("not lines"), "{e}");
+}
+
+#[test]
 fn layer_meshes_say_what_they_leave_out_or_default() {
     // A hole of two vertices is dropped, and a height that isn't a number takes the default.
     let two_vertex_hole = json!({"type": "Polygon", "coordinates": [
