@@ -8,8 +8,9 @@ in pixels and a `dpi` value (96 by default). **Print Map** opens a PDF of the ma
 vectors as a layout's PDF is (see Layouts), in the system viewer on desktop; **Capture To
 Clipboard** copies a map image. **Export To 3D** writes a layer as a Wavefront OBJ or binary STL model
 with polygons extruded by a field (`share.export3d` writes STL when `path` ends in `.stl`). STL
-holds triangles only: lines are left out, zero-area triangles are skipped, and a cap that can't
-be triangulated is fanned over its outer ring, filling any holes; the notices say how many. OBJ
+holds closed solids only: lines and zero-height features are left out, zero-area triangles are
+skipped, and a cap that can't be triangulated is fanned over its outer ring, filling any holes;
+the notices say how many. OBJ
 uses metres east, up and south of the layer's south-west corner (Y up). STL uses metres east and
 north of the model's own south-west corner, which includes the cubes drawn for points and so can
 lie past the layer's, and up from the features' base (Z up, as slicers expect; a negative height

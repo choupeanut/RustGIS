@@ -31974,19 +31974,27 @@ fn stl_leaves_out_lines_and_skips_flat_triangles_and_says_so() {
         mesh_feature(square(0.0, false), 0.0),
         mesh_feature(json!({"type": "LineString", "coordinates": [[0.0, 0.02], [0.01, 0.02]]}), 5.0),
         mesh_feature(json!({"type": "Point", "coordinates": [0.03, 0.02]}), 20.0),
+        mesh_feature(json!({"type": "Point", "coordinates": [0.05, 0.02]}), 0.0),
+        mesh_feature(
+            json!({"type": "Polygon", "coordinates": [[[0.06, 0.0], [0.07, 0.0], [0.070_000_000_01, 0.0], [0.07, 0.01], [0.06, 0.01], [0.06, 0.0]]]}),
+            30.0
+        ),
     ]));
     let (_, bytes) = crate::cmd::items::item_bytes(&mut s, "stl", &json!({"heightField": "h"})).unwrap();
-    // The flat square's 8 wall triangles have no area; its 4 cap triangles stay, and the point
-    // makes a cube of 12.
-    assert_eq!(stl_triangles(&bytes).len(), 4 + 12);
+    // The flat square and the flat point are left out, not written as two coincident caps; the
+    // point of 20 m makes a cube of 12, and the square's 1 µm edge, one point in 32-bit floats,
+    // gives zero-area triangles (4 of its 16) that are skipped.
+    let tris = stl_triangles(&bytes);
+    assert_eq!(tris.len(), 12 + 12);
     let said = |part: &str| s.notices.iter().any(|n| n.text.contains(part));
+    assert!(said("Left out 2 polygon(s) and point(s) of zero height"));
     assert!(said("left out 1 polyline"));
     assert!(said("zero-area"));
     assert!(said("no units"));
     // A layer of squares gives neither the line nor the zero-area notices.
     let mut clean = mesh_session(json!([mesh_feature(square(0.0, false), 30.0)]));
     crate::cmd::items::item_bytes(&mut clean, "stl", &json!({"heightField": "h"})).unwrap();
-    assert!(!clean.notices.iter().any(|n| n.text.contains("polyline") || n.text.contains("zero-area")));
+    assert!(!clean.notices.iter().any(|n| n.text.contains("polyline") || n.text.contains("zero-area") || n.text.contains("zero height")));
     // OBJ keeps its polylines and says nothing about STL.
     let (_, obj) = crate::cmd::items::item_bytes(&mut s, "obj", &json!({"heightField": "h"})).unwrap();
     assert!(String::from_utf8(obj).unwrap().contains("\nl "));
@@ -32043,7 +32051,12 @@ fn stl_refuses_coordinates_beyond_f32_and_all_flat_layers() {
         0.0
     )]));
     let e = crate::cmd::items::item_bytes(&mut flat, "stl", &json!({"heightField": "h"})).unwrap_err();
-    assert!(e.contains("zero area"), "{e}");
+    assert!(e.contains("zero height"), "{e}");
+    // So does one of zero-height solids, which STL can't hold as flat sheets; OBJ still writes them.
+    let mut sheets = mesh_session(json!([mesh_feature(square(0.0, false), 0.0)]));
+    let e = crate::cmd::items::item_bytes(&mut sheets, "stl", &json!({"heightField": "h"})).unwrap_err();
+    assert!(e.contains("zero height"), "{e}");
+    assert!(crate::cmd::items::item_bytes(&mut sheets, "obj", &json!({"heightField": "h"})).is_ok());
 }
 
 #[test]

@@ -1001,6 +1001,8 @@ struct Mesh {
     skipped: usize,
     /// Holes left out because they have fewer than 3 vertices, so their areas stay solid.
     holes_dropped: usize,
+    /// Polygons and points of zero height left out of STL, which holds solids, not flat sheets.
+    flat: usize,
     /// Features whose height field isn't a finite number, so they took the default height.
     default_heights: usize,
     /// Line parts left out because they have a single vertex.
@@ -1022,7 +1024,8 @@ impl Orient {
 impl Mesh {
     // Each push checks the size first, so one huge feature can't build past it.
     fn vertex(&mut self, x: f64, y: f64, z: f64, bare: bool) -> Result<(), String> {
-        self.grow(36)?;
+        // STL stores no shared vertices: its size is all in the triangles.
+        self.grow(if self.keep_lines { 36 } else { 0 })?;
         self.items.push(Item::Vertex([x, y, z], bare));
         self.vertices += 1;
         Ok(())
@@ -1043,7 +1046,12 @@ impl Mesh {
 
     fn grow(&mut self, bytes: usize) -> Result<(), String> {
         self.bytes += bytes;
-        if self.bytes > MAX_MESH { Err("the 3D file would be too large; export fewer features".into()) } else { Ok(()) }
+        // STL's estimate is its exact size, so it stops where the writer would.
+        if self.bytes > if self.keep_lines { MAX_MESH } else { MAX_OBJ } {
+            Err("the 3D file would be too large; export fewer features".into())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1088,6 +1096,11 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
         // unless reversed.
         let below = h < 0.0;
         let orient = |o: Orient| if below { o.reversed() } else { o };
+        // A solid of zero height would be two coincident caps facing apart: STL leaves it out.
+        if !mesh.keep_lines && h == 0.0 && !matches!(ft.geometry, Some(Geometry::Line(_))) {
+            mesh.flat += 1;
+            continue;
+        }
         match &ft.geometry {
             Some(Geometry::Polygon(polys)) => {
                 for rings in polys {
@@ -1199,6 +1212,9 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
         }
     }
     if mesh.vertices == 0 {
+        if mesh.flat > 0 && !mesh.keep_lines {
+            return Err("nothing to export: every polygon and point has zero height, and STL holds solids, not flat sheets".into());
+        }
         if mesh.lines + mesh.short_lines > 0 && !mesh.keep_lines {
             return Err("nothing to export: STL holds polygons and points, not lines".into());
         }
@@ -1299,11 +1315,17 @@ fn stl_bytes(s: &mut Session, p: &Value) -> Result<(Vec<u8>, StlReport), String>
     let mesh = layer_mesh(s, p, false)?;
     let (bytes, report) = mesh_stl(&mesh, MAX_STL_TRIANGLES)?;
     mesh_notices(s, &mesh);
+    if mesh.flat > 0 {
+        s.notify(format!("Left out {} polygon(s) and point(s) of zero height: STL holds solids, not flat sheets", mesh.flat), false);
+    }
     if report.lines > 0 {
         s.notify(format!("STL holds triangles only: left out {} polyline(s)", report.lines), false);
     }
     if report.degenerate > 0 {
-        s.notify(format!("Skipped {} zero-area triangle(s), such as walls of zero height", report.degenerate), false);
+        s.notify(
+            format!("Skipped {} zero-area triangle(s), such as edges too short to tell apart in 32-bit floats", report.degenerate),
+            false,
+        );
     }
     if report.fanned > 0 {
         s.notify(
