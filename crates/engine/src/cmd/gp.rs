@@ -5854,7 +5854,7 @@ mod batch_tests {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [100.0, 100.0, 30.0]
+                    "coordinates": [100.0, 80.0, 30.0]
                 },
                 "properties": {"name": "Outside"}
             }]
