@@ -131,8 +131,12 @@ without changing the classes. Change the outline with **Outline color** and **Ou
 the Single Symbol editor, or `layer.outline` for all classes. Undo restores the previous fills;
 the button also changes to **Restore Fill**, which puts the fills back as they were: their
 colours and opacities, the layer's own fill layers and each class's. A fill that was transparent
-before No Fill stays transparent, and what you change while No Fill is on, such as a class colour,
-is kept. By command:
+before No Fill stays transparent, and a class colour, outline or label changed while No Fill is on
+is kept. A new symbology, colour scheme or fill colour (`layer.symbology`, `layer.ramp`,
+`layer.color`), or fill layers in the symbol's colour for the whole layer (`layer.fillLayers`),
+turn No Fill off and draw the fills themselves, so Restore Fill is then no longer offered. A
+project saved with No Fill on by an earlier RustGIS doesn't record the fills: Restore Fill then
+shows the symbols' fills at the default opacity and says what it couldn't put back. By command:
 
 ```text
 layer.noFill={"layer":"Countries"}

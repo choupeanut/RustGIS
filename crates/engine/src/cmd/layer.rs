@@ -190,38 +190,48 @@ pub fn commands() -> Vec<C> {
         .params(r##"{"layer"?, "color": "#RRGGBB"|"#RRGGBBAA" (the fill; a polygon's outline is left as it is, set it with layer.outline)}"##),
         C::new("layer.noFill", "No Fill", "Style › Drawing", |s, p| {
             with(s, p, |l| {
-                // Kept for Restore Fill; on again, the fills are already hidden.
-                if l.no_fill.is_none() {
-                    l.hidden_fills = Some(Box::new(HiddenFills { renderer: l.renderer.clone(), fills: l.fill_layers.clone() }));
-                }
+                // What it hides is kept for Restore Fill; on again, it is hidden already.
+                let was_off = l.no_fill.is_none();
+                let mut hidden = HiddenFills::default();
                 if l.source.is_some() || l.has_geometry(GeometryType::Point) || l.has_geometry(GeometryType::Polyline) {
                     // Symbols are shared by geometry families. A polygon-only fill override
                     // leaves point markers and line strokes (including their markers) intact.
                     // A streamed layer may have other families outside the loaded window.
                     l.no_fill = Some(NoFill::Override);
-                    l.fill_layers = vec![no_fill_override()];
-                    match &mut l.renderer {
-                        Renderer::Unique { class_fills, other_fills, .. } => {
-                            class_fills.clear();
-                            other_fills.clear();
+                    hidden.fills = std::mem::replace(&mut l.fill_layers, vec![no_fill_override()]);
+                    hidden.class_fills = match &mut l.renderer {
+                        Renderer::Unique { class_fills, other_fills, .. } => std::mem::take(class_fills)
+                            .into_iter()
+                            .map(|(v, f)| (ClassRef::Value(v), f))
+                            .chain([(ClassRef::Other, std::mem::take(other_fills))])
+                            .filter(|(_, f)| !f.is_empty())
+                            .collect(),
+                        Renderer::Graduated { class_fills, .. } => {
+                            std::mem::take(class_fills).into_iter().map(|(i, f)| (ClassRef::Index(i), f)).collect()
                         }
-                        Renderer::Graduated { class_fills, .. } => class_fills.clear(),
-                        _ => {}
-                    }
+                        _ => Vec::new(),
+                    };
                 } else {
-                    l.renderer.map_symbols(|sym| sym.fill = sym.fill.with_alpha(0));
+                    l.renderer.map_symbols(|sym| {
+                        hidden.alphas.push(sym.fill.a());
+                        sym.fill = sym.fill.with_alpha(0);
+                    });
                     l.no_fill = Some(NoFill::Symbols);
+                }
+                if was_off {
+                    l.hidden_fills = Some(hidden);
                 }
             })
         }).roles(&[])
         .when(need_polygon_features)
         .params(r#"{"layer"?: name|id (default: the active layer containing polygons; hides polygon fills, keeping outlines and point/line symbols)}"#),
         C::new("layer.restoreFill", "Restore Fill", "Style › Drawing", |s, p| {
-            with(s, p, |l| {
-                let hidden = l.hidden_fills.take();
-                let how = take_no_fill(l);
-                restore_fill(l, how, hidden.map(|h| *h));
-            })
+            let id = s.layer_id(p)?;
+            let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+            if let Some(lost) = restore_fill(l)? {
+                s.notify(lost, false);
+            }
+            Ok(Value::Null)
         })
         .roles(&[])
         .when(need_no_fill)
@@ -792,53 +802,65 @@ fn show_fill(sym: &mut rustgis_map::Symbol) {
     }
 }
 
-/// Restore Fill: what No Fill hid (`how`) comes back from what it kept, except what was set
-/// since: the layer's own fills and each class's where it has none now, or, on the symbols path,
-/// each fill still transparent at the opacity it had. Nothing kept (a project saved before it
-/// was): the symbols' fills at a new polygon symbol's opacity.
-fn restore_fill(l: &mut rustgis_map::Layer, how: Option<NoFill>, hidden: Option<HiddenFills>) {
-    let Some(HiddenFills { mut renderer, fills }) = hidden else {
-        if how == Some(NoFill::Symbols) {
-            l.renderer.map_symbols(show_fill);
-        }
-        return;
-    };
-    match how {
+/// Restore Fill: what No Fill hid comes back from what it kept, except what was set since: the
+/// layer's own fills and each class's where it has none now, or, on the symbols path, each fill
+/// still transparent at the opacity it had. Says what it couldn't put back, as when No Fill was
+/// turned on by a RustGIS that kept nothing.
+fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Option<String>, String> {
+    let hidden = l.hidden_fills.take();
+    let kept = hidden.is_some();
+    let HiddenFills { alphas, fills, class_fills } = hidden.unwrap_or_default();
+    match take_no_fill(l) {
         Some(NoFill::Override) => {
             if l.fill_layers.is_empty() {
                 l.fill_layers = fills;
             }
-            let classes: Vec<(ClassRef, Vec<rustgis_map::fills::FillLayer>)> = match renderer {
-                Renderer::Unique { class_fills, other_fills, .. } => {
-                    class_fills.into_iter().map(|(v, f)| (ClassRef::Value(v), f)).chain([(ClassRef::Other, other_fills)]).collect()
-                }
-                Renderer::Graduated { class_fills, .. } => class_fills.into_iter().map(|(i, f)| (ClassRef::Index(i), f)).collect(),
-                _ => Vec::new(),
-            };
-            for (class, f) in classes {
+            for (class, f) in class_fills {
                 // A class gone since, or given fills of its own, stays as it is.
-                if !f.is_empty() && l.renderer.class_fills(&class).is_ok_and(<[_]>::is_empty) {
-                    let _ = l.renderer.set_class_fills(&class, f);
+                if l.renderer.class_fills(&class).is_ok_and(<[_]>::is_empty) {
+                    l.renderer.set_class_fills(&class, f)?;
                 }
+            }
+            if !kept {
+                return Ok(Some(format!(
+                    "{}: Restore Fill can't put back any fill layers the layer or its classes had before No Fill, as the project didn't keep them; add them again with Fill Layers",
+                    l.name
+                )));
             }
         }
         Some(NoFill::Symbols) => {
-            // Symbols in the same order as before; classes changed since: none known.
-            let (mut was, mut now) = (Vec::new(), 0);
-            renderer.map_symbols(|s| was.push(s.fill.a()));
+            let mut now = 0;
             l.renderer.map_symbols(|_| now += 1);
-            if was.len() != now {
-                was.clear();
-            }
-            let mut was = was.into_iter();
+            // Kept for other symbols (classes changed since), or none: a new polygon symbol's.
+            let mut was = if alphas.len() == now { alphas } else { Vec::new() }.into_iter();
+            let mut guessed = 0;
             l.renderer.map_symbols(|s| {
-                let a = was.next().unwrap_or_else(shown_fill_alpha);
+                let a = was.next();
                 if s.fill.a() == 0 {
-                    s.fill = s.fill.with_alpha(a);
+                    guessed += usize::from(a.is_none());
+                    s.fill = s.fill.with_alpha(a.unwrap_or_else(shown_fill_alpha));
                 }
             });
+            if guessed > 0 {
+                return Ok(Some(format!(
+                    "{}: Restore Fill shows {guessed} fill(s) at the default opacity ({}), as their opacity from before No Fill wasn't kept",
+                    l.name,
+                    shown_fill_alpha()
+                )));
+            }
         }
         None => {}
+    }
+    Ok(None)
+}
+
+/// Where a class's symbol comes among [`Renderer::map_symbols`]' (as [`class_symbol`] finds it).
+fn symbol_position(r: &Renderer, class: &ClassRef) -> Option<usize> {
+    match (r, class) {
+        (Renderer::Unique { classes, .. }, ClassRef::Value(v)) => classes.iter().position(|(k, _)| k == v),
+        (Renderer::Unique { classes, .. }, ClassRef::Other) => Some(classes.len()),
+        (Renderer::Graduated { symbols, .. }, ClassRef::Index(i)) => (*i < symbols.len()).then_some(*i),
+        _ => None,
     }
 }
 
@@ -4929,8 +4951,9 @@ fn class_style(s: &mut Session, p: &Value) -> CmdResult {
     let g = l.geometry_type();
     let e = l.renderer.set_class_style(&class, &style, g)?;
     // A fill colour chosen while No Fill hides the fills is the one Restore Fill shows.
-    if let Some(sym) = l.hidden_fills.as_mut().filter(|_| style.color.is_some()).and_then(|h| class_symbol(&mut h.renderer, &class)) {
-        sym.fill = e.symbol.fill;
+    let at = symbol_position(&l.renderer, &class).filter(|_| style.color.is_some());
+    if let Some(a) = at.and_then(|i| l.hidden_fills.as_mut()?.alphas.get_mut(i)) {
+        *a = e.symbol.fill.a();
     }
     Ok(json!({"label": e.label, "color": e.symbol.fill.hex(), "outline": e.symbol.stroke.hex()}))
 }

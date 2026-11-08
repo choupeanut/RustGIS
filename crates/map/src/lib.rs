@@ -123,13 +123,17 @@ pub enum NoFill {
 }
 
 /// What No Fill hid ([`Layer::hidden_fills`]), for Restore Fill to put back.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HiddenFills {
-    /// The renderer before No Fill: its fills' opacities and its classes' own fills.
-    pub renderer: Renderer,
-    /// The layer's own fills before No Fill.
-    #[serde(default, deserialize_with = "fills::de_fills")]
+    /// Each symbol's fill opacity before No Fill, in [`Renderer::map_symbols`] order (made 0).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alphas: Vec<u8>,
+    /// The layer's own fills before No Fill (replaced by its transparent one).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "fills::de_fills")]
     pub fills: Vec<fills::FillLayer>,
+    /// The classes' own fills before No Fill (taken off).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_fills: Vec<(symbology::ClassRef, Vec<fills::FillLayer>)>,
 }
 
 /// A layer: a dataset drawn with a renderer and labels.
@@ -197,8 +201,8 @@ pub struct Layer {
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_no_fill")]
     pub no_fill: Option<NoFill>,
     /// What No Fill hid, while it is on: Restore Fill puts back what wasn't changed since.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_no_fill")]
-    pub hidden_fills: Option<Box<HiddenFills>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_hidden_fills")]
+    pub hidden_fills: Option<HiddenFills>,
     /// Draws the stacked strokes in levels (symbol levels): every feature's strokes of one
     /// [`LineStroke::level`] before any of the next, so road casings join under the cores
     /// instead of cutting across them where lines meet.
@@ -2748,19 +2752,25 @@ pub const REFERENCE_SCALES: (f64, f64) = (1.0, 1e9);
 /// far in, its lines would otherwise be drawn thousands of pixels wide.
 pub const SIZE_FACTORS: (f64, f64) = (0.01, 32.0);
 
-/// A [`Layer::no_fill`] (or [`Layer::hidden_fills`]) this version doesn't know (a later variant,
-/// another type, or edited by hand) reads as off, rather than failing the whole project.
-fn de_no_fill<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+/// A [`Layer::no_fill`] this version doesn't know (a later variant, another type, or edited by
+/// hand) reads as off, rather than failing the whole project.
+fn de_no_fill<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<NoFill>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Read<T> {
-        Known(T),
+    enum Read {
+        Known(NoFill),
         Other(serde::de::IgnoredAny),
     }
-    Ok(match Option::<Read<T>>::deserialize(d)? {
+    Ok(match Option::<Read>::deserialize(d)? {
         Some(Read::Known(how)) => Some(how),
         Some(Read::Other(_)) | None => None,
     })
+}
+
+/// [`Layer::hidden_fills`] that don't read as this version keeps them read as none kept, rather
+/// than failing the whole project; Restore Fill then says what it couldn't put back.
+fn de_hidden_fills<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<HiddenFills>, D::Error> {
+    Ok(Option::<serde_json::Value>::deserialize(d)?.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// Reads a layer's reference scale as `layer.referenceScale` would leave it: one out of
@@ -3226,6 +3236,22 @@ mod tests {
         ] {
             v["no_fill"] = unknown.clone();
             assert_eq!(serde_json::from_value::<Layer>(v.clone()).unwrap().no_fill, None, "{unknown}");
+        }
+        // What No Fill hid is saved with it; one that doesn't read is none kept.
+        let kept = HiddenFills {
+            alphas: vec![170, 0],
+            fills: vec![fills::FillLayer::hatch(45.0, 4.0, 0.5)],
+            class_fills: vec![(symbology::ClassRef::Index(1), vec![fills::FillLayer::default()])],
+        };
+        l.hidden_fills = Some(kept.clone());
+        let text = serde_json::to_string(&l).unwrap();
+        assert_eq!(serde_json::from_str::<Layer>(&text).unwrap().hidden_fills, Some(kept));
+        let mut v = serde_json::to_value(&l).unwrap();
+        for unknown in
+            [serde_json::json!("Later"), serde_json::json!({"alphas": [300]}), serde_json::json!({"class_fills": [["Later", []]]})]
+        {
+            v["hidden_fills"] = unknown.clone();
+            assert_eq!(serde_json::from_value::<Layer>(v.clone()).unwrap().hidden_fills, None, "{unknown}");
         }
     }
 
