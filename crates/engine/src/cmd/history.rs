@@ -15,9 +15,13 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("gp.historyCode", "Copy Run As Code", "Analyze › Geoprocessing", code)
             .roles(&[])
+            .effects(crate::policy::Effects::NONE)
             .view()
             .params(r#"{"run": index in the history (0 = the first run), "as"?: "python" (default)|"command" (a Script pane line)|"cli"}"#),
-        C::new("gp.historyScript", "Save History As Python Script", "Analyze › Geoprocessing", script).roles(&[]).view(),
+        C::new("gp.historyScript", "Save History As Python Script", "Analyze › Geoprocessing", script)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
+            .view(),
     ]
 }
 
@@ -95,7 +99,7 @@ fn script(s: &mut Session, _: &Value) -> CmdResult {
 /// The commands other than `gp.run` a run is copied as. The history comes from the project file,
 /// which may say anything: only these are written into code, so a crafted file can't pass any
 /// other command off as a geoprocessing run (and an id is never text to escape).
-const REPLAYED: &[&str] = &["gp.bufferPoint"];
+const REPLAYED: &[&str] = &["gp.bufferPoint", "gp.batch"];
 
 /// The command that runs `r` again, with its parameters: `gp.run` with the tool, or the command
 /// that ran it (a point buffered where the map was clicked, `gp.bufferPoint`).

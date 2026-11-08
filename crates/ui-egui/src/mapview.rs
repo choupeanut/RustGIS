@@ -306,7 +306,8 @@ pub struct MapView {
     pub menu_lonlat: Option<Coord>,
     /// The text graphic the context menu was opened on (layer id, row), for Edit Text.
     pub menu_text: Option<(u32, usize)>,
-    pub dms: bool,
+    /// How the pointer's coordinates read (status bar, right-click menu); a preference.
+    pub coord_format: crate::CoordReadout,
     pub render_ms: u64,
     pub notices_seen: usize,
     pub toasts: Vec<Toast>,
@@ -404,7 +405,7 @@ impl Default for MapView {
             pointer_lonlat: None,
             menu_lonlat: None,
             menu_text: None,
-            dms: false,
+            coord_format: crate::CoordReadout::Decimal,
             render_ms: 0,
             notices_seen: 0,
             toasts: Vec::new(),
@@ -4861,6 +4862,7 @@ mod tests {
     /// included, so every step of a slider drag made the map flicker.
     #[test]
     fn a_style_change_over_tiles_keeps_the_frame_instead_of_a_preview() {
+        let _turn = crate::fetching::turn();
         let mut app = RustGisApp::with_sample();
         // Nothing listens there: the tiles fail, the map still draws.
         app.run("map.addTiles", json!({"url": "http://127.0.0.1:9/{z}/{x}/{y}.png", "name": "Offline"})).expect("tile layer");
