@@ -1048,8 +1048,14 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                         if buffer.len() + built + grown + cap * 12 + triangles * 12 + walls > MAX_SCENE_BYTES {
                             return Err("the scene would be too large; share fewer features".into());
                         }
-                        let (tris, fan) =
-                            found.unwrap_or_else(|| ((1..outer.len().saturating_sub(1)).map(|i| [0, i, i + 1]).collect(), true));
+                        // The fallback fan follows the ring, which may run either way: it is wound
+                        // counter-clockwise (in x, z) like the triangulator's answer, so it faces up too.
+                        let (tris, fan) = found.unwrap_or_else(|| {
+                            let ccw =
+                                outer.iter().zip(outer.iter().cycle().skip(1)).map(|(a, b)| a.0 * b.1 - b.0 * a.1).sum::<f64>() >= 0.0;
+                            let fan = (1..outer.len().saturating_sub(1)).map(|i| if ccw { [0, i, i + 1] } else { [0, i + 1, i] }).collect();
+                            (fan, true)
+                        });
                         fanned += usize::from(fan);
                         let (pos, idx) = tri.entry(key).or_default();
                         let base = pos.len() as u32;

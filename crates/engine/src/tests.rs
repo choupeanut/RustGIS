@@ -32492,12 +32492,13 @@ fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.decode(uri.split_once(",").unwrap().1).unwrap()
     };
-    // The indices are the fan from the ring's first vertex, wound to face up: (0, i + 1, i).
+    // The indices are the fan from the ring's first vertex, wound to face up (+y) for this
+    // counter-clockwise ring: (0, i, i + 1).
     let ia = accessor(&prim["indices"]);
     let iv = &g["bufferViews"][ia["bufferView"].as_u64().unwrap() as usize];
     let istart = (iv["byteOffset"].as_u64().unwrap_or(0) + ia["byteOffset"].as_u64().unwrap_or(0)) as usize;
     let indices: Vec<u32> = bytes[istart..istart + 4999 * 3 * 4].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let fan: Vec<u32> = (1..5000u32).flat_map(|i| [0, i + 1, i]).collect();
+    let fan: Vec<u32> = (1..5000u32).flat_map(|i| [0, i, i + 1]).collect();
     assert_eq!(indices, fan);
     let view = &g["bufferViews"][at["bufferView"].as_u64().unwrap() as usize];
     let start = (view["byteOffset"].as_u64().unwrap_or(0) + at["byteOffset"].as_u64().unwrap_or(0)) as usize;
@@ -32508,16 +32509,19 @@ fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
             (f(0), f(8))
         })
         .collect();
-    let (cx, cz) = xz.iter().fold((0.0, 0.0), |(a, b), (x, z)| (a + x / 5001.0, b + z / 5001.0));
-    let radii: Vec<f64> = xz.iter().map(|(x, z)| ((x - cx).powi(2) + (z - cz).powi(2)).sqrt()).collect();
-    let (lo, hi) = radii.iter().fold((f64::MAX, 0.0f64), |(lo, hi), r| (lo.min(*r), hi.max(*r)));
-    assert!(hi - lo < hi * 0.01, "positions off the outer ring: {lo}..{hi}");
-    // In the ring's own order: vertex i at angle i·τ/5001 (east, and south is +z).
+    // Each position is its source vertex, in order: metres east (x) and south (z) of the map's centre.
+    let c = holed.map().center_lonlat();
+    let (origin, k) = (rustgis_geom::lonlat_to_merc(c), c.y.to_radians().cos().abs().max(0.01));
     for (i, (x, z)) in xz.iter().enumerate() {
-        let a = i as f64 * std::f64::consts::TAU / 5001.0;
-        let (ex, ez) = (a.cos(), -a.sin());
-        let (dx, dz) = ((x - cx) / hi, (z - cz) / hi);
-        assert!((dx - ex).abs() < 0.01 && (dz - ez).abs() < 0.01, "vertex {i} out of order: ({dx}, {dz})");
+        let q = rustgis_geom::lonlat_to_merc(rustgis_geom::Coord::new(big[i][0], big[i][1]));
+        let (ex, ez) = ((q.x - origin.x) * k, -(q.y - origin.y) * k);
+        assert!((x - ex).abs() < 0.125 && (z - ez).abs() < 0.125, "vertex {i}: ({x}, {z}), not ({ex}, {ez})");
+    }
+    // And every triangle faces up: its normal, (b - a) × (c - a), has a positive y.
+    for t in indices.chunks(3) {
+        let [a, b, c] = [t[0], t[1], t[2]].map(|n| xz[n as usize]);
+        let (u, v) = ((b.0 - a.0, b.1 - a.1), (c.0 - a.0, c.1 - a.1));
+        assert!(u.1 * v.0 - u.0 * v.1 > 0.0, "{t:?} faces down");
     }
     // Features too far from the centre for 32-bit positions (a polygon, a line) are left out and
     // said, not written as infinity.
