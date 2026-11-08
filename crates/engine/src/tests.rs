@@ -32469,29 +32469,48 @@ fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
     let said: Vec<&str> = s.notices.iter().map(|n| n.text.as_str()).filter(|t| t.contains("couldn't be triangulated")).collect();
     assert_eq!(said.len(), 1, "{:?}", s.notices);
     assert!(said[0].starts_with("2 polygon cap(s) couldn't be triangulated"), "{said:?}");
-    // The oversized polygon is still in the scene (as a fan), not skipped.
-    let g: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let max_count = g["accessors"].as_array().unwrap().iter().filter_map(|a| a["count"].as_u64()).max().unwrap();
-    assert!(max_count >= 5001 * 3, "{max_count}");
     // A clean scene says nothing about caps.
     let mut clean = mesh_session(json!([mesh_feature(square(0.0, false), 30.0)]));
     clean.run("share.webScene", &json!({"path": path})).unwrap();
     assert!(!clean.notices.iter().any(|n| n.text.contains("couldn't be triangulated")), "{:?}", clean.notices);
-    // A fan over the outer ring writes no positions for the holes it can't use (the layer isn't
-    // extruded, so the cap's are all there are).
+    // On its own (with a hole it can't use), the oversized polygon is in the scene as a fan over
+    // its outer ring: 4999 triangles, and only the ring's 5001 positions (the layer isn't extruded,
+    // so the cap's are all there are), all on the circle, none of the hole's.
     let hole = [[0.001, 0.001], [0.002, 0.001], [0.0015, 0.002], [0.001, 0.001]];
     let mut holed = mesh_session(json!([mesh_feature(json!({"type": "Polygon", "coordinates": [big, hole]}), 30.0)]));
     holed.run("share.webScene", &json!({"path": path})).unwrap();
     let g: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let counts: Vec<u64> =
-        g["accessors"].as_array().unwrap().iter().filter(|a| a["type"] == "VEC3").filter_map(|a| a["count"].as_u64()).collect();
-    assert_eq!(counts, [5001]);
-    // A polygon too far from the centre for 32-bit positions is left out and said, not written as infinity.
+    let prim = &g["meshes"][0]["primitives"][0];
+    let accessor = |i: &Value| &g["accessors"][i.as_u64().unwrap() as usize];
+    assert_eq!(accessor(&prim["indices"])["count"], 4999 * 3);
+    let at = accessor(&prim["attributes"]["POSITION"]);
+    assert_eq!(at["count"], 5001);
+    let uri = g["buffers"][0]["uri"].as_str().unwrap();
+    let bytes = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(uri.split_once(",").unwrap().1).unwrap()
+    };
+    let view = &g["bufferViews"][at["bufferView"].as_u64().unwrap() as usize];
+    let start = (view["byteOffset"].as_u64().unwrap_or(0) + at["byteOffset"].as_u64().unwrap_or(0)) as usize;
+    let xz: Vec<(f64, f64)> = bytes[start..start + 5001 * 12]
+        .chunks(12)
+        .map(|v| {
+            let f = |o: usize| f64::from(f32::from_le_bytes(v[o..o + 4].try_into().unwrap()));
+            (f(0), f(8))
+        })
+        .collect();
+    let (cx, cz) = xz.iter().fold((0.0, 0.0), |(a, b), (x, z)| (a + x / 5001.0, b + z / 5001.0));
+    let radii: Vec<f64> = xz.iter().map(|(x, z)| ((x - cx).powi(2) + (z - cz).powi(2)).sqrt()).collect();
+    let (lo, hi) = radii.iter().fold((f64::MAX, 0.0f64), |(lo, hi), r| (lo.min(*r), hi.max(*r)));
+    assert!(hi - lo < hi * 0.01, "positions off the outer ring: {lo}..{hi}");
+    // Features too far from the centre for 32-bit positions (a polygon, a line) are left out and
+    // said, not written as infinity.
     let far = json!({"type": "Polygon", "coordinates": [[[1e40, 0.0], [1e40, 0.01], [1.01e40, 0.0], [1e40, 0.0]]]});
-    let mut s = mesh_session(json!([mesh_feature(far, 30.0), mesh_feature(square(0.0, false), 30.0)]));
+    let far_line = json!({"type": "LineString", "coordinates": [[0.0, 0.0], [1e40, 0.0]]});
+    let mut s = mesh_session(json!([mesh_feature(far, 30.0), mesh_feature(far_line, 30.0), mesh_feature(square(0.0, false), 30.0)]));
     s.run("share.webScene", &json!({"path": path})).unwrap();
     assert!(
-        s.notices.iter().any(|n| n.text == "1 polygon(s) left out of the scene: a coordinate is too far from the map's centre"),
+        s.notices.iter().any(|n| n.text == "2 feature(s) left out of the scene: a coordinate is too far from the map's centre"),
         "{:?}",
         s.notices
     );

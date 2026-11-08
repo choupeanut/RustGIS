@@ -92,7 +92,7 @@ in the browser. The Share As commands accept a `path`; without one they use the 
 - **Web Scene** (`share.webScene`): the visible vector layers as glTF, polygons extruded by their
   layer's extrusion setting, with a camera that looks at the map's centre from its bearing and pitch.
   A cap that can't be triangulated is fanned over its outer ring, as in OBJ and STL, and a notice
-  says how many. A polygon with a coordinate too far from the map's centre for the scene's 32-bit
+  says how many. A feature with a coordinate too far from the map's centre for the scene's 32-bit
   positions is left out, and a notice says how many.
 - **Web Link Chart** (`share.linkChart`): the features joined by the map's relationships as a
   node-link HTML page; `relationship` limits it to one relationship.

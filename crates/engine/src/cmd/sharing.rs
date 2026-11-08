@@ -254,7 +254,7 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
                 s.notify(super::items::fanned_caps_note(fanned), false);
             }
             if out_of_range > 0 {
-                s.notify(format!("{out_of_range} polygon(s) left out of the scene: a coordinate is too far from the map's centre"), false);
+                s.notify(format!("{out_of_range} feature(s) left out of the scene: a coordinate is too far from the map's centre"), false);
             }
             Ok((m.name.clone(), bytes, m.name.clone()))
         }
@@ -939,7 +939,7 @@ struct SceneBytes {
 /// (z) of the map's centre, with a camera where the map view (`view` points across) looks
 /// from: its bearing and pitch, as far off as MapLibre's camera would be. Also the number of
 /// polygon caps that are fans over the outer ring (the triangulator gave up, or fell back to one),
-/// and of polygons left out because a position is too far from the centre for 32 bits.
+/// and of features left out because a position is too far from the centre for 32 bits.
 fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
     let c = m.center_lonlat();
     let origin = rustgis_geom::lonlat_to_merc(c);
@@ -978,6 +978,17 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                 continue;
             }
             let Some(g) = &ft.geometry else { continue };
+            // A position too far for 32 bits would make the scene invalid: the feature is left out,
+            // and said.
+            let mut finite = true;
+            g.for_each_coord(|c| {
+                let (x, z) = xy(c);
+                finite &= x.is_finite() && z.is_finite();
+            });
+            if !finite {
+                out_of_range += 1;
+                continue;
+            }
             budget -= 1;
             // The geometry built so far, with the buffer already written, stays under the cap
             // (checked as it grows, so a few huge polygons can't run away first).
@@ -1010,13 +1021,14 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                         let open: Vec<Vec<(f64, f64)>> =
                             std::iter::once(outer.clone()).chain(open.iter().skip(1).filter(|r| r.len() >= 3).cloned()).collect();
                         let Some(outer) = open.first() else { continue };
-                        // A position too far for 32 bits would make the scene invalid: the polygon is
-                        // left out, and said.
-                        if open.iter().flatten().any(|p| !p.0.is_finite() || !p.1.is_finite()) {
-                            out_of_range += 1;
-                            continue;
-                        }
                         let flat: Vec<(f64, f64)> = open.iter().flatten().copied().collect();
+                        // At most what this polygon adds (its cap's positions and indices, and its
+                        // walls), checked before it is built, so a fan over a huge ring can't run away.
+                        let walls = if h > 0.0 { flat.len() * (4 * 12 + 6 * 4) } else { 0 };
+                        let grown = size(&tri, &lines, &key).saturating_sub(last.map_or(0, |(_, before)| before));
+                        if buffer.len() + built + grown + (flat.len() + open.len()) * 24 + walls > MAX_SCENE_BYTES {
+                            return Err("the scene would be too large; share fewer features".into());
+                        }
                         // Past the triangulator's limits, the cap is a fan over the outer ring, as in
                         // OBJ and STL (the polygon's walls and the rest stay in the scene); its holes'
                         // positions aren't written for it.
