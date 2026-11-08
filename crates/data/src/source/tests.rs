@@ -2899,6 +2899,10 @@ fn geojson_latitude_past_the_poles_is_said_once_with_a_count_by_every_path() {
     assert_eq!(messages, ["1 feature has a latitude past ±90°: longitude and latitude may be swapped"]);
     let (_, messages, _) = geojson_paths("lat95b.geojson", &fc(&[point(60.0, 95.0), point(1.0, -91.0), point(2.0, 3.0), line.to_string()]));
     assert_eq!(messages, ["3 features have a latitude past ±90°: longitude and latitude may be swapped"]);
+    // A swapped position is said even when another position of the feature is far east.
+    let multi = r#"{"type":"Feature","properties":{},"geometry":{"type":"MultiPoint","coordinates":[[60,95],[200,10]]}}"#;
+    let (_, messages, _) = geojson_paths("lat95c.geojson", &fc(&[multi.to_string()]));
+    assert_eq!(messages, ["1 feature has a latitude past ±90°: longitude and latitude may be swapped"]);
     // Clean files, even at the poles and the antimeridian, give nothing; a lone Feature as well.
     let (_, messages, _) = geojson_paths("clean.geojson", &fc(&[point(10.0, 60.0), point(180.0, -90.0), point(-180.0, 90.0)]));
     assert!(messages.is_empty(), "{messages:?}");

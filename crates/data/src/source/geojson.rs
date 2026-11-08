@@ -95,7 +95,7 @@ impl Scan {
                     self.zm.push(u32::try_from(self.places.len()).unwrap_or(u32::MAX));
                 }
                 let e = g.extent();
-                self.swapped += usize::from(latitude_past_poles(&e));
+                self.swapped += usize::from(latitude_past_poles(g));
                 self.extent = self.extent.union(&e);
                 if let Some(slot) = self.kinds.get_mut(kind_slot(g.kind())) {
                     *slot += 1;

@@ -1180,7 +1180,7 @@ impl Collector {
             zm += usize::from(had_z);
             // Converted geometry is already within ±90.5° (or dropped above), so only what is read
             // as longitude/latitude can be swapped.
-            swapped += usize::from(declared.is_none() && geom.as_ref().is_some_and(|g| latitude_past_poles(&g.extent())));
+            swapped += usize::from(declared.is_none() && geom.as_ref().is_some_and(latitude_past_poles));
             ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
         }
         ds.geometry_type = dominant_type(&ds);
@@ -1658,11 +1658,14 @@ pub(crate) fn read_rows(
     Ok((ds, report))
 }
 
-/// Whether an extent could be longitude/latitude with the two swapped: its x within ±180.5° and
-/// its y past the poles (beyond ±90.5°, as the readers check). Eastings and northings, with x far
-/// past 180 too, aren't taken for that.
-pub(crate) fn latitude_past_poles(e: &rustgis_geom::Extent) -> bool {
-    !e.is_empty() && e.min_x >= -180.5 && e.max_x <= 180.5 && (e.min_y < -90.5 || e.max_y > 90.5)
+/// Whether a geometry has a position that could be longitude/latitude with the two swapped: its x
+/// within ±180.5° and its y past the poles (beyond ±90.5°, as the readers check). Eastings and
+/// northings, with x far past 180 too, aren't taken for that. Each position is judged on its own, so
+/// another position elsewhere doesn't hide it.
+pub(crate) fn latitude_past_poles(g: &Geometry) -> bool {
+    let mut past = false;
+    g.for_each_coord(|c| past |= c.x.abs() <= 180.5 && c.y.abs() > 90.5);
+    past
 }
 
 /// The notice for `n` features with a latitude past the poles (none for 0).
