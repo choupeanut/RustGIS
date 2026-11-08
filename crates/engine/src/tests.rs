@@ -24437,6 +24437,68 @@ fn restore_fill_puts_back_what_no_fill_hid() {
     }
 }
 
+/// No Fill again, on a layer it already hides (here one with points, so a transparent fill over
+/// its symbols), changes nothing: a class's fills set while it is on stay, and Restore Fill puts
+/// back what it hid, with no notice when nothing was changed since.
+#[test]
+fn no_fill_again_keeps_what_was_set_while_it_is_on() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
+    use rustgis_map::symbology::ClassRef;
+    let mut ds = Dataset::new("parcels", GeometryType::Polygon, vec![Field::new("kind", FieldType::Text)]);
+    for (i, kind) in ["a", "b"].into_iter().enumerate() {
+        let x = i as f64 * 2.0;
+        let ring = vec![Coord::new(x, 0.0), Coord::new(x + 1.0, 0.0), Coord::new(x + 1.0, 1.0), Coord::new(x, 0.0)];
+        ds.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Attr::Text(kind.into())]);
+    }
+    ds.push(Some(Geometry::Point(Coord::new(10.0, 0.5))), vec![Attr::Text("a".into())]);
+    let mut s = Session::new(Project::default());
+    let id = s.map_mut().add_dataset(ds);
+    s.active_layer = Some(id);
+    s.run("layer.symbology", &json!({"type": "unique", "field": "kind"})).unwrap();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("layer.fillLayers", &json!({"value": "a", "fills": [{"pattern": "hatch"}]})).unwrap();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    let a = ClassRef::Value("a".into());
+    assert_eq!(s.map().layer(id).unwrap().renderer.class_fills(&a).unwrap().len(), 1, "the class's hatch stays");
+    let mark = s.notice_mark();
+    s.run("layer.restoreFill", &Value::Null).unwrap();
+    assert!(s.notices_since(mark).is_empty(), "{:?}", s.notices_since(mark));
+    assert_eq!(s.map().layer(id).unwrap().renderer.class_fills(&a).unwrap().len(), 1, "the class's hatch after Restore Fill");
+    assert!(s.map().layer(id).unwrap().no_fill.is_none(), "No Fill is off");
+}
+
+/// Restore Fill says when a class's hidden fills can't go back because the class has fills of its
+/// own since No Fill, once, with the count; the classes it could put back come back.
+#[test]
+fn restore_fill_says_when_a_class_was_given_fills_since() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
+    use rustgis_map::symbology::ClassRef;
+    let mut ds = Dataset::new("parcels", GeometryType::Polygon, vec![Field::new("kind", FieldType::Text)]);
+    for (i, kind) in ["a", "b"].into_iter().enumerate() {
+        let x = i as f64 * 2.0;
+        let ring = vec![Coord::new(x, 0.0), Coord::new(x + 1.0, 0.0), Coord::new(x + 1.0, 1.0), Coord::new(x, 0.0)];
+        ds.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Attr::Text(kind.into())]);
+    }
+    ds.push(Some(Geometry::Point(Coord::new(10.0, 0.5))), vec![Attr::Text("a".into())]);
+    let mut s = Session::new(Project::default());
+    let id = s.map_mut().add_dataset(ds);
+    s.active_layer = Some(id);
+    s.run("layer.symbology", &json!({"type": "unique", "field": "kind"})).unwrap();
+    s.run("layer.fillLayers", &json!({"value": "a", "fills": [{"pattern": "hatch"}]})).unwrap();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    // Class a has fills of its own again, so its hidden hatch can't go back over them.
+    s.run("layer.fillLayers", &json!({"value": "a", "fills": [{"pattern": "dots"}]})).unwrap();
+    let mark = s.notice_mark();
+    s.run("layer.restoreFill", &Value::Null).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.len() == 1 && said[0].contains("1 class"), "{said:?}");
+    let own = s.map().layer(id).unwrap().renderer.class_fills(&ClassRef::Value("a".into())).unwrap();
+    assert!(
+        matches!(own, [f] if matches!(f.pattern, rustgis_map::fills::FillPattern::Dots { .. })),
+        "class a keeps its own dots, not the hatch No Fill hid: {own:?}"
+    );
+}
+
 /// #1456: a definition query on a streamed source the view filters as it reads (FlatGeobuf)
 /// says nothing, nor on one only filtering what each view reads (GeoJSON read in place) when it
 /// holds no more than a view reads; past that, or when the view read is already a sample, or for

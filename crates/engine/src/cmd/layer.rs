@@ -246,8 +246,12 @@ pub fn commands() -> Vec<C> {
         .params(r##"{"layer"?, "color": "#RRGGBB"|"#RRGGBBAA" (the fill; a polygon's outline is left as it is, set it with layer.outline)}"##),
         C::new("layer.noFill", "No Fill", "Style › Drawing", |s, p| {
             with(s, p, |l| {
-                // What it hides is kept for Restore Fill; on again, it is hidden already.
-                let was_off = l.no_fill.is_none();
+                // On again, it is hidden already: what it hid, and what was set since (a class's
+                // fills, say), stay as they are, and the mode it hides by stays too.
+                if l.no_fill.is_some() {
+                    return;
+                }
+                // What it hides is kept for Restore Fill.
                 let mut hidden = HiddenFills::default();
                 if l.source.is_some() || l.has_geometry(GeometryType::Point) || l.has_geometry(GeometryType::Polyline) {
                     // Symbols are shared by geometry families. A polygon-only fill override
@@ -274,9 +278,7 @@ pub fn commands() -> Vec<C> {
                     });
                     l.no_fill = Some(NoFill::Symbols);
                 }
-                if was_off {
-                    l.hidden_fills = Some(hidden);
-                }
+                l.hidden_fills = Some(hidden);
             })
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_polygon_features)
@@ -284,7 +286,7 @@ pub fn commands() -> Vec<C> {
         C::new("layer.restoreFill", "Restore Fill", "Style › Drawing", |s, p| {
             let id = s.layer_id(p)?;
             let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-            if let Some(lost) = restore_fill(l)? {
+            for lost in restore_fill(l)? {
                 s.notify(lost, false);
             }
             Ok(Value::Null)
@@ -862,26 +864,36 @@ fn show_fill(sym: &mut rustgis_map::Symbol) {
 /// layer's own fills and each class's where it has none now, or, on the symbols path, each fill
 /// still transparent at the opacity it had. Says what it couldn't put back, as when No Fill was
 /// turned on by a RustGIS that kept nothing.
-fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Option<String>, String> {
+fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Vec<String>, String> {
     let hidden = l.hidden_fills.take();
     let kept = hidden.is_some();
     let HiddenFills { alphas, fills, class_fills } = hidden.unwrap_or_default();
+    let mut notes = Vec::new();
     match take_no_fill(l) {
         Some(NoFill::Override) => {
             if l.fill_layers.is_empty() {
                 l.fill_layers = fills;
             }
+            let mut kept_own = 0;
             for (class, f) in class_fills {
                 // A class gone since, or given fills of its own, stays as it is.
                 if l.renderer.class_fills(&class).is_ok_and(<[_]>::is_empty) {
                     l.renderer.set_class_fills(&class, f)?;
+                } else {
+                    kept_own += 1;
                 }
             }
+            if kept_own > 0 {
+                notes.push(format!(
+                    "{}: Restore Fill didn't put back the fills No Fill hid for {kept_own} class(es), as each has fills of its own now or is gone",
+                    l.name
+                ));
+            }
             if !kept {
-                return Ok(Some(format!(
+                notes.push(format!(
                     "{}: Restore Fill can't put back any fill layers the layer or its classes had before No Fill, as the project didn't keep them; add them again with Fill Layers",
                     l.name
-                )));
+                ));
             }
         }
         Some(NoFill::Symbols) => {
@@ -898,16 +910,16 @@ fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Option<String>, String> {
                 }
             });
             if guessed > 0 {
-                return Ok(Some(format!(
+                notes.push(format!(
                     "{}: Restore Fill shows {guessed} fill(s) at the default opacity ({}), as their opacity from before No Fill wasn't kept",
                     l.name,
                     shown_fill_alpha()
-                )));
+                ));
             }
         }
         None => {}
     }
-    Ok(None)
+    Ok(notes)
 }
 
 /// Where a class's symbol comes among [`Renderer::map_symbols`]' (as [`class_symbol`] finds it).

@@ -132,7 +132,7 @@ pub struct HiddenFills {
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "fills::de_fills")]
     pub fills: Vec<fills::FillLayer>,
     /// The classes' own fills before No Fill (taken off).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "de_class_fills")]
     pub class_fills: Vec<(symbology::ClassRef, Vec<fills::FillLayer>)>,
 }
 
@@ -2752,6 +2752,14 @@ fn de_hidden_fills<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Hidd
     Ok(Option::<serde_json::Value>::deserialize(d)?.and_then(|v| serde_json::from_value(v).ok()))
 }
 
+/// [`HiddenFills::class_fills`] read as a layer's own fill stacks are: each stack at most
+/// [`fills::MAX_FILLS`], so a saved stack Restore Fill would refuse still opens.
+fn de_class_fills<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<(symbology::ClassRef, Vec<fills::FillLayer>)>, D::Error> {
+    #[derive(Deserialize)]
+    struct Saved(symbology::ClassRef, #[serde(deserialize_with = "fills::de_fills")] Vec<fills::FillLayer>);
+    Ok(Vec::<Saved>::deserialize(d)?.into_iter().map(|Saved(class, f)| (class, f)).collect())
+}
+
 /// Reads a layer's reference scale as `layer.referenceScale` would leave it: one out of
 /// [`REFERENCE_SCALES`] (or not a number) is none. A project file is hostile input.
 fn de_reference_scale<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
@@ -3232,6 +3240,17 @@ mod tests {
             v["hidden_fills"] = unknown.clone();
             assert_eq!(serde_json::from_value::<Layer>(v.clone()).unwrap().hidden_fills, None, "{unknown}");
         }
+    }
+
+    #[test]
+    fn a_saved_class_stack_reads_bounded_like_a_layer_stack() {
+        // Restore Fill would refuse a class stack past MAX_FILLS, so a saved one reads at most that.
+        let stack: Vec<_> = (0..fills::MAX_FILLS + 4).map(|_| serde_json::json!({})).collect();
+        let saved = serde_json::json!({"class_fills": [[{"Index": 1}, stack]]});
+        let read: HiddenFills = serde_json::from_value(saved).unwrap();
+        assert_eq!(read.class_fills.len(), 1);
+        assert_eq!(read.class_fills[0].0, symbology::ClassRef::Index(1));
+        assert_eq!(read.class_fills[0].1.len(), fills::MAX_FILLS);
     }
 
     #[test]
