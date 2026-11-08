@@ -249,9 +249,12 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
         "webScene" => {
             let mut m = map_of(s, p)?;
             m.layers.iter_mut().filter(|l| shared_layer("webScene", l)).try_for_each(load_whole)?;
-            let (bytes, fanned) = gltf(&m, s.view_size)?;
+            let SceneBytes { bytes, fanned, out_of_range } = gltf(&m, s.view_size)?;
             if fanned > 0 {
                 s.notify(super::items::fanned_caps_note(fanned), false);
+            }
+            if out_of_range > 0 {
+                s.notify(format!("{out_of_range} polygon(s) left out of the scene: a coordinate is too far from the map's centre"), false);
             }
             Ok((m.name.clone(), bytes, m.name.clone()))
         }
@@ -924,12 +927,20 @@ fn find(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"matches": out}))
 }
 
+/// A glTF scene's bytes, and what it approximates or leaves out.
+struct SceneBytes {
+    bytes: Vec<u8>,
+    fanned: usize,
+    out_of_range: usize,
+}
+
 /// A glTF 2.0 scene (embedded buffer): polygon layers extruded by their extrusion setting (flat
 /// otherwise), lines and points, coloured by their symbology. Metres east (x), up (y) and south
 /// (z) of the map's centre, with a camera where the map view (`view` points across) looks
 /// from: its bearing and pitch, as far off as MapLibre's camera would be. Also the number of
-/// polygon caps that are fans over the outer ring (the triangulator gave up, or fell back to one).
-fn gltf(m: &Map, view: (f64, f64)) -> Result<(Vec<u8>, usize), String> {
+/// polygon caps that are fans over the outer ring (the triangulator gave up, or fell back to one),
+/// and of polygons left out because a position is too far from the centre for 32 bits.
+fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
     let c = m.center_lonlat();
     let origin = rustgis_geom::lonlat_to_merc(c);
     let k = c.y.to_radians().cos().abs().max(0.01);
@@ -940,7 +951,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<(Vec<u8>, usize), String> {
     let mut buffer: Vec<u8> = Vec::new();
     let (mut views, mut accessors, mut meshes, mut nodes, mut materials) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut budget = MAX_FEATURES;
-    let mut fanned = 0usize;
+    let (mut fanned, mut out_of_range) = (0usize, 0usize);
     for l in m.layers.iter().rev().filter(|l| l.visible && !l.is_raster()) {
         // Per colour, its positions and (for triangles) indices.
         // Ordered, so the same scene always writes the same file.
@@ -999,15 +1010,24 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<(Vec<u8>, usize), String> {
                         let open: Vec<Vec<(f64, f64)>> =
                             std::iter::once(outer.clone()).chain(open.iter().skip(1).filter(|r| r.len() >= 3).cloned()).collect();
                         let Some(outer) = open.first() else { continue };
+                        // A position too far for 32 bits would make the scene invalid: the polygon is
+                        // left out, and said.
+                        if open.iter().flatten().any(|p| !p.0.is_finite() || !p.1.is_finite()) {
+                            out_of_range += 1;
+                            continue;
+                        }
+                        let flat: Vec<(f64, f64)> = open.iter().flatten().copied().collect();
                         // Past the triangulator's limits, the cap is a fan over the outer ring, as in
-                        // OBJ and STL (the polygon's walls and the rest stay in the scene).
-                        let (tris, fan) = rustgis_geom::triangulate::triangulate_reporting(outer, open.get(1..).unwrap_or(&[]))
-                            .unwrap_or_else(|| ((1..outer.len().saturating_sub(1)).map(|i| [0, i, i + 1]).collect(), true));
+                        // OBJ and STL (the polygon's walls and the rest stay in the scene); its holes'
+                        // positions aren't written for it.
+                        let (tris, fan, cap) = match rustgis_geom::triangulate::triangulate_reporting(outer, open.get(1..).unwrap_or(&[])) {
+                            Some((tris, fan)) => (tris, fan, flat.len()),
+                            None => ((1..outer.len().saturating_sub(1)).map(|i| [0, i, i + 1]).collect(), true, outer.len()),
+                        };
                         fanned += usize::from(fan);
                         let (pos, idx) = tri.entry(key).or_default();
-                        let flat: Vec<(f64, f64)> = open.iter().flatten().copied().collect();
                         let base = pos.len() as u32;
-                        for (x, z) in &flat {
+                        for (x, z) in flat.get(..cap).unwrap_or(&[]) {
                             pos.push([*x as f32, h, *z as f32]);
                         }
                         for t in &tris {
@@ -1133,7 +1153,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<(Vec<u8>, usize), String> {
         "extras": {"origin": [c.x, c.y], "units": "metres east, up and south of origin (longitude, latitude)",
             "bearing": at.bearing, "pitch": at.pitch},
     });
-    serde_json::to_vec(&doc).map(|b| (b, fanned)).map_err(|e| e.to_string())
+    serde_json::to_vec(&doc).map(|b| SceneBytes { bytes: b, fanned, out_of_range }).map_err(|e| e.to_string())
 }
 
 /// The glTF camera of a scene and the node placing it: looking at the map's centre (the scene's

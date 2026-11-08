@@ -32477,6 +32477,26 @@ fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
     let mut clean = mesh_session(json!([mesh_feature(square(0.0, false), 30.0)]));
     clean.run("share.webScene", &json!({"path": path})).unwrap();
     assert!(!clean.notices.iter().any(|n| n.text.contains("couldn't be triangulated")), "{:?}", clean.notices);
+    // A fan over the outer ring writes no positions for the holes it can't use (the layer isn't
+    // extruded, so the cap's are all there are).
+    let hole = [[0.001, 0.001], [0.002, 0.001], [0.0015, 0.002], [0.001, 0.001]];
+    let mut holed = mesh_session(json!([mesh_feature(json!({"type": "Polygon", "coordinates": [big, hole]}), 30.0)]));
+    holed.run("share.webScene", &json!({"path": path})).unwrap();
+    let g: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let counts: Vec<u64> =
+        g["accessors"].as_array().unwrap().iter().filter(|a| a["type"] == "VEC3").filter_map(|a| a["count"].as_u64()).collect();
+    assert_eq!(counts, [5001]);
+    // A polygon too far from the centre for 32-bit positions is left out and said, not written as infinity.
+    let far = json!({"type": "Polygon", "coordinates": [[[1e40, 0.0], [1e40, 0.01], [1.01e40, 0.0], [1e40, 0.0]]]});
+    let mut s = mesh_session(json!([mesh_feature(far, 30.0), mesh_feature(square(0.0, false), 30.0)]));
+    s.run("share.webScene", &json!({"path": path})).unwrap();
+    assert!(
+        s.notices.iter().any(|n| n.text == "1 polygon(s) left out of the scene: a coordinate is too far from the map's centre"),
+        "{:?}",
+        s.notices
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(serde_json::from_str::<Value>(&text).is_ok() && !text.contains("null"), "{text}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
