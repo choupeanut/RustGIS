@@ -32422,7 +32422,62 @@ fn stl_fans_a_cap_past_the_triangulator_limit_and_says_so() {
     assert!(!stl_triangles(&bytes).is_empty());
     let said = |part: &str| s.notices.iter().any(|n| n.text.contains(part));
     assert!(said("1 polygon cap(s) couldn't be triangulated"));
-    assert!(said("holes are filled"));
+    assert!(said("holes may be filled"));
+}
+
+/// A polygon the triangulator can only finish as a fan: a hole sharing the outer ring's whole left
+/// side (the geom crate's `a_ring_left_with_no_ear_is_finished_as_a_fan_and_says_so`), in degrees.
+fn fan_polygon() -> Value {
+    json!({"type": "Polygon", "coordinates": [
+        [[0.0, 0.0], [0.04, 0.0], [0.04, 0.04], [0.0, 0.04], [0.0, 0.0]],
+        [[0.0, 0.0], [0.03, 0.02], [0.0, 0.04], [0.0, 0.0]]]})
+}
+
+#[test]
+fn three_d_exports_count_internal_fans_with_the_others_and_clean_caps_say_nothing() {
+    for kind in ["obj", "stl"] {
+        // A cap the triangulator can only finish as a fan is reported like one it gave up on.
+        let mut s = mesh_session(json!([mesh_feature(fan_polygon(), 30.0), mesh_feature(square(0.0, false), 30.0)]));
+        crate::cmd::items::item_bytes(&mut s, kind, &json!({"heightField": "h"})).unwrap();
+        let said = |part: &str| s.notices.iter().any(|n| n.text.contains(part));
+        assert!(said("1 polygon cap(s) couldn't be triangulated"), "{kind}: {:?}", s.notices);
+        // Clean caps give no such notice.
+        let mut clean = mesh_session(json!([mesh_feature(square(0.0, false), 30.0)]));
+        crate::cmd::items::item_bytes(&mut clean, kind, &json!({"heightField": "h"})).unwrap();
+        assert!(!clean.notices.iter().any(|n| n.text.contains("couldn't be triangulated")), "{kind}: {:?}", clean.notices);
+    }
+}
+
+#[test]
+fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
+    let dir = std::env::temp_dir().join(format!("rustgis-scene-fans-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scene.gltf").display().to_string();
+    // One cap past the triangulator's limit (5001 vertices) and one it finishes as a fan: two caps, one notice.
+    let big: Vec<[f64; 2]> = (0..5001)
+        .map(|i| {
+            let a = i as f64 * std::f64::consts::TAU / 5001.0;
+            [0.01 * a.cos(), 0.01 * a.sin()]
+        })
+        .collect();
+    let mut s = mesh_session(json!([
+        mesh_feature(json!({"type": "Polygon", "coordinates": [big]}), 30.0),
+        mesh_feature(fan_polygon(), 30.0),
+        mesh_feature(square(0.0, false), 30.0),
+    ]));
+    s.run("share.webScene", &json!({"path": path})).unwrap();
+    let said: Vec<&str> = s.notices.iter().map(|n| n.text.as_str()).filter(|t| t.contains("couldn't be triangulated")).collect();
+    assert_eq!(said.len(), 1, "{:?}", s.notices);
+    assert!(said[0].starts_with("2 polygon cap(s) couldn't be triangulated"), "{said:?}");
+    // The oversized polygon is still in the scene (as a fan), not skipped.
+    let g: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let max_count = g["accessors"].as_array().unwrap().iter().filter_map(|a| a["count"].as_u64()).max().unwrap();
+    assert!(max_count >= 5001 * 3, "{max_count}");
+    // A clean scene says nothing about caps.
+    let mut clean = mesh_session(json!([mesh_feature(square(0.0, false), 30.0)]));
+    clean.run("share.webScene", &json!({"path": path})).unwrap();
+    assert!(!clean.notices.iter().any(|n| n.text.contains("couldn't be triangulated")), "{:?}", clean.notices);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
