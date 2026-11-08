@@ -1178,7 +1178,9 @@ impl Collector {
                 }
             }
             zm += usize::from(had_z);
-            swapped += usize::from(geom.as_ref().is_some_and(|g| latitude_past_poles(&g.extent())));
+            // Converted geometry is already within ±90.5° (or dropped above), so only what is read
+            // as longitude/latitude can be swapped.
+            swapped += usize::from(declared.is_none() && geom.as_ref().is_some_and(|g| latitude_past_poles(&g.extent())));
             ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
         }
         ds.geometry_type = dominant_type(&ds);

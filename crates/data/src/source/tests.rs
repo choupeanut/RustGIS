@@ -2902,6 +2902,10 @@ fn geojson_latitude_past_the_poles_is_said_once_with_a_count_by_every_path() {
     // Clean files, even at the poles and the antimeridian, give nothing; a lone Feature as well.
     let (_, messages, _) = geojson_paths("clean.geojson", &fc(&[point(10.0, 60.0), point(180.0, -90.0), point(-180.0, 90.0)]));
     assert!(messages.is_empty(), "{messages:?}");
+    // Within the readers' ±90.5° tolerance is still not past the poles.
+    let (_, messages, _) =
+        geojson_paths("tolerance.geojson", &fc(&[point(1.0, 90.2), point(1.0, -90.2), point(180.5, 90.5), point(-180.5, -90.5)]));
+    assert!(messages.is_empty(), "{messages:?}");
     let (_, report) = crate::io::read_geojson(&point(60.0, 95.0), "x").unwrap();
     assert_eq!(report.messages.len(), 1, "{:?}", report.messages);
     let (_, report) = crate::io::read_geojson(&point(10.0, 60.0), "x").unwrap();
@@ -2916,5 +2920,10 @@ fn geojson_in_a_declared_projected_system_is_not_taken_for_swapped() {
     // Northings far past 90 are what RD New coordinates are: they convert, so nothing is said.
     let (ds, messages, _) = geojson_paths("rd-quiet.geojson", &rd_geojson(Some(&named("EPSG:28992"))));
     assert!(in_arnhem(&ds.extent()));
+    assert!(messages.is_empty(), "{messages:?}");
+    // Web Mercator metres that would look like a latitude past the poles if read as degrees.
+    let point = r#"{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[10,100]}}"#;
+    let (ds, messages, _) = geojson_paths("merc-quiet.geojson", &merc_collection(&[point]));
+    assert_eq!(ds.features.len(), 1);
     assert!(messages.is_empty(), "{messages:?}");
 }
