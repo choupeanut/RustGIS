@@ -979,13 +979,24 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
             }
             let Some(g) = &ft.geometry else { continue };
             // A position too far for 32 bits would make the scene invalid: the feature is left out,
-            // and said.
-            let mut finite = true;
-            g.for_each_coord(|c| {
-                let (x, z) = xy(c);
-                finite &= x.is_finite() && z.is_finite();
-            });
-            if !finite {
+            // and said. Only what would be drawn counts (not a degenerate ring or a one-vertex line).
+            let far = |c: &Coord| {
+                let (x, z) = xy(*c);
+                !x.is_finite() || !z.is_finite()
+            };
+            let drawn = |r: &&Vec<Coord>| r.len() - usize::from(r.len() > 1 && r.first() == r.last()) >= 3;
+            let too_far = match g {
+                Geometry::Polygon(polys) => polys
+                    .iter()
+                    .filter(|rings| rings.first().is_some_and(|r| drawn(&r)))
+                    .flat_map(|rings| rings.iter().filter(drawn))
+                    .flatten()
+                    .any(far),
+                Geometry::Line(parts) => parts.iter().filter(|p| p.len() >= 2).flatten().any(far),
+                Geometry::Point(p) => far(p),
+                Geometry::MultiPoint(ps_) => ps_.iter().any(far),
+            };
+            if too_far {
                 out_of_range += 1;
                 continue;
             }
@@ -1022,20 +1033,23 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                             std::iter::once(outer.clone()).chain(open.iter().skip(1).filter(|r| r.len() >= 3).cloned()).collect();
                         let Some(outer) = open.first() else { continue };
                         let flat: Vec<(f64, f64)> = open.iter().flatten().copied().collect();
-                        // At most what this polygon adds (its cap's positions and indices, and its
-                        // walls), checked before it is built, so a fan over a huge ring can't run away.
-                        let walls = if h > 0.0 { flat.len() * (4 * 12 + 6 * 4) } else { 0 };
-                        let grown = size(&tri, &lines, &key).saturating_sub(last.map_or(0, |(_, before)| before));
-                        if buffer.len() + built + grown + (flat.len() + open.len()) * 24 + walls > MAX_SCENE_BYTES {
-                            return Err("the scene would be too large; share fewer features".into());
-                        }
                         // Past the triangulator's limits, the cap is a fan over the outer ring, as in
                         // OBJ and STL (the polygon's walls and the rest stay in the scene); its holes'
                         // positions aren't written for it.
-                        let (tris, fan, cap) = match rustgis_geom::triangulate::triangulate_reporting(outer, open.get(1..).unwrap_or(&[])) {
-                            Some((tris, fan)) => (tris, fan, flat.len()),
-                            None => ((1..outer.len().saturating_sub(1)).map(|i| [0, i, i + 1]).collect(), true, outer.len()),
+                        let found = rustgis_geom::triangulate::triangulate_reporting(outer, open.get(1..).unwrap_or(&[]));
+                        let (cap, triangles) = match &found {
+                            Some((tris, _)) => (flat.len(), tris.len()),
+                            None => (outer.len(), outer.len().saturating_sub(2)),
                         };
+                        // What this polygon adds (its cap's positions and indices, and its walls),
+                        // checked before it is built, so a fan over a huge ring can't run away.
+                        let walls = if h > 0.0 { flat.len() * (4 * 12 + 6 * 4) } else { 0 };
+                        let grown = size(&tri, &lines, &key).saturating_sub(last.map_or(0, |(_, before)| before));
+                        if buffer.len() + built + grown + cap * 12 + triangles * 12 + walls > MAX_SCENE_BYTES {
+                            return Err("the scene would be too large; share fewer features".into());
+                        }
+                        let (tris, fan) =
+                            found.unwrap_or_else(|| ((1..outer.len().saturating_sub(1)).map(|i| [0, i, i + 1]).collect(), true));
                         fanned += usize::from(fan);
                         let (pos, idx) = tri.entry(key).or_default();
                         let base = pos.len() as u32;

@@ -32479,6 +32479,8 @@ fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
     let hole = [[0.001, 0.001], [0.002, 0.001], [0.0015, 0.002], [0.001, 0.001]];
     let mut holed = mesh_session(json!([mesh_feature(json!({"type": "Polygon", "coordinates": [big, hole]}), 30.0)]));
     holed.run("share.webScene", &json!({"path": path})).unwrap();
+    let said: Vec<&str> = holed.notices.iter().map(|n| n.text.as_str()).filter(|t| t.contains("couldn't be triangulated")).collect();
+    assert!(matches!(said[..], [t] if t.starts_with("1 polygon cap(s) couldn't be triangulated")), "{:?}", holed.notices);
     let g: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let prim = &g["meshes"][0]["primitives"][0];
     let accessor = |i: &Value| &g["accessors"][i.as_u64().unwrap() as usize];
@@ -32490,6 +32492,13 @@ fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.decode(uri.split_once(",").unwrap().1).unwrap()
     };
+    // The indices are the fan from the ring's first vertex, wound to face up: (0, i + 1, i).
+    let ia = accessor(&prim["indices"]);
+    let iv = &g["bufferViews"][ia["bufferView"].as_u64().unwrap() as usize];
+    let istart = (iv["byteOffset"].as_u64().unwrap_or(0) + ia["byteOffset"].as_u64().unwrap_or(0)) as usize;
+    let indices: Vec<u32> = bytes[istart..istart + 4999 * 3 * 4].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let fan: Vec<u32> = (1..5000u32).flat_map(|i| [0, i + 1, i]).collect();
+    assert_eq!(indices, fan);
     let view = &g["bufferViews"][at["bufferView"].as_u64().unwrap() as usize];
     let start = (view["byteOffset"].as_u64().unwrap_or(0) + at["byteOffset"].as_u64().unwrap_or(0)) as usize;
     let xz: Vec<(f64, f64)> = bytes[start..start + 5001 * 12]
@@ -32516,6 +32525,11 @@ fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
     );
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(serde_json::from_str::<Value>(&text).is_ok() && !text.contains("null"), "{text}");
+    // A far ring the scene wouldn't draw anyway (two vertices) isn't counted as left out for it.
+    let flat_far = json!({"type": "Polygon", "coordinates": [[[1e40, 0.0], [0.0, 0.01], [1e40, 0.0]]]});
+    let mut s = mesh_session(json!([mesh_feature(flat_far, 30.0), mesh_feature(square(0.0, false), 30.0)]));
+    s.run("share.webScene", &json!({"path": path})).unwrap();
+    assert!(!s.notices.iter().any(|n| n.text.contains("left out of the scene")), "{:?}", s.notices);
     let _ = std::fs::remove_dir_all(dir);
 }
 

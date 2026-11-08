@@ -9,9 +9,10 @@ vectors as a layout's PDF is (see Layouts), in the system viewer on desktop; **C
 Clipboard** copies a map image. **Export To 3D** writes a layer as a Wavefront OBJ or binary STL model
 with polygons extruded by a field (`share.export3d` writes STL when `path` ends in `.stl`). STL
 holds closed solids only: lines and zero-height features are left out, zero-area triangles are
-skipped, and a cap that can't be triangulated is fanned over its outer ring, filling any holes, as
-is one the triangulator can only finish as a fan (a hole touching the outer ring along an edge, for
-example); the notices say how many. OBJ
+skipped, and a cap that can't be triangulated is fanned over its outer ring, filling any holes; one
+the triangulator can only finish as a fan (a hole touching the outer ring along an edge, for
+example) is fanned over what is left of it. Either fan may spill outside the polygon; the notices
+say how many. OBJ
 uses metres east, up and south of the layer's south-west corner (Y up). STL uses metres east and
 north of the model's own south-west corner, which includes the cubes drawn for points and so can
 lie past the layer's, and up from the features' base (Z up, as slicers expect; a negative height
@@ -91,8 +92,9 @@ in the browser. The Share As commands accept a `path`; without one they use the 
   to another project; `model` chooses a model by name.
 - **Web Scene** (`share.webScene`): the visible vector layers as glTF, polygons extruded by their
   layer's extrusion setting, with a camera that looks at the map's centre from its bearing and pitch.
-  A cap that can't be triangulated is fanned over its outer ring, as in OBJ and STL, and a notice
-  says how many. A feature with a coordinate too far from the map's centre for the scene's 32-bit
+  Caps are fanned as in OBJ and STL: over the outer ring when the cap can't be triangulated
+  (filling any holes), or over what is left of it when the triangulator can only finish it as a
+  fan. Either fan may spill outside the polygon, and a notice says how many caps are fans. A feature with a coordinate too far from the map's centre for the scene's 32-bit
   positions is left out, and a notice says how many.
 - **Web Link Chart** (`share.linkChart`): the features joined by the map's relationships as a
   node-link HTML page; `relationship` limits it to one relationship.
