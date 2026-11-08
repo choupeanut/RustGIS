@@ -32512,6 +32512,13 @@ fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
     let radii: Vec<f64> = xz.iter().map(|(x, z)| ((x - cx).powi(2) + (z - cz).powi(2)).sqrt()).collect();
     let (lo, hi) = radii.iter().fold((f64::MAX, 0.0f64), |(lo, hi), r| (lo.min(*r), hi.max(*r)));
     assert!(hi - lo < hi * 0.01, "positions off the outer ring: {lo}..{hi}");
+    // In the ring's own order: vertex i at angle i·τ/5001 (east, and south is +z).
+    for (i, (x, z)) in xz.iter().enumerate() {
+        let a = i as f64 * std::f64::consts::TAU / 5001.0;
+        let (ex, ez) = (a.cos(), -a.sin());
+        let (dx, dz) = ((x - cx) / hi, (z - cz) / hi);
+        assert!((dx - ex).abs() < 0.01 && (dz - ez).abs() < 0.01, "vertex {i} out of order: ({dx}, {dz})");
+    }
     // Features too far from the centre for 32-bit positions (a polygon, a line) are left out and
     // said, not written as infinity.
     let far = json!({"type": "Polygon", "coordinates": [[[1e40, 0.0], [1e40, 0.01], [1.01e40, 0.0], [1e40, 0.0]]]});

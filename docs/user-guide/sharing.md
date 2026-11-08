@@ -94,8 +94,11 @@ in the browser. The Share As commands accept a `path`; without one they use the 
   layer's extrusion setting, with a camera that looks at the map's centre from its bearing and pitch.
   Caps are fanned as in OBJ and STL: over the outer ring when the cap can't be triangulated
   (filling any holes), or over what is left of it when the triangulator can only finish it as a
-  fan. Either fan may spill outside the polygon, and a notice says how many caps are fans. A feature with a coordinate too far from the map's centre for the scene's 32-bit
-  positions is left out, and a notice says how many.
+  fan. Either fan may spill outside the polygon, and a notice says how many caps are fans. A
+  feature with a coordinate too far from the map's centre for the scene's 32-bit positions is left
+  out, and a notice says how many. Only what the scene draws counts: rings with at least three
+  vertices (besides the closing one) and line parts with at least two. A polygon whose outer ring
+  is shorter is skipped anyway, and isn't counted.
 - **Web Link Chart** (`share.linkChart`): the features joined by the map's relationships as a
   node-link HTML page; `relationship` limits it to one relationship.
 
