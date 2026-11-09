@@ -1019,7 +1019,9 @@ fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Vec<String>, String> {
                 let why = if changed_since {
                     "the layer's classes changed since No Fill, so the opacities it kept don't match them"
                 } else {
-                    "their opacity from before No Fill wasn't kept"
+                    // Kept by none of the No Fills: from before the first (an earlier RustGIS's),
+                    // or shown and hidden again since.
+                    "the opacity they had before No Fill hid them wasn't kept"
                 };
                 notes.push(format!(
                     "{}: Restore Fill shows {guessed} fill(s) at the default opacity ({}), as {why}",
