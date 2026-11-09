@@ -77,7 +77,7 @@ const GEOMETRIES: &[&str] = &[
 /// Geometry elements this reader doesn't take as a feature's shape: the instantiable members of
 /// the substitution groups of `gml:AbstractGeometry`, `gml:AbstractSurfacePatch` and
 /// `gml:AbstractCurveSegment` in the GML 3.2.1 schema (geometryBasic0d1d.xsd, geometryAggregates.xsd,
-/// geometryComplexes.xsd, geometryPrimitives.xsd at schemas.opengis.net/gml/3.2.1) that aren't in
+/// geometryComplexes.xsd, geometryPrimitives.xsd, grids.xsd at schemas.opengis.net/gml/3.2.1) that aren't in
 /// [`GEOMETRIES`].
 const SHAPES_NOT_READ: &[&str] = &[
     "Arc",
@@ -105,11 +105,13 @@ const SHAPES_NOT_READ: &[&str] = &[
     "CompositeSolid",
     "CompositeSurface",
     "GeometricComplex",
+    "Grid",
     "MultiGeometry",
     "MultiSolid",
     "OrientableCurve",
     "OrientableSurface",
     "PolyhedralSurface",
+    "RectifiedGrid",
     "Ring",
     "Shell",
     "Solid",
@@ -291,19 +293,28 @@ fn parts_lost(g: &Node) -> usize {
                 (kind, local(x)),
                 ("MultiPoint", "Point")
                     | ("MultiLineString" | "MultiCurve", "LineString" | "Curve")
-                    | ("MultiPolygon" | "MultiSurface", "Polygon" | "PolygonPatch")
+                    | ("MultiPolygon" | "MultiSurface", "Polygon" | "PolygonPatch" | "Triangle" | "Rectangle")
             )
     };
-    let gives = |x: &Node| match kind {
-        "MultiPoint" => coords(x, &scratch).is_some_and(|c| !c.is_empty()),
-        "MultiLineString" | "MultiCurve" => coords(x, &scratch).is_some_and(|c| c.len() >= 2),
+    // Triangles and rectangles are patches the reader doesn't keep.
+    let gives = |x: &Node| match (kind, local(x)) {
+        (_, "Triangle" | "Rectangle") => false,
+        ("MultiPoint", _) => coords(x, &scratch).is_some_and(|c| !c.is_empty()),
+        ("MultiLineString" | "MultiCurve", _) => coords(x, &scratch).is_some_and(|c| c.len() >= 2),
         _ => polygon(x, &scratch, &Cell::new(0)).is_some(),
     };
+    // A member nested in a part (a composite's `surfaceMember`) that is only a reference.
+    let reference = |x: &Node| x.is_element() && is_gml(x) && local(x).ends_with("Member") && !x.children().any(|c| c.is_element());
     // A member lost whole (a reference, no part in it) counts once; one holding parts counts those
-    // it can't give, so a member with one part read and one not says the second.
+    // it can't give and the references nested in it, so a member with one part read and one not
+    // says the second.
     let lost = |part: Node| {
         let leaves: Vec<Node> = part.descendants().filter(&leaf).collect();
-        if leaves.is_empty() { 1 } else { leaves.iter().filter(|x| !gives(x)).count() }
+        if leaves.is_empty() {
+            1
+        } else {
+            leaves.iter().filter(|x| !gives(x)).count() + part.descendants().skip(1).filter(&reference).count()
+        }
     };
     // A member property holds one part (`curveMember`), a members property several (`curveMembers`).
     g.children()
@@ -909,6 +920,22 @@ mod tests {
         assert!(lossy[0].0.features[0].geometry.is_some());
         let clean = read("m.gml", member("10 48 12 48 12 49 10 48").as_bytes()).unwrap();
         assert!(!said(&clean[0], "multi-geometries"), "{:?}", clean[0].1.messages);
+        assert!(matches!(&clean[0].0.features[0].geometry, Some(Geometry::Polygon(p)) if p.len() == 2));
+        // A triangle beside a patch read, and a reference nested in a composite beside a polygon
+        // read: each is a part not read.
+        let tri = "<gml:Triangle><gml:exterior><gml:LinearRing><gml:posList>10 48 11 48 11 49 10 48</gml:posList></gml:LinearRing></gml:exterior></gml:Triangle>";
+        let gml = doc(&format!(
+            "<wfs:member><app:p><app:g><gml:MultiSurface><gml:surfaceMember><gml:Surface><gml:patches>{}{tri}</gml:patches></gml:Surface></gml:surfaceMember></gml:MultiSurface></app:g></app:p></wfs:member>",
+            patch("10 48 11 48 11 49 10 48")
+        ));
+        let layers = read("m.gml", gml.as_bytes()).unwrap();
+        assert!(said(&layers[0], "m: 1 part of multi-geometries not read"), "{:?}", layers[0].1.messages);
+        let gml = doc(
+            "<wfs:member><app:p><app:g><gml:MultiSurface><gml:surfaceMember><gml:CompositeSurface><gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing><gml:posList>10 48 11 48 11 49 10 48</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember><gml:surfaceMember xlink:href=\"#s\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"/></gml:CompositeSurface></gml:surfaceMember></gml:MultiSurface></app:g></app:p></wfs:member>",
+        );
+        let layers = read("m.gml", gml.as_bytes()).unwrap();
+        assert!(layers[0].0.features[0].geometry.is_some());
+        assert!(said(&layers[0], "m: 1 part of multi-geometries not read"), "{:?}", layers[0].1.messages);
     }
 
     /// #1620: an interior ring left out is said (already so since #1612).
@@ -948,6 +975,10 @@ mod tests {
         );
         let layers = read("o.gml", gml.as_bytes()).unwrap();
         assert!(said(&layers[0], "further shapes (z, b, a)"), "{:?}", layers[0].1.messages);
+        // A grid (gml:AbstractImplicitGeometry) is a shape not read, the feature's only one here.
+        let gml = doc("<wfs:member><app:n><app:cover><gml:RectifiedGrid gml:id=\"g\" dimension=\"2\"/></app:cover></app:n></wfs:member>");
+        let layers = read("g.gml", gml.as_bytes()).unwrap();
+        assert_eq!(layers[0].1.skipped, 1, "{:?}", layers[0].1.messages);
         let gml = doc("<wfs:member><app:n><app:note><gml:description>x</gml:description></app:note></app:n></wfs:member>");
         let layers = read("d.gml", gml.as_bytes()).unwrap();
         assert_eq!(layers[0].1.skipped, 0, "{:?}", layers[0].1.messages);
