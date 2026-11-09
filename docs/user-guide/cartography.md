@@ -132,7 +132,9 @@ the Single Symbol editor, or `layer.outline` for all classes. Undo restores the 
 the button also changes to **Restore Fill**, which puts the fills back as they were: their
 colours and opacities, the layer's own fill layers and each class's. A fill that was transparent
 before No Fill stays transparent, and a class colour, outline or label changed while No Fill is on
-is kept. A new symbology, colour scheme or fill colour (`layer.symbology`, `layer.ramp`,
+is kept. Fills shown while No Fill is on (a class's fill layers, or a class colour with an
+opacity) show until No Fill is chosen again, which hides them too and keeps them for Restore Fill
+in place of what it kept for those classes. A new symbology, colour scheme or fill colour (`layer.symbology`, `layer.ramp`,
 `layer.color`), or fill layers in the symbol's colour for the whole layer (`layer.fillLayers`),
 turn No Fill off and draw the fills themselves, so Restore Fill is then no longer offered. A
 project saved with No Fill on by an earlier RustGIS doesn't record the fills: Restore Fill then

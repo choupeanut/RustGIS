@@ -24764,7 +24764,8 @@ fn no_fill_again_keeps_what_was_set_while_it_is_on() {
     s.run("layer.fillLayers", &json!({"value": "a", "fills": [{"pattern": "hatch"}]})).unwrap();
     s.run("layer.noFill", &Value::Null).unwrap();
     let a = ClassRef::Value("a".into());
-    assert_eq!(s.map().layer(id).unwrap().renderer.class_fills(&a).unwrap().len(), 1, "the class's hatch stays");
+    // No Fill on again hides the hatch too, keeping it for Restore Fill.
+    assert!(s.map().layer(id).unwrap().renderer.class_fills(&a).unwrap().is_empty(), "the class's hatch is hidden");
     let mark = s.notice_mark();
     s.run("layer.restoreFill", &Value::Null).unwrap();
     assert!(s.notices_since(mark).is_empty(), "{:?}", s.notices_since(mark));
@@ -24805,6 +24806,42 @@ fn no_fill_again_is_no_step_to_undo() {
     s.run("layer.noFill", &Value::Null).unwrap();
     assert_eq!((s.undo.len(), s.redo.len(), s.dirty()), (undo, redo, dirty));
     assert!(s.map().layer(id).unwrap().no_fill.is_some());
+}
+
+/// No Fill on again hides what was shown since, on both paths, as one undo step; Restore Fill then
+/// shows it as it was shown.
+#[test]
+fn no_fill_again_hides_what_was_shown_since() {
+    use rustgis_map::symbology::ClassRef;
+    // Symbols: a class's colour with an opacity, chosen while No Fill is on, shows that class.
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("layer.classStyle", &json!({"value": "a", "color": "#11223380"})).unwrap();
+    let alphas = |s: &Session| {
+        let mut out = Vec::new();
+        s.map().layer(id).unwrap().renderer.clone().map_symbols(|sym| out.push(sym.fill.a()));
+        out
+    };
+    assert!(alphas(&s).contains(&0x80));
+    let undo = s.undo.len();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    assert!(alphas(&s).iter().all(|a| *a == 0), "{:?}", alphas(&s));
+    assert_eq!(s.undo.len(), undo + 1);
+    s.run("layer.restoreFill", &Value::Null).unwrap();
+    assert!(alphas(&s).contains(&0x80), "{:?}", alphas(&s));
+    // Override: a class's fills set while No Fill is on are hidden, and kept in place of the
+    // class's earlier ones.
+    let (mut s, id) = no_fill_layer(true);
+    let c = ClassRef::Value("c".into());
+    s.run("layer.fillLayers", &json!({"value": "c", "fills": [{"pattern": "hatch"}]})).unwrap();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("layer.fillLayers", &json!({"value": "c", "fills": [{"pattern": "dots"}, {"pattern": "hatch"}]})).unwrap();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    assert!(s.map().layer(id).unwrap().renderer.class_fills(&c).unwrap().is_empty());
+    let mark = s.notice_mark();
+    s.run("layer.restoreFill", &Value::Null).unwrap();
+    assert!(s.notices_since(mark).is_empty(), "{:?}", s.notices_since(mark));
+    assert_eq!(s.map().layer(id).unwrap().renderer.class_fills(&c).unwrap().len(), 2, "the dots and hatch set last");
 }
 
 /// Restore Fill after an undo puts back what No Fill hid, on both paths: the symbols' own
