@@ -136,8 +136,10 @@ is kept. Fills shown while No Fill is on (a class's fill layers, or a class colo
 opacity) show until No Fill is chosen again, which hides them too and keeps them for Restore Fill
 in place of what it kept for those classes. A new symbology, colour scheme or fill colour (`layer.symbology`, `layer.ramp`,
 `layer.color`), or fill layers in the symbol's colour for the whole layer (`layer.fillLayers`),
-turn No Fill off and draw the fills themselves, so Restore Fill is then no longer offered. A
-project saved with No Fill on by an earlier RustGIS doesn't record the fills: Restore Fill then
+turn No Fill off and draw the fills themselves, so Restore Fill is then no longer offered, and a
+notice counts the hidden fills that were dropped. On a mixed or streamed layer, where No Fill lays
+a transparent fill over the symbols, fill layers for the whole layer of any colour turn it off
+too, as they replace that fill. A project saved with No Fill on by an earlier RustGIS doesn't record the fills: Restore Fill then
 shows the symbols' fills at the default opacity and says what it couldn't put back. By command:
 
 ```text

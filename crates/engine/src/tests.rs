@@ -26624,6 +26624,76 @@ fn no_fill_again_is_no_step_to_undo() {
     assert!(s.map().layer(id).unwrap().no_fill.is_some());
 }
 
+/// No Fill on again with nothing shown since keeps no record, so a project saved by an earlier
+/// RustGIS (No Fill on, nothing kept) still says nothing was kept.
+#[test]
+fn no_fill_again_without_a_change_starts_no_record_of_what_was_hidden() {
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.map_mut().layer_mut(id).unwrap().hidden_fills = None;
+    s.run("layer.noFill", &Value::Null).unwrap();
+    assert!(s.map().layer(id).unwrap().hidden_fills.is_none());
+    let mark = s.notice_mark();
+    s.run("layer.restoreFill", &Value::Null).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains("wasn't kept")), "{said:?}");
+}
+
+/// Restore Fill on a layer the named one isn't, while the active layer has No Fill, changes
+/// nothing: no step to undo.
+#[test]
+fn restore_fill_on_a_layer_without_no_fill_is_no_step_to_undo() {
+    use rustgis_data::{Dataset, GeometryType};
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    let other = s.map_mut().add_dataset(Dataset::new("other", GeometryType::Polygon, Vec::new()));
+    let (undo, redo, dirty) = (s.undo.len(), s.redo.len(), s.dirty());
+    s.run("layer.restoreFill", &json!({"layer": other})).unwrap();
+    assert_eq!((s.undo.len(), s.redo.len(), s.dirty()), (undo, redo, dirty));
+    assert!(s.map().layer(id).unwrap().no_fill.is_some());
+}
+
+/// A whole-layer fill in another colour, set while No Fill is on, is hidden by No Fill on again
+/// and comes back with Restore Fill (symbols path: the layer's own fills are drawn).
+#[test]
+fn no_fill_again_hides_a_layer_fill_set_while_it_is_on() {
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "color": "#ff0000"}]})).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().fill_layers.len(), 1);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    assert!(s.map().layer(id).unwrap().fill_layers.is_empty());
+    s.run("layer.restoreFill", &Value::Null).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().fill_layers.len(), 1, "the hatch comes back");
+    assert!(s.map().layer(id).unwrap().no_fill.is_none());
+}
+
+/// Turning No Fill off with a colour scheme, or with fill layers for the whole layer, says how
+/// many hidden fills it drops, once; with nothing hidden it says nothing.
+#[test]
+fn turning_no_fill_off_says_what_it_drops() {
+    let (mut s, id) = no_fill_layer(false);
+    let mark = s.notice_mark();
+    s.run("layer.ramp", &json!({"ramp": "Ember"})).unwrap();
+    assert!(s.notices_since(mark).is_empty(), "nothing hidden, nothing dropped");
+    s.run("layer.noFill", &Value::Null).unwrap();
+    let mark = s.notice_mark();
+    s.run("layer.ramp", &json!({"ramp": "Ember"})).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.len() == 1 && said[0].contains("drops"), "{said:?}");
+    assert!(s.map().layer(id).unwrap().hidden_fills.is_none());
+    // On a mixed layer, a whole-layer fill in any colour turns No Fill off, dropping the layer's
+    // own fills it hid.
+    let (mut s, id) = no_fill_layer(true);
+    s.run("layer.fillLayers", &json!({"fills": [{"pattern": "dots"}]})).unwrap();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    let mark = s.notice_mark();
+    s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "color": "#ff0000"}]})).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.len() == 1 && said[0].contains("drops"), "{said:?}");
+    assert!(s.map().layer(id).unwrap().no_fill.is_none());
+}
+
 /// No Fill on again hides what was shown since, on both paths, as one undo step; Restore Fill then
 /// shows it as it was shown.
 #[test]

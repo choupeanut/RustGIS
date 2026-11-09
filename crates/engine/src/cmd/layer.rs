@@ -141,17 +141,21 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "expression"?: text|null (unique: class by this expression's values instead of a field; blank or null: by a field; with neither key, Unique Values keep the layer's expression), "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile"|"geometricInterval"|"standardDeviation"|"arithmeticProgression"|"headTailBreaks"|"manual", "breaks"?: [numbers] (manual: the classes' upper bounds, closed by the field's largest value), "ramp"?: string}"#),
         C::new("layer.ramp", "Color Scheme", "Style › Drawing", |s, p| {
             let r = s.ramp(s_req(p, "ramp")?)?;
-            with(s, p, |l| match &mut l.raster {
+            let mut dropped = None;
+            let out = with(s, p, |l| match &mut l.raster {
                 Some(rl) => rl.style.set_ramp(r),
                 None => {
                     let g = l.geometry_type();
                     l.renderer.apply_ramp(r, g);
                     // New colours after No Fill are drawn (#1301).
+                    dropped = dropped_by_no_fill(l);
                     if take_no_fill(l) == Some(NoFill::Symbols) {
                         l.renderer.map_symbols(show_fill);
                     }
                 }
-            })
+            })?;
+            notify_dropped(s, dropped);
+            Ok(out)
         }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?, "ramp": colour ramp name}"#)
         .when(need_layer),
         C::new("layer.invertRamp", "Invert Color Ramp", "Style › Drawing", |s, p| {
@@ -220,7 +224,8 @@ pub fn commands() -> Vec<C> {
             let c = Rgba::from_hex(hex).ok_or("color must be #RRGGBB or #RRGGBBAA")?;
             // `#RRGGBBAA` sets the fill's alpha exactly; `#RRGGBB` keeps the layer's translucency.
             let explicit_alpha = hex.trim().trim_start_matches('#').len() == 8;
-            with(s, p, |l| {
+            let mut dropped = None;
+            let out = with(s, p, |l| {
                 let g = l.geometry_type();
                 let fill = |sym: &rustgis_map::Symbol| {
                     let mut out = sym.with_fill(c, g);
@@ -239,8 +244,11 @@ pub fn commands() -> Vec<C> {
                     other => *other = Renderer::Single(fill(&other.base_symbol())),
                 }
                 // A fill colour after No Fill is drawn, unless it is transparent itself (#1301).
+                dropped = dropped_by_no_fill(l);
                 take_no_fill(l);
-            })
+            })?;
+            notify_dropped(s, dropped);
+            Ok(out)
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_feature_layer)
         .params(r##"{"layer"?, "color": "#RRGGBB"|"#RRGGBBAA" (the fill; a polygon's outline is left as it is, set it with layer.outline)}"##),
@@ -292,6 +300,12 @@ pub fn commands() -> Vec<C> {
         C::new("layer.restoreFill", "Restore Fill", "Style › Drawing", |s, p| {
             let id = s.layer_id(p)?;
             let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+            // The named layer has no No Fill (the gate checks the active layer): nothing changes,
+            // so it is no step to undo, as with No Fill on again.
+            if l.no_fill.is_none() {
+                s.request_only = true;
+                return Ok(Value::Null);
+            }
             for lost in restore_fill(l)? {
                 s.notify(lost, false);
             }
@@ -834,10 +848,10 @@ fn no_fill_override() -> rustgis_map::fills::FillLayer {
 }
 
 /// No Fill on again: hides what was shown since it was turned on, keeping it for Restore Fill in
-/// place of what was kept for the same class or symbol. Whether anything was shown.
+/// place of what was kept for the same class or symbol. Whether anything was shown. Nothing shown
+/// leaves the saved state as it was, so a project saved by an earlier RustGIS keeps saying that
+/// nothing was kept.
 fn hide_again(l: &mut rustgis_map::Layer) -> bool {
-    let hidden = l.hidden_fills.get_or_insert_with(HiddenFills::default);
-    let mut changed = false;
     // A class's own fills, set since: hidden on either path (they draw over the symbol's fill).
     let shown: Vec<(ClassRef, Vec<rustgis_map::fills::FillLayer>)> = match &mut l.renderer {
         Renderer::Unique { class_fills, other_fills, .. } => std::mem::take(class_fills)
@@ -849,14 +863,28 @@ fn hide_again(l: &mut rustgis_map::Layer) -> bool {
         Renderer::Graduated { class_fills, .. } => std::mem::take(class_fills).into_iter().map(|(i, f)| (ClassRef::Index(i), f)).collect(),
         _ => Vec::new(),
     };
+    // On the symbols path the layer's own fill layers are drawn, so those shown since are hidden
+    // too (the override path keeps its own, which No Fill replaces).
+    let symbols = l.no_fill == Some(NoFill::Symbols);
+    let mut symbol_shown = false;
+    if symbols {
+        l.renderer.map_symbols(|sym| symbol_shown |= sym.fill.a() > 0);
+    }
+    let stack_shown = symbols && !l.fill_layers.is_empty();
+    if shown.is_empty() && !symbol_shown && !stack_shown {
+        return false;
+    }
+    let hidden = l.hidden_fills.get_or_insert_with(HiddenFills::default);
     for (class, f) in shown {
-        changed = true;
         match hidden.class_fills.iter_mut().find(|(c, _)| *c == class) {
             Some(kept) => kept.1 = f,
             None => hidden.class_fills.push((class, f)),
         }
     }
-    if l.no_fill == Some(NoFill::Symbols) {
+    if symbols {
+        if stack_shown {
+            hidden.fills = std::mem::take(&mut l.fill_layers);
+        }
         // A symbol's fill shown since: hidden again, at the opacity it was shown at.
         let mut now = 0;
         l.renderer.map_symbols(|_| now += 1);
@@ -868,12 +896,27 @@ fn hide_again(l: &mut rustgis_map::Layer) -> bool {
                     *a = sym.fill.a();
                 }
                 sym.fill = sym.fill.with_alpha(0);
-                changed = true;
             }
             i += 1;
         });
     }
-    changed
+    true
+}
+
+/// What turning No Fill off drops, for a notice: the fills and opacities it hid, which Restore
+/// Fill would put back. `None` when it hid none.
+fn dropped_by_no_fill(l: &rustgis_map::Layer) -> Option<String> {
+    let hidden = l.hidden_fills.as_ref()?;
+    let shown_opacities = hidden.alphas.iter().filter(|a| **a > 0).count();
+    let n = hidden.class_fills.len() + usize::from(!hidden.fills.is_empty()) + shown_opacities;
+    (n > 0).then(|| format!("{}: turning No Fill off drops {n} hidden fill(s) that Restore Fill can't put back", l.name))
+}
+
+/// Says what [`dropped_by_no_fill`] found, if anything.
+fn notify_dropped(s: &mut Session, dropped: Option<String>) {
+    if let Some(text) = dropped {
+        s.notify(text, false);
+    }
 }
 
 /// Turns No Fill off, dropping its override if it laid one, and says how it was on. The caller
@@ -951,6 +994,10 @@ fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Vec<String>, String> {
             }
         }
         Some(NoFill::Symbols) => {
+            // The layer's own fill layers, hidden by a No Fill on again, come back where none are set.
+            if l.fill_layers.is_empty() {
+                l.fill_layers = fills;
+            }
             let mut now = 0;
             l.renderer.map_symbols(|_| now += 1);
             // Kept for other symbols (classes changed since), or none: a new polygon symbol's.
@@ -1183,6 +1230,7 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
     let in_symbol_colour = fills.is_empty() || fills.iter().any(|f| f.color.is_none());
     let hidden = l.no_fill;
     let count = fills.len();
+    let mut dropped = None;
     match class {
         Some(c) => {
             // Without fills of its own the class takes the layer's, which No Fill's override
@@ -1197,15 +1245,18 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
         None => {
             if in_symbol_colour && hidden == Some(NoFill::Symbols) {
                 l.renderer.map_symbols(show_fill);
+                dropped = dropped_by_no_fill(l);
                 take_no_fill(l);
             }
             // Fills set here replace No Fill's own, even transparent ones.
             if hidden == Some(NoFill::Override) {
+                dropped = dropped_by_no_fill(l);
                 take_no_fill(l);
             }
             l.fill_layers = fills;
         }
     }
+    notify_dropped(s, dropped);
     Ok(json!({"fills": count}))
 }
 
@@ -5232,10 +5283,13 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
         _ => String::new(),
     };
     let order = if rest.by_number { "by number" } else { "in text order" };
+    let mut dropped = None;
     let out = with(s, p, |l| {
         l.renderer = r;
+        dropped = dropped_by_no_fill(l);
         take_no_fill(l);
     })?;
+    notify_dropped(s, dropped);
     if rest.features > 0 {
         let rest = rest.features;
         s.notify(
