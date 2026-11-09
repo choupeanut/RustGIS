@@ -273,19 +273,12 @@ pub fn commands() -> Vec<C> {
                     // A streamed layer may have other families outside the loaded window.
                     l.no_fill = Some(NoFill::Override);
                     hidden.fills = std::mem::replace(&mut l.fill_layers, vec![no_fill_override()]);
-                    hidden.class_fills = match &mut l.renderer {
-                        Renderer::Unique { class_fills, other_fills, .. } => std::mem::take(class_fills)
-                            .into_iter()
-                            .map(|(v, f)| (ClassRef::Value(v), f))
-                            .chain([(ClassRef::Other, std::mem::take(other_fills))])
-                            .filter(|(_, f)| !f.is_empty())
-                            .collect(),
-                        Renderer::Graduated { class_fills, .. } => {
-                            std::mem::take(class_fills).into_iter().map(|(i, f)| (ClassRef::Index(i), f)).collect()
-                        }
-                        _ => Vec::new(),
-                    };
+                    hidden.class_fills = take_class_fills(&mut l.renderer);
                 } else {
+                    // Fill layers in a colour of their own draw whatever the symbol's opacity, so
+                    // the layer's and the classes' stacks are taken off here too.
+                    hidden.fills = std::mem::take(&mut l.fill_layers);
+                    hidden.class_fills = take_class_fills(&mut l.renderer);
                     l.renderer.map_symbols(|sym| {
                         hidden.alphas.push(sym.fill.a());
                         sym.fill = sym.fill.with_alpha(0);
@@ -847,13 +840,9 @@ fn no_fill_override() -> rustgis_map::fills::FillLayer {
     rustgis_map::fills::FillLayer { color: Some(Rgba::rgb(0, 0, 0).with_alpha(0)), ..Default::default() }
 }
 
-/// No Fill on again: hides what was shown since it was turned on, keeping it for Restore Fill in
-/// place of what was kept for the same class or symbol. Whether anything was shown. Nothing shown
-/// leaves the saved state as it was, so a project saved by an earlier RustGIS keeps saying that
-/// nothing was kept.
-fn hide_again(l: &mut rustgis_map::Layer) -> bool {
-    // A class's own fills, set since: hidden on either path (they draw over the symbol's fill).
-    let shown: Vec<(ClassRef, Vec<rustgis_map::fills::FillLayer>)> = match &mut l.renderer {
+/// Takes the classes' own fill stacks off the renderer, for No Fill to keep.
+fn take_class_fills(r: &mut Renderer) -> Vec<(ClassRef, Vec<rustgis_map::fills::FillLayer>)> {
+    match r {
         Renderer::Unique { class_fills, other_fills, .. } => std::mem::take(class_fills)
             .into_iter()
             .map(|(v, f)| (ClassRef::Value(v), f))
@@ -862,7 +851,16 @@ fn hide_again(l: &mut rustgis_map::Layer) -> bool {
             .collect(),
         Renderer::Graduated { class_fills, .. } => std::mem::take(class_fills).into_iter().map(|(i, f)| (ClassRef::Index(i), f)).collect(),
         _ => Vec::new(),
-    };
+    }
+}
+
+/// No Fill on again: hides what was shown since it was turned on, keeping it for Restore Fill in
+/// place of what was kept for the same class or symbol. Whether anything was shown. Nothing shown
+/// leaves the saved state as it was, so a project saved by an earlier RustGIS keeps saying that
+/// nothing was kept.
+fn hide_again(l: &mut rustgis_map::Layer) -> bool {
+    // A class's own fills, set since: hidden on either path (they draw over the symbol's fill).
+    let shown = take_class_fills(&mut l.renderer);
     // On the symbols path the layer's own fill layers are drawn, so those shown since are hidden
     // too (the override path keeps its own, which No Fill replaces).
     let symbols = l.no_fill == Some(NoFill::Symbols);

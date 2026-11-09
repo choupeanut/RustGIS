@@ -26766,6 +26766,28 @@ fn restore_fill_says_when_the_layers_hidden_fill_layers_stay_hidden() {
     assert!(s.notices_since(mark).is_empty());
 }
 
+/// No Fill hides fill layers in a colour of their own on the symbols path too (they draw whatever
+/// the symbol's opacity), the layer's and a class's, and Restore Fill puts them back.
+#[test]
+fn no_fill_hides_fill_layers_in_their_own_colour() {
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.fillLayers", &json!({"value": "a", "fills": [{"pattern": "hatch", "color": "#ff0000"}]})).unwrap();
+    s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "color": "#00ff00"}]})).unwrap();
+    let before = s.map().layer(id).unwrap().clone();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    let l = s.map().layer(id).unwrap();
+    assert_eq!(l.no_fill, Some(rustgis_map::NoFill::Symbols));
+    assert!(l.fill_layers.is_empty(), "the layer's own hatch is hidden");
+    assert!(
+        matches!(&l.renderer, rustgis_map::Renderer::Unique { class_fills, .. } if class_fills.is_empty()),
+        "the class hatch is hidden"
+    );
+    s.run("layer.restoreFill", &Value::Null).unwrap();
+    let l = s.map().layer(id).unwrap();
+    assert_eq!(l.fill_layers, before.fill_layers);
+    assert_eq!(l.renderer, before.renderer);
+}
+
 /// A whole-layer fill in another colour, set while No Fill is on, is hidden by No Fill on again
 /// and comes back with Restore Fill (symbols path: the layer's own fills are drawn).
 #[test]
