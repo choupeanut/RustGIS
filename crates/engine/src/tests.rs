@@ -26751,7 +26751,10 @@ fn restore_fill_says_when_the_layers_hidden_fill_layers_stay_hidden() {
     s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "color": "#00ff00"}]})).unwrap();
     s.run("layer.noFill", &Value::Null).unwrap();
     s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "color": "#ff0000"}]})).unwrap();
+    let mark = s.notice_mark();
     s.run("layer.noFill", &Value::Null).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains("kept 1 fill stack(s) shown since")), "the green hatch replaced: {said:?}");
     s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "color": "#0000ff"}]})).unwrap();
     let mark = s.notice_mark();
     s.run("layer.restoreFill", &Value::Null).unwrap();

@@ -259,8 +259,16 @@ pub fn commands() -> Vec<C> {
             let id = s.layer_id(p)?;
             let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
             if l.no_fill.is_some() {
-                if !hide_again(l) {
-                    s.request_only = true;
+                match hide_again(l) {
+                    None => s.request_only = true,
+                    Some(0) => {}
+                    Some(n) => {
+                        let text = format!(
+                            "{}: No Fill kept {n} fill stack(s) shown since in place of the ones it hid before, which Restore Fill can't put back now",
+                            l.name
+                        );
+                        s.notify(text, false);
+                    }
                 }
                 return Ok(Value::Null);
             }
@@ -855,10 +863,11 @@ fn take_class_fills(r: &mut Renderer) -> Vec<(ClassRef, Vec<rustgis_map::fills::
 }
 
 /// No Fill on again: hides what was shown since it was turned on, keeping it for Restore Fill in
-/// place of what was kept for the same class or symbol. Whether anything was shown. Nothing shown
-/// leaves the saved state as it was, so a project saved by an earlier RustGIS keeps saying that
-/// nothing was kept.
-fn hide_again(l: &mut rustgis_map::Layer) -> bool {
+/// place of what was kept for the same class or symbol. `None` when nothing was shown, else how
+/// many kept fill stacks (the layer's, a class's) the newer ones replaced, for a notice. Nothing
+/// shown leaves the saved state as it was, so a project saved by an earlier RustGIS keeps saying
+/// that nothing was kept.
+fn hide_again(l: &mut rustgis_map::Layer) -> Option<usize> {
     // A class's own fills, set since: hidden on either path (they draw over the symbol's fill).
     let shown = take_class_fills(&mut l.renderer);
     // On the symbols path the layer's own fill layers are drawn, so those shown since are hidden
@@ -870,19 +879,24 @@ fn hide_again(l: &mut rustgis_map::Layer) -> bool {
     }
     let stack_shown = symbols && !l.fill_layers.is_empty();
     if shown.is_empty() && !symbol_shown && !stack_shown {
-        return false;
+        return None;
     }
     // Started over none (a project saved with No Fill on by a RustGIS that kept nothing), the
     // record holds only what this hides, so Restore Fill still says the rest wasn't kept.
     let hidden = l.hidden_fills.get_or_insert_with(|| HiddenFills { partial: true, ..HiddenFills::default() });
+    let mut replaced = 0;
     for (class, f) in shown {
         match hidden.class_fills.iter_mut().find(|(c, _)| *c == class) {
-            Some(kept) => kept.1 = f,
+            Some(kept) => {
+                replaced += usize::from(!kept.1.is_empty());
+                kept.1 = f;
+            }
             None => hidden.class_fills.push((class, f)),
         }
     }
     if symbols {
         if stack_shown {
+            replaced += usize::from(!hidden.fills.is_empty());
             hidden.fills = std::mem::take(&mut l.fill_layers);
         }
         // A symbol's fill shown since: hidden again, at the opacity it was shown at.
@@ -900,7 +914,7 @@ fn hide_again(l: &mut rustgis_map::Layer) -> bool {
             i += 1;
         });
     }
-    true
+    Some(replaced)
 }
 
 /// What turning No Fill off drops, for a notice: the fills and opacities it hid, which Restore
