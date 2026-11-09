@@ -347,6 +347,9 @@ impl Node {
     }
     /// Rejects a withdrawn load or reloaded schema before a new stage begins.
     pub(crate) fn current(&self) -> Result<(), String> {
+        if self.auth.as_ref().is_some_and(|a| a.restored_since()) {
+            return Err("the Earthdata token remembered on this computer was read while this command ran; run it again".into());
+        }
         if self.auth.as_ref().is_some_and(|a| !a.is_current()) {
             return Err("the active account changed since this operation was approved".into());
         }

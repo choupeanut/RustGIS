@@ -920,6 +920,84 @@ fn permission_policy_exact_runtime_account_rotation() {
     arcgis_auth::sign_out(Some(root.trim_end_matches('/')));
 }
 
+/// A remembered Earthdata token read before a node binds keeps it current; read after, it cancels
+/// with a message that says why; a login, logout or replacement keeps the ordinary message.
+#[test]
+fn permission_policy_remembered_earthdata_token_read_mid_run() {
+    // The token and its store are process-wide: isolate them from every parallel plan reader.
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var_os("RUSTGIS_POLICY_REMEMBERED_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::permission_policy::permission_policy_remembered_earthdata_token_read_mid_run", "--nocapture"])
+            .env("RUSTGIS_POLICY_REMEMBERED_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
+    use crate::render::rustgis_tiles::earthdata;
+    use rustgis_data::secrets::{MemorySecrets, Secret, SecretStore};
+    // A new run of the app with a token remembered, not yet read.
+    let relaunch = || {
+        let store = Arc::new(MemorySecrets::new());
+        store.save(earthdata::ACCOUNT, &Secret::new("synthetic-remembered")).unwrap();
+        earthdata::set_token(None).unwrap();
+        earthdata::set_secret_store(Some(store));
+    };
+    // Starts a command that sends (a download), as the app does after the plan binds its accounts.
+    let start = |s: &mut Session, n: u64| {
+        let (scope, _) = assistant(n);
+        let call = Call::command("layer.addUrl", json!({"url":"https://example.invalid/remembered.geojson"}));
+        let p = pending(s, &scope, &call);
+        s.run_permitted(scope, p.allow(), &call).unwrap();
+        let request = s.take_url_requests().pop().unwrap();
+        let id = s.download_started_for(&request).unwrap();
+        (id, s.download_still(id).unwrap())
+    };
+    let mut s = world();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        s.leave_downloads = true;
+    }
+
+    // Read at startup, before the node binds: nothing changes mid-run.
+    relaunch();
+    assert_eq!(earthdata::restore(), earthdata::Restored::Token);
+    let (id, still) = start(&mut s, 1601);
+    assert_eq!(earthdata::restore(), earthdata::Restored::Nothing);
+    assert!(still() && s.download_continues(id).is_ok());
+
+    // Read while the command runs: cancelled, and told why.
+    relaunch();
+    let (id, still) = start(&mut s, 1602);
+    assert_eq!(earthdata::restore(), earthdata::Restored::Token);
+    assert!(!still());
+    let said = s.download_continues(id).unwrap_err();
+    assert!(said.contains("remembered on this computer was read while this command ran") && !said.contains("synthetic"), "{said}");
+
+    // A login or replacement instead of that read, or after it, is the ordinary change.
+    let changes: [&dyn Fn(); 2] =
+        [&|| drop(earthdata::login("synthetic-typed", false)), &|| earthdata::set_token(Some("synthetic-typed")).unwrap()];
+    for (n, change) in changes.into_iter().enumerate() {
+        relaunch();
+        let (id, still) = start(&mut s, 1610 + n as u64);
+        change();
+        assert!(!still());
+        let said = s.download_continues(id).unwrap_err();
+        assert!(said.contains("account changed") && !said.contains("remembered"), "{said}");
+    }
+    relaunch();
+    let (id, _) = start(&mut s, 1620);
+    earthdata::restore();
+    earthdata::set_token(Some("synthetic-typed")).unwrap();
+    let said = s.download_continues(id).unwrap_err();
+    assert!(said.contains("account changed") && !said.contains("remembered"), "{said}");
+    earthdata::set_secret_store(None);
+    earthdata::set_token(None).unwrap();
+}
+
 /// Foreign in-place completions cannot borrow/consume ownership; omitted options retain defaults.
 #[test]
 fn permission_policy_download_refinements_rollback_and_abandonment() {
