@@ -2090,7 +2090,7 @@ fn render_tilted(map: &mut Map, view: &View, full_res_rasters: bool, sources_rea
         None => warp.finish(pm.pixels()),
     }
     drop(kept);
-    extrusions_tilted(map, view, pm.pixels());
+    extrusions_tilted(map, view, pm.pixels())?;
     markers_tilted(map, view, &mut pm);
     let placed = place_tilted_labels(map, view, candidates, ground.as_ref());
     for l in &placed.labels {
@@ -2935,8 +2935,9 @@ fn markers_tilted(map: &mut Map, view: &View, pm: &mut Canvas) {
 }
 
 /// The extruded layers of a tilted view, stood up in perspective over its ground, bottom layer
-/// first (a drape of the moving view shows them flat).
-fn extrusions_tilted(map: &mut Map, view: &View, pm: &mut Pixmap) {
+/// first (a drape of the moving view shows them flat). `None` when a see-through layer's own
+/// pixmap can't be allocated, as the flat map's offscreen layers fail the render.
+fn extrusions_tilted(map: &mut Map, view: &View, pm: &mut Pixmap) -> Option<()> {
     let scale = map.ground_res_at(&view.camera) / rustgis_geom::PIXEL_M;
     // Layers a hidden or out-of-scale group holds aren't drawn, as in `render_frame`.
     let held = map.held_by_group(scale);
@@ -2984,15 +2985,16 @@ fn extrusions_tilted(map: &mut Map, view: &View, pm: &mut Pixmap) {
         };
         // Below 1, on a pixmap of its own laid over the map once, so the layer's back walls don't
         // show through its roofs.
-        match (opacity < 1.0).then(|| Pixmap::new(pm.width(), pm.height())).flatten() {
-            Some(mut own) => {
-                draw(&mut own);
-                let over = PixmapPaint { opacity, ..PixmapPaint::default() };
-                pm.draw_pixmap(0, 0, own.as_ref(), &over, Transform::identity(), None);
-            }
-            None => draw(pm),
+        if opacity < 1.0 {
+            let mut own = Pixmap::new(pm.width(), pm.height())?;
+            draw(&mut own);
+            let over = PixmapPaint { opacity, ..PixmapPaint::default() };
+            pm.draw_pixmap(0, 0, own.as_ref(), &over, Transform::identity(), None);
+        } else {
+            draw(pm);
         }
     }
+    Some(())
 }
 
 /// The most physical pixels a side of a tilted view's band is drawn with: past it, at a lower
