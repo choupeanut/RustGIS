@@ -308,9 +308,6 @@ fn parts_lost(g: &Node) -> usize {
         "MultiLineString" | "MultiCurve" => coords(x, &scratch).is_some_and(|c| c.len() >= 2),
         _ => polygon(x, &scratch, &Cell::new(0)).is_some(),
     };
-    // A shape nested in a part with nothing in it the reader takes: a triangle, an arc, a
-    // surface that is only a reference.
-    let unread_shape = |x: &Node| x.is_element() && is_gml(x) && is_shape(local(x)) && !x.descendants().any(|d| leaf(&d));
     // A member nested in a part (a composite's `surfaceMember`) that is only a reference.
     let reference = |x: &Node| x.is_element() && is_gml(x) && local(x).ends_with("Member") && !x.children().any(|c| c.is_element());
     // A member lost whole (a reference, no part in it) counts once; one holding parts counts those
@@ -321,6 +318,13 @@ fn parts_lost(g: &Node) -> usize {
         if leaves.is_empty() {
             return 1;
         }
+        // The elements holding a part (the parts too), marked once so each check below is a walk up
+        // the tree, not down it: a hostile member can't make it quadratic.
+        let holds: std::collections::HashSet<roxmltree::NodeId> =
+            leaves.iter().flat_map(|l| l.ancestors().take_while(|a| *a != part).map(|a| a.id())).collect();
+        // A shape nested in a part with nothing in it the reader takes: a triangle, an arc, a
+        // surface that is only a reference.
+        let unread_shape = |x: &Node| x.is_element() && is_gml(x) && is_shape(local(x)) && !holds.contains(&x.id());
         // Whether something between `x` and the part is a part read or a shape counted.
         let inside = |x: &Node| x.ancestors().skip(1).take_while(|a| *a != part).any(|a| unread_shape(&a) || leaf(&a));
         let shapes = part.descendants().skip(1).filter(|x| unread_shape(x) && !inside(x)).count();
@@ -972,7 +976,8 @@ mod tests {
     }
 
     /// Unread shapes nested beside a part read are said: an arc in a composite curve, a surface
-    /// that is only a reference; a curve's own arc segment is not a part lost.
+    /// that is only a reference; a curve's own arc segment is not a part lost (the curve keeps its
+    /// control points, a separate approximation).
     #[test]
     fn nested_unread_shapes_are_said() {
         let line = "<gml:LineString><gml:posList>10 48 11 48</gml:posList></gml:LineString>";
