@@ -249,14 +249,11 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
         "webScene" => {
             let mut m = map_of(s, p)?;
             m.layers.iter_mut().filter(|l| shared_layer("webScene", l)).try_for_each(load_whole)?;
-            let SceneBytes { bytes, fanned, out_of_range } = gltf(&m, s.view_size)?;
-            if fanned > 0 {
-                s.notify(super::items::fanned_caps_note(fanned), false);
+            let scene = gltf(&m, s.view_size)?;
+            for note in scene.notes() {
+                s.notify(note, false);
             }
-            if out_of_range > 0 {
-                s.notify(format!("{out_of_range} feature(s) left out of the scene: a coordinate is too far from the map's centre"), false);
-            }
-            Ok((m.name.clone(), bytes, m.name.clone()))
+            Ok((m.name.clone(), scene.bytes, m.name.clone()))
         }
         "linkChart" => {
             let rel = ps(p, "relationship").map(str::to_string);
@@ -928,18 +925,49 @@ fn find(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// A glTF scene's bytes, and what it approximates or leaves out.
+#[derive(Default)]
 struct SceneBytes {
     bytes: Vec<u8>,
     fanned: usize,
     out_of_range: usize,
+    limited: usize,
+    skipped_outer: usize,
+    holes_dropped: usize,
+    single_vertex_lines: usize,
+}
+
+impl SceneBytes {
+    /// The same counted explanations accompany a usable scene and an empty-result error.
+    fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.fanned > 0 {
+            notes.push(super::items::fanned_caps_note(self.fanned));
+        }
+        if self.out_of_range > 0 {
+            notes.push(format!("{} feature(s) left out of the scene: a coordinate is too far from the map's centre", self.out_of_range));
+        }
+        if self.limited > 0 {
+            notes.push(format!("{} feature(s) left out of the scene: the {MAX_FEATURES} feature limit was reached", self.limited));
+        }
+        if self.skipped_outer > 0 {
+            notes.push(format!("Skipped {} polygon(s) whose outer ring has fewer than 3 vertices", self.skipped_outer));
+        }
+        if self.holes_dropped > 0 {
+            notes.push(format!("Dropped {} hole(s) with fewer than 3 vertices", self.holes_dropped));
+        }
+        if self.single_vertex_lines > 0 {
+            notes.push(format!("Skipped {} line part(s) with a single vertex", self.single_vertex_lines));
+        }
+        notes
+    }
 }
 
 /// A glTF 2.0 scene (embedded buffer): polygon layers extruded by their extrusion setting (flat
 /// otherwise), lines and points, coloured by their symbology. Metres east (x), up (y) and south
 /// (z) of the map's centre, with a camera where the map view (`view` points across) looks
 /// from: its bearing and pitch, as far off as MapLibre's camera would be. Also the number of
-/// polygon caps that are fans over the outer ring (the triangulator gave up, or fell back to one),
-/// and of features left out because a position is too far from the centre for 32 bits.
+/// polygon caps that are fans (the triangulator gave up, or fell back to one), and counted
+/// explanations of features or parts left out.
 fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
     let c = m.center_lonlat();
     let origin = rustgis_geom::lonlat_to_merc(c);
@@ -951,7 +979,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
     let mut buffer: Vec<u8> = Vec::new();
     let (mut views, mut accessors, mut meshes, mut nodes, mut materials) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut budget = MAX_FEATURES;
-    let (mut fanned, mut out_of_range) = (0usize, 0usize);
+    let mut scene = SceneBytes::default();
     for l in m.layers.iter().rev().filter(|l| l.visible && !l.is_raster()) {
         // Per colour, its positions and (for triangles) indices.
         // Ordered, so the same scene always writes the same file.
@@ -974,10 +1002,14 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
             if let Some((k, before)) = last.take() {
                 built += size(&tri, &lines, &k).saturating_sub(before);
             }
-            if budget == 0 || rows.get(row) != Some(&true) {
+            if rows.get(row) != Some(&true) {
                 continue;
             }
             let Some(g) = &ft.geometry else { continue };
+            if budget == 0 {
+                scene.limited += 1;
+                continue;
+            }
             // A position too far for 32 bits would make the scene invalid: the feature is left out,
             // and said. Only what would be drawn counts (not a degenerate ring or a one-vertex line).
             let far = |c: &Coord| {
@@ -997,7 +1029,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                 Geometry::MultiPoint(ps_) => ps_.iter().any(far),
             };
             if too_far {
-                out_of_range += 1;
+                scene.out_of_range += 1;
                 continue;
             }
             budget -= 1;
@@ -1028,7 +1060,11 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                             .collect();
                         // A polygon whose outer ring is degenerate is skipped (a hole never
                         // stands in for it); degenerate holes are dropped.
-                        let Some(outer) = open.first().filter(|r| r.len() >= 3) else { continue };
+                        let Some(outer) = open.first().filter(|r| r.len() >= 3) else {
+                            scene.skipped_outer += 1;
+                            continue;
+                        };
+                        scene.holes_dropped += open.iter().skip(1).filter(|r| r.len() < 3).count();
                         let open: Vec<Vec<(f64, f64)>> =
                             std::iter::once(outer.clone()).chain(open.iter().skip(1).filter(|r| r.len() >= 3).cloned()).collect();
                         let Some(outer) = open.first() else { continue };
@@ -1056,7 +1092,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                             let fan = (1..outer.len().saturating_sub(1)).map(|i| if ccw { [0, i, i + 1] } else { [0, i + 1, i] }).collect();
                             (fan, true)
                         });
-                        fanned += usize::from(fan);
+                        scene.fanned += usize::from(fan);
                         let (pos, idx) = tri.entry(key).or_default();
                         let base = pos.len() as u32;
                         for (x, z) in flat.get(..cap).unwrap_or(&[]) {
@@ -1087,6 +1123,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                 Geometry::Line(parts) => {
                     let seg = lines.entry(key).or_default();
                     for part in parts {
+                        scene.single_vertex_lines += usize::from(part.len() == 1);
                         for w in part.windows(2) {
                             let ((ax, az), (bx, bz)) = (xy(w[0]), xy(w[1]));
                             seg.push([ax, h, az]);
@@ -1163,7 +1200,9 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
         }
     }
     if nodes.is_empty() {
-        return Err("the map has no features to put in a scene".into());
+        let notes = scene.notes();
+        let why = if notes.is_empty() { String::new() } else { format!(": {}", notes.join("; ")) };
+        return Err(format!("the map has no features to put in a scene{why}"));
     }
     // As drawn: a camera set from outside a command may not be clamped yet.
     let mut at = m.camera;
@@ -1185,7 +1224,8 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
         "extras": {"origin": [c.x, c.y], "units": "metres east, up and south of origin (longitude, latitude)",
             "bearing": at.bearing, "pitch": at.pitch},
     });
-    serde_json::to_vec(&doc).map(|b| SceneBytes { bytes: b, fanned, out_of_range }).map_err(|e| e.to_string())
+    scene.bytes = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
+    Ok(scene)
 }
 
 /// The glTF camera of a scene and the node placing it: looking at the map's centre (the scene's
