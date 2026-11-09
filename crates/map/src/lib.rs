@@ -134,6 +134,10 @@ pub struct HiddenFills {
     /// The classes' own fills before No Fill (taken off).
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "de_class_fills")]
     pub class_fills: Vec<(symbology::ClassRef, Vec<fills::FillLayer>)>,
+    /// Started by No Fill on again over a layer that kept nothing (saved with No Fill on by an
+    /// earlier RustGIS): it holds only what was hidden since, not what the first No Fill hid.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 /// A layer: a dataset drawn with a renderer and labels.
@@ -3276,6 +3280,7 @@ mod tests {
             alphas: vec![170, 0],
             fills: vec![fills::FillLayer::hatch(45.0, 4.0, 0.5)],
             class_fills: vec![(symbology::ClassRef::Index(1), vec![fills::FillLayer::default()])],
+            partial: true,
         };
         l.hidden_fills = Some(kept.clone());
         let text = serde_json::to_string(&l).unwrap();

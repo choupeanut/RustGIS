@@ -300,8 +300,8 @@ pub fn commands() -> Vec<C> {
         C::new("layer.restoreFill", "Restore Fill", "Style › Drawing", |s, p| {
             let id = s.layer_id(p)?;
             let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-            // The named layer has no No Fill (the gate checks the active layer): nothing changes,
-            // so it is no step to undo, as with No Fill on again.
+            // `need_no_fill` already refuses a named or active layer without No Fill; this only
+            // guards a layer `layer_id` resolves differently: nothing changes, no step to undo.
             if l.no_fill.is_none() {
                 s.request_only = true;
                 return Ok(Value::Null);
@@ -874,7 +874,9 @@ fn hide_again(l: &mut rustgis_map::Layer) -> bool {
     if shown.is_empty() && !symbol_shown && !stack_shown {
         return false;
     }
-    let hidden = l.hidden_fills.get_or_insert_with(HiddenFills::default);
+    // Started over none (a project saved with No Fill on by a RustGIS that kept nothing), the
+    // record holds only what this hides, so Restore Fill still says the rest wasn't kept.
+    let hidden = l.hidden_fills.get_or_insert_with(|| HiddenFills { partial: true, ..HiddenFills::default() });
     for (class, f) in shown {
         match hidden.class_fills.iter_mut().find(|(c, _)| *c == class) {
             Some(kept) => kept.1 = f,
@@ -919,6 +921,14 @@ fn notify_dropped(s: &mut Session, dropped: Option<String>) {
     }
 }
 
+/// Turns No Fill off for a command that gives the layer a new renderer, whose own fills are drawn:
+/// what it hid no longer matches, so it is dropped. The notice for that, if anything was hidden.
+pub(crate) fn end_no_fill_for_new_renderer(l: &mut rustgis_map::Layer) -> Option<String> {
+    let dropped = dropped_by_no_fill(l);
+    take_no_fill(l);
+    dropped
+}
+
 /// Turns No Fill off, dropping its override if it laid one, and says how it was on. The caller
 /// shows the symbols' fills on the other path, where only it knows which.
 fn take_no_fill(l: &mut rustgis_map::Layer) -> Option<NoFill> {
@@ -959,8 +969,8 @@ fn show_fill(sym: &mut rustgis_map::Symbol) {
 /// turned on by a RustGIS that kept nothing.
 fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Vec<String>, String> {
     let hidden = l.hidden_fills.take();
-    let kept = hidden.is_some();
-    let HiddenFills { alphas, fills, class_fills } = hidden.unwrap_or_default();
+    let kept = hidden.as_ref().is_some_and(|h| !h.partial);
+    let HiddenFills { alphas, fills, class_fills, .. } = hidden.unwrap_or_default();
     let mut notes = Vec::new();
     let mode = take_no_fill(l);
     if mode.is_some() {
@@ -982,9 +992,7 @@ fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Vec<String>, String> {
     }
     match mode {
         Some(NoFill::Override) => {
-            if l.fill_layers.is_empty() {
-                l.fill_layers = fills;
-            }
+            put_back_layer_fills(l, fills, &mut notes);
             if !kept {
                 // Whether there were any isn't known either.
                 notes.push(format!(
@@ -995,9 +1003,7 @@ fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Vec<String>, String> {
         }
         Some(NoFill::Symbols) => {
             // The layer's own fill layers, hidden by a No Fill on again, come back where none are set.
-            if l.fill_layers.is_empty() {
-                l.fill_layers = fills;
-            }
+            put_back_layer_fills(l, fills, &mut notes);
             let mut now = 0;
             l.renderer.map_symbols(|_| now += 1);
             // Kept for other symbols (classes changed since), or none: a new polygon symbol's.
@@ -1027,6 +1033,20 @@ fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Vec<String>, String> {
         None => {}
     }
     Ok(notes)
+}
+
+/// The layer's own fill layers No Fill hid come back unless it has fill layers of its own now;
+/// those stay, and a note says the hidden ones weren't put back.
+fn put_back_layer_fills(l: &mut rustgis_map::Layer, fills: Vec<rustgis_map::fills::FillLayer>, notes: &mut Vec<String>) {
+    if l.fill_layers.is_empty() {
+        l.fill_layers = fills;
+    } else if !fills.is_empty() {
+        notes.push(format!(
+            "{}: Restore Fill didn't put back the layer's {} fill layer(s) No Fill hid, as the layer has fill layers of its own now",
+            l.name,
+            fills.len()
+        ));
+    }
 }
 
 /// Where a class's symbol comes among [`Renderer::map_symbols`]' (as [`class_symbol`] finds it).

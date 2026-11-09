@@ -108,6 +108,8 @@ pub fn commands() -> Vec<C> {
                 return Err(format!("{name} is a {} style; {} is a {} layer", st.geometry.label(), l.name, l.geometry_type().label()));
             }
             l.renderer = st.renderer;
+            // The style's fills are drawn, as with a new symbology (#1301).
+            let no_fill_dropped = super::layer::end_no_fill_for_new_renderer(l);
             let field = l.labels.default.field.clone();
             // Saved moves name features by id: the style's belong to the layer it was made from,
             // so this layer keeps its own, in the class of the same name (Default in Default).
@@ -123,6 +125,7 @@ pub fn commands() -> Vec<C> {
             l.labels.repoint_missing_fields(&l.dataset);
             l.transparency = st.transparency;
             let area_notice = super::design::display_area_message(l);
+            if let Some(notice) = no_fill_dropped { s.notify(notice, false); }
             if let Some(notice) = area_notice { s.notify(notice,false); }
             if relock {
                 s.map_mut().label_lock = None;

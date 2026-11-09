@@ -26639,8 +26639,8 @@ fn no_fill_again_without_a_change_starts_no_record_of_what_was_hidden() {
     assert!(said.iter().any(|t| t.contains("wasn't kept")), "{said:?}");
 }
 
-/// Restore Fill on a layer the named one isn't, while the active layer has No Fill, changes
-/// nothing: no step to undo.
+/// Restore Fill naming a layer without No Fill, while the active layer has it, is refused (the
+/// condition checks the named layer) and changes nothing: no step to undo, redo kept.
 #[test]
 fn restore_fill_on_a_layer_without_no_fill_is_no_step_to_undo() {
     use rustgis_data::{Dataset, GeometryType};
@@ -26648,9 +26648,79 @@ fn restore_fill_on_a_layer_without_no_fill_is_no_step_to_undo() {
     s.run("layer.noFill", &Value::Null).unwrap();
     let other = s.map_mut().add_dataset(Dataset::new("other", GeometryType::Polygon, Vec::new()));
     let (undo, redo, dirty) = (s.undo.len(), s.redo.len(), s.dirty());
-    s.run("layer.restoreFill", &json!({"layer": other})).unwrap();
+    let refused = s.run("layer.restoreFill", &json!({"layer": other}));
+    assert!(refused.is_err_and(|e| e.contains("No Fill isn't on")), "the named layer has no No Fill");
     assert_eq!((s.undo.len(), s.redo.len(), s.dirty()), (undo, redo, dirty));
     assert!(s.map().layer(id).unwrap().no_fill.is_some());
+}
+
+/// A record No Fill on again starts over a project that kept nothing (No Fill saved on by an
+/// earlier RustGIS) holds only what it hid, so Restore Fill still says the rest wasn't kept.
+#[test]
+fn no_fill_again_over_nothing_kept_still_says_what_wasnt_kept() {
+    for mixed in [false, true] {
+        let (mut s, id) = no_fill_layer(mixed);
+        s.run("layer.noFill", &Value::Null).unwrap();
+        s.map_mut().layer_mut(id).unwrap().hidden_fills = None;
+        s.run("layer.fillLayers", &json!({"value": "a", "fills": [{"pattern": "hatch"}]})).unwrap();
+        s.run("layer.noFill", &Value::Null).unwrap();
+        assert!(s.map().layer(id).unwrap().hidden_fills.as_ref().is_some_and(|h| h.partial), "mixed {mixed}");
+        let mark = s.notice_mark();
+        s.run("layer.restoreFill", &Value::Null).unwrap();
+        let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        let note = if mixed { "didn't keep them" } else { "wasn't kept" };
+        assert!(said.iter().any(|t| t.contains(note)), "mixed {mixed}: {said:?}");
+        assert!(!said.iter().any(|t| t.contains("changed since")), "mixed {mixed}: {said:?}");
+    }
+}
+
+/// Applying a saved style or symbolizing by subtype gives the layer a new renderer, so No Fill
+/// ends, as with a new symbology: Restore Fill can't put the old fills onto the new classes.
+#[test]
+fn a_new_renderer_from_a_style_or_subtypes_ends_no_fill() {
+    let (mut s, id) = no_fill_layer(false);
+    s.run("style.new", &json!({"name": "plain"})).unwrap();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    let mark = s.notice_mark();
+    s.run("style.apply", &json!({"name": "plain"})).unwrap();
+    let l = s.map().layer(id).unwrap();
+    assert!(l.no_fill.is_none() && l.hidden_fills.is_none());
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains("turning No Fill off drops")), "{said:?}");
+    assert!(s.run("layer.restoreFill", &Value::Null).is_err());
+
+    let (mut s, id) = no_fill_layer(false);
+    s.map_mut().layer_mut(id).unwrap().dataset.fields.push(rustgis_data::Field::new("code", rustgis_data::FieldType::Integer));
+    for f in &mut s.map_mut().layer_mut(id).unwrap().dataset.features {
+        f.attrs.push(rustgis_data::Value::Int(1));
+    }
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("data.subtypes", &json!({"field": "code", "subtypes": [{"code": 1, "name": "one"}]})).unwrap();
+    let l = s.map().layer(id).unwrap();
+    assert!(l.no_fill.is_none() && l.hidden_fills.is_none());
+}
+
+/// The layer's own fill layers No Fill hid don't replace fill layers set since; Restore Fill says
+/// it didn't put them back, and says nothing when the layer had none.
+#[test]
+fn restore_fill_says_when_the_layers_hidden_fill_layers_stay_hidden() {
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "color": "#00ff00"}]})).unwrap();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "color": "#ff0000"}]})).unwrap();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "color": "#0000ff"}]})).unwrap();
+    let mark = s.notice_mark();
+    s.run("layer.restoreFill", &Value::Null).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains("fill layer(s) No Fill hid")), "{said:?}");
+    assert_eq!(s.map().layer(id).unwrap().fill_layers.len(), 1);
+
+    let (mut s, _) = no_fill_layer(false);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    let mark = s.notice_mark();
+    s.run("layer.restoreFill", &Value::Null).unwrap();
+    assert!(s.notices_since(mark).is_empty());
 }
 
 /// A whole-layer fill in another colour, set while No Fill is on, is hidden by No Fill on again
