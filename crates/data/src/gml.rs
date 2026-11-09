@@ -258,6 +258,11 @@ fn geometry(g: &Node, zm: &Cell<bool>, lost: &Cell<usize>) -> Option<Geometry> {
                     poly
                 })
                 .collect();
+            // A plain surface's triangles and rectangles aren't read: said as left out (a
+            // multi-surface's are counted by `parts_lost`).
+            if !polys.is_empty() && !local(g).starts_with("Multi") {
+                lost.set(lost.get() + kids(&["Triangle", "Rectangle"]).len());
+            }
             (!polys.is_empty()).then_some(Geometry::Polygon(polys))
         }
         "Envelope" | "Box" => {
@@ -572,7 +577,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
             let what =
                 if kind.lost == 1 { "ring or surface patch of a geometry was" } else { "rings or surface patches of geometries were" };
             rep.messages.push(format!(
-                "{}: {} {what} left out: too few points, unreadable coordinates, a patch with no exterior ring, or an exterior ring past the first",
+                "{}: {} {what} left out: too few points, unreadable coordinates, a patch with no exterior ring or of a kind not read, or an exterior ring past the first",
                 ds.name, kind.lost
             ));
         }
@@ -936,6 +941,26 @@ mod tests {
         let layers = read("m.gml", gml.as_bytes()).unwrap();
         assert!(layers[0].0.features[0].geometry.is_some());
         assert!(said(&layers[0], "m: 1 part of multi-geometries not read"), "{:?}", layers[0].1.messages);
+    }
+
+    /// A plain surface's triangle or rectangle beside a patch read is said as left out; two
+    /// patches read say nothing.
+    #[test]
+    fn a_surface_says_its_unread_patches() {
+        let ring = "<gml:exterior><gml:LinearRing><gml:posList>10 48 11 48 11 49 10 48</gml:posList></gml:LinearRing></gml:exterior>";
+        let surface = |second: &str| {
+            doc(&format!(
+                "<wfs:member><app:p><app:g><gml:Surface><gml:patches><gml:PolygonPatch>{ring}</gml:PolygonPatch><gml:{second}>{ring}</gml:{second}></gml:patches></gml:Surface></app:g></app:p></wfs:member>"
+            ))
+        };
+        for kind in ["Triangle", "Rectangle"] {
+            let layers = read("s.gml", surface(kind).as_bytes()).unwrap();
+            assert!(layers[0].0.features[0].geometry.is_some());
+            assert!(said(&layers[0], "s: 1 ring or surface patch of a geometry was left out"), "{kind}: {:?}", layers[0].1.messages);
+            assert!(said(&layers[0], "or of a kind not read"), "{:?}", layers[0].1.messages);
+        }
+        let clean = read("s.gml", surface("PolygonPatch").as_bytes()).unwrap();
+        assert!(!said(&clean[0], "surface patch"), "{:?}", clean[0].1.messages);
     }
 
     /// #1620: an interior ring left out is said (already so since #1612).
