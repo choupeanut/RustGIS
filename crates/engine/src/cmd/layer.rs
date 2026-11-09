@@ -245,12 +245,15 @@ pub fn commands() -> Vec<C> {
         .when(need_feature_layer)
         .params(r##"{"layer"?, "color": "#RRGGBB"|"#RRGGBBAA" (the fill; a polygon's outline is left as it is, set it with layer.outline)}"##),
         C::new("layer.noFill", "No Fill", "Style › Drawing", |s, p| {
+            // On again, it is hidden already: what it hid, and what was set since (a class's
+            // fills, say), stay as they are, and the mode it hides by stays too. Nothing changes,
+            // so it is no step to undo (and leaves redo and the saved state alone).
+            let id = s.layer_id(p)?;
+            if s.map().layer(id).is_some_and(|l| l.no_fill.is_some()) {
+                s.request_only = true;
+                return Ok(Value::Null);
+            }
             with(s, p, |l| {
-                // On again, it is hidden already: what it hid, and what was set since (a class's
-                // fills, say), stay as they are, and the mode it hides by stays too.
-                if l.no_fill.is_some() {
-                    return;
-                }
                 // What it hides is kept for Restore Fill.
                 let mut hidden = HiddenFills::default();
                 if l.source.is_some() || l.has_geometry(GeometryType::Point) || l.has_geometry(GeometryType::Polyline) {
@@ -292,6 +295,7 @@ pub fn commands() -> Vec<C> {
             Ok(Value::Null)
         })
         .roles(&[])
+        .effects(crate::policy::Effects::NONE)
         .when(need_no_fill)
         .params(r#"{"layer"?: name|id (default: the active layer containing polygons; puts back the fills layer.noFill hid, with their colours and opacities, the layer's own fills and each class's, except what was changed since)}"#),
         C::new("layer.outline", "Outline", "Style › Drawing", |s, p| {

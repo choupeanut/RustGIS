@@ -24772,6 +24772,69 @@ fn no_fill_again_keeps_what_was_set_while_it_is_on() {
     assert!(s.map().layer(id).unwrap().no_fill.is_none(), "No Fill is off");
 }
 
+/// A layer of three polygons in Unique Values classes "a", "b" and "c", with a point too when
+/// `mixed` (No Fill then overrides the polygons' fills instead of the symbols').
+fn no_fill_layer(mixed: bool) -> (Session, u32) {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
+    let mut ds = Dataset::new("parcels", GeometryType::Polygon, vec![Field::new("kind", FieldType::Text)]);
+    for (i, kind) in ["a", "b", "c"].into_iter().enumerate() {
+        let x = i as f64 * 2.0;
+        let ring = vec![Coord::new(x, 0.0), Coord::new(x + 1.0, 0.0), Coord::new(x + 1.0, 1.0), Coord::new(x, 0.0)];
+        ds.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Attr::Text(kind.into())]);
+    }
+    if mixed {
+        ds.push(Some(Geometry::Point(Coord::new(10.0, 0.5))), vec![Attr::Text("a".into())]);
+    }
+    let mut s = Session::new(Project::default());
+    let id = s.map_mut().add_dataset(ds);
+    s.active_layer = Some(id);
+    s.run("layer.symbology", &json!({"type": "unique", "field": "kind"})).unwrap();
+    (s, id)
+}
+
+/// No Fill again while it is on changes nothing, so it is no step: redo, undo and the saved state
+/// are left as they were.
+#[test]
+fn no_fill_again_is_no_step_to_undo() {
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("layer.outline", &json!({"color": "#112233"})).unwrap();
+    s.run("edit.undo", &Value::Null).unwrap();
+    let (undo, redo, dirty) = (s.undo.len(), s.redo.len(), s.dirty());
+    assert_eq!(redo, 1);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    assert_eq!((s.undo.len(), s.redo.len(), s.dirty()), (undo, redo, dirty));
+    assert!(s.map().layer(id).unwrap().no_fill.is_some());
+}
+
+/// Restore Fill after an undo puts back what No Fill hid, on both paths: the symbols' own
+/// opacities (one of them 0) and the fill stacks of the layer and its classes.
+#[test]
+fn restore_fill_after_an_undo_puts_back_the_style_from_before_no_fill() {
+    for mixed in [false, true] {
+        let (mut s, id) = no_fill_layer(mixed);
+        s.run("layer.classStyle", &json!({"value": "a", "color": "#11223340"})).unwrap();
+        s.run("layer.classStyle", &json!({"value": "b", "color": "#44556600"})).unwrap();
+        if mixed {
+            s.run("layer.fillLayers", &json!({"fills": [{"pattern": "dots"}]})).unwrap();
+            s.run("layer.fillLayers", &json!({"value": "c", "fills": [{"pattern": "hatch", "angle": 30}]})).unwrap();
+        }
+        let style = |s: &Session| {
+            let l = s.map().layer(id).unwrap();
+            (l.renderer.clone(), l.fill_layers.clone())
+        };
+        let before = style(&s);
+        s.run("layer.noFill", &Value::Null).unwrap();
+        s.run("layer.outline", &json!({"color": "#112233"})).unwrap();
+        s.run("edit.undo", &Value::Null).unwrap();
+        assert!(s.map().layer(id).unwrap().hidden_fills.is_some(), "mixed: {mixed}");
+        let mark = s.notice_mark();
+        s.run("layer.restoreFill", &Value::Null).unwrap();
+        assert!(s.notices_since(mark).is_empty(), "mixed: {mixed}: {:?}", s.notices_since(mark));
+        assert!(style(&s) == before, "mixed: {mixed}");
+    }
+}
+
 /// Restore Fill says when a class's hidden fills can't go back because the class has fills of its
 /// own since No Fill, once, with the count; the classes it could put back come back.
 #[test]
