@@ -1049,6 +1049,36 @@ fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Vec<String>, String> {
     Ok(notes)
 }
 
+/// The layer's renderer with what No Fill hid put back, as Restore Fill would: a style saved from
+/// the layer keeps its fills (No Fill is a way of drawing the layer, not part of its symbology).
+pub(crate) fn renderer_with_fills(l: &rustgis_map::Layer) -> Renderer {
+    let mut r = l.renderer.clone();
+    if l.no_fill.is_none() {
+        return r;
+    }
+    let Some(hidden) = &l.hidden_fills else { return r };
+    for (class, f) in &hidden.class_fills {
+        if r.class_fills(class).is_ok_and(<[_]>::is_empty) {
+            // A stack read bounded as it was kept: setting it can't fail, and if it did the
+            // style would keep the class as drawn now.
+            let _ = r.set_class_fills(class, f.clone());
+        }
+    }
+    if l.no_fill == Some(NoFill::Symbols) {
+        let mut now = 0;
+        r.map_symbols(|_| now += 1);
+        if hidden.alphas.len() == now {
+            let mut was = hidden.alphas.iter();
+            r.map_symbols(|s| {
+                if let Some(a) = was.next().filter(|_| s.fill.a() == 0) {
+                    s.fill = s.fill.with_alpha(*a);
+                }
+            });
+        }
+    }
+    r
+}
+
 /// The layer's own fill layers No Fill hid come back unless it has fill layers of its own now;
 /// those stay, and a note says the hidden ones weren't put back.
 fn put_back_layer_fills(l: &mut rustgis_map::Layer, fills: Vec<rustgis_map::fills::FillLayer>, notes: &mut Vec<String>) {

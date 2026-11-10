@@ -80,7 +80,7 @@ pub fn commands() -> Vec<C> {
             let id = s.layer_id(p)?;
             let l = s.map().layer(id).ok_or("no such layer")?;
             let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| l.name.clone());
-            let item = StyleItem { name: name.clone(), geometry: l.geometry_type(), renderer: l.renderer.clone(), labels: l.labels.clone(), transparency: l.transparency };
+            let item = StyleItem { name: name.clone(), geometry: l.geometry_type(), renderer: super::layer::renderer_with_fills(l), labels: l.labels.clone(), transparency: l.transparency };
             add_style(s, item);
             Ok(json!({"style": name}))
         }).roles(&[]).effects(crate::policy::Effects::NONE)

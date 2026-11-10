@@ -26791,6 +26791,20 @@ fn no_fill_hides_fill_layers_in_their_own_colour() {
     assert_eq!(l.renderer, before.renderer);
 }
 
+/// A style saved while No Fill is on keeps the fills No Fill hid: the class hatch and the symbols'
+/// opacities, as the layer had them.
+#[test]
+fn a_style_saved_during_no_fill_keeps_the_hidden_fills() {
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.fillLayers", &json!({"value": "a", "fills": [{"pattern": "hatch", "color": "#ff0000"}]})).unwrap();
+    let before = s.map().layer(id).unwrap().renderer.clone();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("style.new", &json!({"name": "kept"})).unwrap();
+    let style = s.project.styles.iter().find(|t| t.name == "kept").unwrap();
+    assert_eq!(style.renderer, before);
+    assert!(s.map().layer(id).unwrap().no_fill.is_some(), "the layer itself stays as it is");
+}
+
 /// A whole-layer fill in another colour, set while No Fill is on, is hidden by No Fill on again
 /// and comes back with Restore Fill (symbols path: the layer's own fills are drawn).
 #[test]
