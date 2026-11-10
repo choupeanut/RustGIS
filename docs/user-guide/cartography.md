@@ -140,8 +140,8 @@ in place of what it kept for those classes. A new symbology, colour scheme or fi
 turn No Fill off and draw the fills themselves, so Restore Fill is then no longer offered, and a
 notice counts the hidden fills that were dropped. On a mixed or streamed layer, where No Fill lays
 a transparent fill over the symbols, fill layers for the whole layer of any colour turn it off
-too, as they replace that fill. A project saved with No Fill on by an earlier RustGIS doesn't record the fills: Restore Fill then
-shows the symbols' fills at the default opacity and says what it couldn't put back. By command:
+too, as they replace that fill. A project saved with No Fill on by an earlier RustGIS doesn't record the fills, so Restore Fill says what it couldn't put back.
+On a polygon layer the symbols' fills show at the default opacity; on a mixed or streamed layer the symbols keep their own opacity, and fill layers the layer or its classes had don't come back. By command:
 
 ```text
 layer.noFill={"layer":"Countries"}
