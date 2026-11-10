@@ -373,8 +373,9 @@ fn parts_lost(g: &Node) -> usize {
 }
 
 /// The kinds of curve segment (an `Arc`, a `BSpline`…) under the curves a geometry keeps, which are
-/// read as their control points. Only segments other than `LineStringSegment` count. The curves of a
-/// ring or a multi-curve part that isn't kept don't: those are said as lost.
+/// read as their control points (a segment given by a centre point, as that centre). Only segments
+/// other than `LineStringSegment` count. The curves of a ring or a multi-curve part that isn't kept
+/// don't: those are said as lost.
 fn approximated(g: &Node) -> Vec<String> {
     let scratch = Cell::new(false);
     let surface = matches!(local(g), "Polygon" | "Surface" | "MultiPolygon" | "MultiSurface");
@@ -457,6 +458,8 @@ struct Kind {
     /// Features with curve segments read as their control points: how many, and the first few kinds.
     approximated: usize,
     approximated_names: Names,
+    /// Features with curve segments given by a centre point, which is read as a vertex.
+    centred: usize,
 }
 
 /// Reads a GML file into a layer per feature type (those with features).
@@ -534,7 +537,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                         rings_lost += lost.get();
                         geom = Some(gm);
                         kind.parts_lost += parts_lost(&g);
-                        let approx = approximated(&g);
+                        let (centred, approx): (Vec<String>, Vec<String>) =
+                            approximated(&g).into_iter().partition(|n| n.ends_with("ByCenterPoint"));
+                        kind.centred += usize::from(!centred.is_empty());
                         kind.approximated += usize::from(!approx.is_empty());
                         for n in approx {
                             kind.approximated_names.add(n);
@@ -678,6 +683,13 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                 ds.name,
                 kind.approximated,
                 kind.approximated_names.said()
+            ));
+        }
+        if kind.centred > 0 {
+            let what = if kind.centred == 1 { "feature" } else { "features" };
+            rep.messages.push(format!(
+                "{}: {} {what} had curve segments given by a centre point (ArcByCenterPoint or CircleByCenterPoint): the centre was read as a vertex, so the line doesn't follow the curve there",
+                ds.name, kind.centred
             ));
         }
         if unread > 0 {
@@ -1103,6 +1115,16 @@ mod tests {
             layers[0].1.messages
         );
         assert!(!said(&layers[1], "approximated"), "{:?}", layers[1].1.messages);
+        assert!(!said(&layers[0], "centre point") && !said(&layers[1], "centre point"), "{:?}", layers[0].1.messages);
+        // A segment given by a centre point gets that centre as a vertex, which is said for what it is.
+        let centred =
+            "<gml:ArcByCenterPoint numArc=\"1\"><gml:pos>10.5 48.5</gml:pos><gml:radius uom=\"m\">5</gml:radius></gml:ArcByCenterPoint>";
+        let gml = doc(&format!("{}{}", member("c", &curve(&format!("{seg}{centred}"))), member("c", &curve(seg))));
+        let layers = read("a.gml", gml.as_bytes()).unwrap();
+        assert!(layers[0].0.features.iter().all(|f| f.geometry.is_some()));
+        assert!(said(&layers[0], "a: 1 feature had curve segments given by a centre point"), "{:?}", layers[0].1.messages);
+        assert!(said(&layers[0], "the centre was read as a vertex"), "{:?}", layers[0].1.messages);
+        assert!(!said(&layers[0], "approximated"), "{:?}", layers[0].1.messages);
         // A circle by centre point with one position makes no line: the feature isn't read, and the
         // approximation isn't said a second time.
         let gml = doc(&member(
