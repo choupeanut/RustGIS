@@ -657,7 +657,11 @@ fn projected2(p: &Node) -> Result<Node, String> {
         let method_id = mapped.map(|&(code, _, _)| Item::Node(Node::new("AUTHORITY", "EPSG", [Item::Num(f64::from(code))])));
         items.push(Item::Node(Node::new("PROJECTION", name, method_id)));
         for param in conv.nodes().filter(|n| n.name.eq_ignore_ascii_case("PARAMETER")) {
-            let Some(v) = param.num(0) else { continue };
+            let Some(v) = param.num(0) else {
+                // Kept with no number, so it can be told from a parameter not given.
+                items.push(Item::Node(Node::new("PARAMETER", param.title(), None)));
+                continue;
+            };
             let (name, measure) = match lookup(param, PARAMETERS, |r| (r.0, r.1)) {
                 Some(&(_, _, wkt1, m)) => (wkt1, Some(m)),
                 None => (param.title(), None),
@@ -915,6 +919,12 @@ fn projected(p: &Node) -> Result<Crs, String> {
     let method = norm(p.child("PROJECTION").map_or("", Node::title));
     let pseudo = method == "MERCATOR_AUXILIARY_SPHERE" || method == "POPULAR_VISUALISATION_PSEUDO_MERCATOR";
     if name.contains("WEB_MERCATOR") || name.contains("PSEUDO_MERCATOR") || pseudo {
+        // `parameters` leaves out a value that isn't a finite number, and one left out counts as
+        // Web Mercator's default.
+        let unusable = |i: &Item| matches!(i, Item::Node(n) if n.name.eq_ignore_ascii_case("PARAMETER") && n.num(0).is_none());
+        if p.items.iter().any(unusable) {
+            return Err("a Web Mercator system with a parameter that isn't a finite number isn't supported".into());
+        }
         if is_web_mercator(p, &method) {
             if axis_flip(p)?.is_some() {
                 return Err(REVERSED_AXES.into());
@@ -3058,6 +3068,16 @@ pub(crate) mod tests {
         assert_ne!(east, wkt2);
         let e = crs_from_wkt(&east).unwrap_err();
         assert!(e.contains("a Web Mercator system with parameters of its own") && e.contains("isn't supported"), "{e}");
+        // A parameter that isn't a finite number isn't a default: refused, never read as one.
+        for huge in [
+            ESRI_3857.replace(r#""False_Easting",0.0"#, r#""False_Easting",1e400"#),
+            no_ext("1e400"),
+            wkt2.replace(r#"PARAMETER["False easting",0,"#, r#"PARAMETER["False easting",1e400,"#),
+        ] {
+            assert!(huge.contains("1e400"), "{huge}");
+            let e = crs_from_wkt(&huge).unwrap_err();
+            assert!(e.contains("isn't a finite number"), "{e}");
+        }
     }
 
     /// PROJ's `+towgs84` as WKT2: a `BOUNDCRS` with the shift to WGS 84 as its transformation.
