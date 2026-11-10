@@ -10,8 +10,8 @@
 //! The file is hostile: no DTD is read, the node count is capped, and features whose geometry
 //! can't be read are counted.
 
-use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::cell::{Cell, OnceCell};
+use std::collections::{BTreeMap, HashSet};
 
 use roxmltree::{Node, ParsingOptions};
 use rustgis_geom::Coord;
@@ -212,28 +212,34 @@ fn ring(mut r: Vec<Coord>) -> Option<Vec<Coord>> {
     (r.len() >= 4).then_some(r)
 }
 
-/// The rings of a polygon or surface patch: exterior (outerBoundaryIs) first. `lost` counts the
-/// rings left out: too few points or unreadable, and exterior rings past the first.
-fn polygon(p: &Node, zm: &Cell<bool>, lost: &Cell<usize>) -> Option<Vec<Vec<Coord>>> {
-    // Each ring `ring` keeps (at least four positions once closed, closed if it wasn't), and whether
-    // it had Z or M.
-    let boundary = |names: &[&str]| -> Vec<(Vec<Coord>, bool)> {
+/// The rings kept of a polygon or surface patch: the first exterior (outerBoundaryIs) ring, `None`
+/// without one, then the interiors. Each comes with its boundary element and whether it had Z or M.
+/// `lost` counts the rings left out: too few points or unreadable, and exterior rings past the first.
+fn kept_rings(p: &Node, lost: &Cell<usize>) -> Option<Vec<(roxmltree::NodeId, Vec<Coord>, bool)>> {
+    // Each ring `ring` keeps: at least four positions once closed, closed if it wasn't.
+    let boundary = |names: &[&str]| -> Vec<(roxmltree::NodeId, Vec<Coord>, bool)> {
         let kept = |b: Node| {
             let dims = Cell::new(false);
-            let r = coords(&b, &dims).and_then(ring).map(|r| (r, dims.get()));
+            let r = coords(&b, &dims).and_then(ring).map(|r| (b.id(), r, dims.get()));
             lost.set(lost.get() + usize::from(r.is_none()));
             r
         };
         p.descendants().filter(|d| d.is_element() && is_gml(d) && names.contains(&local(d))).filter_map(kept).collect()
     };
-    // The first exterior ring, then the interiors: only the rings kept mark Z or M.
     let mut outers = boundary(&["exterior", "outerBoundaryIs"]).into_iter();
     let outer = outers.next()?;
     lost.set(lost.get() + outers.count());
     let mut rings = vec![outer];
     rings.extend(boundary(&["interior", "innerBoundaryIs"]));
-    zm.set(zm.get() || rings.iter().any(|(_, d)| *d));
-    Some(rings.into_iter().map(|(r, _)| r).collect())
+    Some(rings)
+}
+
+/// The rings of a polygon or surface patch, exterior first. Only the rings kept mark Z or M; `lost`
+/// counts the others ([`kept_rings`]).
+fn polygon(p: &Node, zm: &Cell<bool>, lost: &Cell<usize>) -> Option<Vec<Vec<Coord>>> {
+    let rings = kept_rings(p, lost)?;
+    zm.set(zm.get() || rings.iter().any(|(_, _, d)| *d));
+    Some(rings.into_iter().map(|(_, r, _)| r).collect())
 }
 
 /// A GML geometry element as a geometry; `zm` is set when Z or M values are dropped, and `lost`
@@ -371,27 +377,36 @@ fn parts_lost(g: &Node) -> usize {
 /// ring or a multi-curve part that isn't kept don't: those are said as lost.
 fn approximated(g: &Node) -> Vec<String> {
     let scratch = Cell::new(false);
+    let surface = matches!(local(g), "Polygon" | "Surface" | "MultiPolygon" | "MultiSurface");
     let multi = matches!(local(g), "MultiCurve" | "MultiLineString");
     let is = |n: &Node, name: &str| n.is_element() && is_gml(n) && local(n) == name;
-    // Whether the curve is kept: a ring boundary above it as `polygon` keeps it, or else, in a
-    // multi-curve, at least two coordinates. (`ancestors` starts at the node itself.)
+    // The boundaries of the rings kept: worked out once, and only for a geometry with such a curve.
+    let rings = OnceCell::new();
+    let kept_boundaries = || -> HashSet<roxmltree::NodeId> {
+        let polygons = g.descendants().filter(|p| is(p, "Polygon") || is(p, "PolygonPatch"));
+        polygons.filter_map(|p| kept_rings(&p, &Cell::new(0))).flatten().map(|(boundary, ..)| boundary).collect()
+    };
+    // Whether the curve is kept: under the nearest ring boundary if that ring is, or else, in a
+    // multi-curve, with at least two coordinates. (`ancestors` starts at the node itself.)
     let kept = |c: &Node| {
+        if !surface {
+            return !multi || coords(c, &scratch).is_some_and(|v| v.len() >= 2);
+        }
         let boundary = c
             .ancestors()
             .take_while(|a| a != g)
             .find(|a| a.is_element() && is_gml(a) && matches!(local(a), "exterior" | "outerBoundaryIs" | "interior" | "innerBoundaryIs"));
-        match boundary {
-            Some(b) => coords(&b, &scratch).and_then(ring).is_some(),
-            None => !multi || coords(c, &scratch).is_some_and(|v| v.len() >= 2),
-        }
+        boundary.is_some_and(|b| rings.get_or_init(kept_boundaries).contains(&b.id()))
     };
-    g.descendants()
-        .filter(|c| is(c, "Curve") && kept(c))
-        .flat_map(|c| c.children().filter(|s| is(s, "segments")).flat_map(|s| s.children().filter(|x| x.is_element() && is_gml(x))))
-        .map(|x| local(&x))
-        .filter(|n| *n != "LineStringSegment")
-        .map(str::to_string)
-        .collect()
+    let mut names = Vec::new();
+    for c in g.descendants().filter(|c| is(c, "Curve")) {
+        let segments = c.children().filter(|s| is(s, "segments")).flat_map(|s| s.children()).filter(|x| x.is_element() && is_gml(x));
+        let curved: Vec<String> = segments.map(|x| local(&x).to_string()).filter(|n| n != "LineStringSegment").collect();
+        if !curved.is_empty() && kept(&c) {
+            names.extend(curved);
+        }
+    }
+    names
 }
 
 /// The first few distinct names of what a notice counts; more are said as `…`.
@@ -1139,6 +1154,21 @@ mod tests {
         assert!(layers[0].0.features[0].geometry.is_some(), "{:?}", layers[0].1.messages);
         assert!(said(&layers[0], "1 ring or surface patch of a geometry was left out"), "{:?}", layers[0].1.messages);
         assert!(!said(&layers[0], "approximated"), "{:?}", layers[0].1.messages);
+        // Only the first exterior ring is kept, so an arc in the second is not approximated.
+        let plain = "<gml:LinearRing><gml:posList>10 48 11 48 11 49 10 48</gml:posList></gml:LinearRing>";
+        let gml = member(&format!("<gml:Polygon><gml:exterior>{plain}</gml:exterior><gml:exterior>{good}</gml:exterior></gml:Polygon>"));
+        let layers = read("a.gml", gml.as_bytes()).unwrap();
+        assert!(layers[0].0.features[0].geometry.is_some(), "{:?}", layers[0].1.messages);
+        assert!(said(&layers[0], "1 ring or surface patch of a geometry was left out"), "{:?}", layers[0].1.messages);
+        assert!(!said(&layers[0], "approximated"), "{:?}", layers[0].1.messages);
+        // A polygon with no exterior ring is left out whole, with the arc of its interior.
+        let gml = member(&format!(
+            "<gml:MultiSurface><gml:surfaceMember><gml:Polygon><gml:interior>{good}</gml:interior></gml:Polygon></gml:surfaceMember><gml:surfaceMember><gml:Polygon><gml:exterior>{plain}</gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface>"
+        ));
+        let layers = read("a.gml", gml.as_bytes()).unwrap();
+        assert!(layers[0].0.features[0].geometry.is_some(), "{:?}", layers[0].1.messages);
+        assert_eq!(layers[0].1.messages.len(), 1, "{:?}", layers[0].1.messages);
+        assert!(said(&layers[0], "1 part of multi-geometries not read"), "{:?}", layers[0].1.messages);
     }
 
     /// A GML 2 feature whose only shape is a GeometryCollection had geometry that couldn't be read.
