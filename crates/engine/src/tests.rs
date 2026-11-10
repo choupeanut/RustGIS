@@ -26892,6 +26892,24 @@ fn no_fill_again_hides_what_was_shown_since() {
     assert_eq!(s.map().layer(id).unwrap().renderer.class_fills(&c).unwrap().len(), 2, "the dots and hatch set last");
 }
 
+/// A QGIS style with symbols turns No Fill off as Apply Style does, saying what that drops; one
+/// without leaves it on.
+#[test]
+fn qgis_style_turns_no_fill_off_only_with_symbols() {
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    let qml = |renderer: &str| format!(r#"<qgis version="3.40.0"><renderer-v2 type="{renderer}"/></qgis>"#);
+    s.run("style.importQgis", &json!({"text": qml("heatmapRenderer")})).unwrap();
+    assert!(s.map().layer(id).unwrap().no_fill.is_some(), "no symbols in it: still on");
+    for (case, says) in [("on", true), ("already off", false)] {
+        let mark = s.notice_mark();
+        s.run("style.importQgis", &json!({"text": qml("nullSymbol")})).unwrap();
+        assert!(s.map().layer(id).unwrap().no_fill.is_none(), "{case}: its symbols: off");
+        let said = s.notices_since(mark).iter().any(|n| n.text.contains("hidden fill"));
+        assert_eq!(said, says, "{case}: the fills it drops are said");
+    }
+}
+
 /// Restore Fill after an undo puts back what No Fill hid, on both paths: the symbols' own
 /// opacities (one of them 0) and the fill stacks of the layer and its classes.
 #[test]
