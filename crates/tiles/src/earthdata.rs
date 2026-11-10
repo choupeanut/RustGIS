@@ -58,7 +58,8 @@ fn token_store() -> &'static Mutex<Option<String>> {
 }
 
 /// Whether the token kept is the one [`restore`] read and nothing has set, replaced or forgotten
-/// it since. Never holds the token itself.
+/// it since. Never holds the token itself. Read and written only while holding the `token_store`
+/// lock, so it never disagrees with the token.
 static RESTORED: AtomicBool = AtomicBool::new(false);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -84,7 +85,12 @@ impl AccountIdentity {
     /// this computer was read since ([`restore`]) and nothing was given, forgotten or replaced
     /// after. For telling a cancelled request why; it never makes a stale identity current.
     pub fn restored_since(&self) -> bool {
-        self.relevant && self.token.is_none() && RESTORED.load(Ordering::SeqCst) && !self.is_current()
+        if !self.relevant || self.token.is_some() {
+            return false;
+        }
+        // Not `is_current`, which locks too: with no token in the snapshot, stale means one is active.
+        let token = lock(token_store());
+        RESTORED.load(Ordering::SeqCst) && token.is_some()
     }
 }
 
@@ -127,8 +133,9 @@ pub fn set_token(token: Option<&str>) -> Result<(), String> {
         Some(t) => checked(t)?,
         None => None,
     };
+    let mut kept = lock(token_store());
     RESTORED.store(false, Ordering::SeqCst);
-    *lock(token_store()) = token;
+    *kept = token;
     Ok(())
 }
 
@@ -213,24 +220,27 @@ pub fn restore() -> Restored {
     *read = true;
     let Some(store) = secret_store() else { return Restored::Nothing };
     let Ok(Some(secret)) = store.load(ACCOUNT) else { return Restored::Nothing };
-    if let Some(session) = lock(token_store()).as_deref() {
+    let mut kept = lock(token_store());
+    if let Some(session) = kept.as_deref() {
         REMEMBERED.kept.store(checked(secret.expose()).ok().flatten().as_deref() == Some(session), Ordering::SeqCst);
         return Restored::Nothing;
     }
     match checked(secret.expose()) {
         Ok(Some(token)) if !expired(&token, now_secs()) => {
             RESTORED.store(true, Ordering::SeqCst);
-            *lock(token_store()) = Some(token);
+            *kept = Some(token);
             REMEMBERED.kept.store(true, Ordering::SeqCst);
             Restored::Token
         }
         Ok(Some(_)) => {
+            drop(kept);
             REMEMBERED.kept.store(store.delete(ACCOUNT).is_err(), Ordering::SeqCst);
             REMEMBERED.expired.store(true, Ordering::SeqCst);
             Restored::Expired
         }
         // Damaged: of no use to anyone.
         _ => {
+            drop(kept);
             REMEMBERED.kept.store(store.delete(ACCOUNT).is_err(), Ordering::SeqCst);
             Restored::Nothing
         }
@@ -271,8 +281,11 @@ pub fn login(token: &str, remember: bool) -> Result<Option<&'static str>, String
     let mut read = lock(&REMEMBERED.read);
     *read = true;
     REMEMBERED.expired.store(false, Ordering::SeqCst);
-    RESTORED.store(false, Ordering::SeqCst);
-    *lock(token_store()) = Some(token.clone());
+    {
+        let mut kept = lock(token_store());
+        RESTORED.store(false, Ordering::SeqCst);
+        *kept = Some(token.clone());
+    }
     let Some(store) = secret_store() else { return Ok(remember.then_some(NO_STORE)) };
     let kept = REMEMBERED.kept.load(Ordering::SeqCst);
     if remember && store.save(ACCOUNT, &Secret::new(token)).is_ok() {
@@ -298,8 +311,11 @@ pub fn logout() -> Result<(), &'static str> {
     let mut read = lock(&REMEMBERED.read);
     *read = true;
     REMEMBERED.expired.store(false, Ordering::SeqCst);
-    RESTORED.store(false, Ordering::SeqCst);
-    *lock(token_store()) = None;
+    {
+        let mut kept = lock(token_store());
+        RESTORED.store(false, Ordering::SeqCst);
+        *kept = None;
+    }
     // Deleted even when this session didn't read it: forgetting is asked for. A system without
     // a credential store had nowhere to keep one, unless this session saw it there.
     match secret_store().map_or(Ok(()), |store| store.delete(ACCOUNT)) {

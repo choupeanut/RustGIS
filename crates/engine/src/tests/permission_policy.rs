@@ -921,7 +921,8 @@ fn permission_policy_exact_runtime_account_rotation() {
 }
 
 /// A remembered Earthdata token read before a node binds keeps it current; read after, it cancels
-/// with a message that says why; a login, logout or replacement keeps the ordinary message.
+/// with a message that says why; a login or replacement keeps the ordinary message. The command
+/// line and Python read it in `prefs::opt_in`, so their first command is not cancelled.
 #[test]
 fn permission_policy_remembered_earthdata_token_read_mid_run() {
     // The token and its store are process-wide: isolate them from every parallel plan reader.
@@ -930,6 +931,8 @@ fn permission_policy_remembered_earthdata_token_read_mid_run() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "tests::permission_policy::permission_policy_remembered_earthdata_token_read_mid_run", "--nocapture"])
             .env("RUSTGIS_POLICY_REMEMBERED_CHILD", "1")
+            // `opt_in` reads saved preferences: none, from a folder that doesn't exist.
+            .env("RUSTGIS_CONFIG_DIR", std::env::temp_dir().join(format!("rustgis-policy-remembered-{}", std::process::id())))
             .output()
             .unwrap();
         assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
@@ -994,6 +997,16 @@ fn permission_policy_remembered_earthdata_token_read_mid_run() {
     earthdata::set_token(Some("synthetic-typed")).unwrap();
     let said = s.download_continues(id).unwrap_err();
     assert!(said.contains("account changed") && !said.contains("remembered"), "{said}");
+
+    // The command line and Python opt in to saved secrets: that reads the token, so the first
+    // command binds it and is not cancelled.
+    let store = MemorySecrets::new();
+    store.save(earthdata::ACCOUNT, &Secret::new("synthetic-remembered")).unwrap();
+    earthdata::set_token(None).unwrap();
+    crate::prefs::opt_in(&mut s, store, |_| {});
+    let (id, still) = start(&mut s, 1630);
+    assert_eq!(earthdata::restore(), earthdata::Restored::Nothing);
+    assert!(still() && s.download_continues(id).is_ok());
     earthdata::set_secret_store(None);
     earthdata::set_token(None).unwrap();
 }

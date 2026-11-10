@@ -5000,7 +5000,8 @@ impl RustGisApp {
             // Agents the user turned on last time: the relay starts with the app.
             connectui::resume(self);
             // The Earthdata token remembered on this computer is read now, off the frame, so a
-            // command started later binds it instead of meeting it mid-run (#1626).
+            // command started later binds it instead of meeting it mid-run (#1626). This runs every
+            // frame; after the first call it returns at once.
             earthaccessui::restore(self, ctx);
             if let Some(relay) = &self.relay {
                 // A relay started before the first frame has no wake yet; now there is a context
