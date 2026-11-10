@@ -366,15 +366,27 @@ fn parts_lost(g: &Node) -> usize {
         .sum()
 }
 
-/// The kinds of curve segment (an `Arc`, a `BSpline`…) under the curves a geometry keeps that are read
-/// as their control points: only `LineStringSegment`s are the polyline they say. A curve of a
-/// multi-curve that gives too few coordinates isn't kept (counted by `parts_lost`), so it isn't here.
+/// The kinds of curve segment (an `Arc`, a `BSpline`…) under the curves a geometry keeps, which are
+/// read as their control points. Only segments other than `LineStringSegment` count. The curves of a
+/// ring or a multi-curve part that isn't kept don't: those are said as lost.
 fn approximated(g: &Node) -> Vec<String> {
     let scratch = Cell::new(false);
     let multi = matches!(local(g), "MultiCurve" | "MultiLineString");
     let is = |n: &Node, name: &str| n.is_element() && is_gml(n) && local(n) == name;
+    // Whether the curve is kept: a ring boundary above it as `polygon` keeps it, or else, in a
+    // multi-curve, at least two coordinates. (`ancestors` starts at the node itself.)
+    let kept = |c: &Node| {
+        let boundary = c
+            .ancestors()
+            .take_while(|a| a != g)
+            .find(|a| a.is_element() && is_gml(a) && matches!(local(a), "exterior" | "outerBoundaryIs" | "interior" | "innerBoundaryIs"));
+        match boundary {
+            Some(b) => coords(&b, &scratch).and_then(ring).is_some(),
+            None => !multi || coords(c, &scratch).is_some_and(|v| v.len() >= 2),
+        }
+    };
     g.descendants()
-        .filter(|c| is(c, "Curve") && (!multi || coords(c, &scratch).is_some_and(|v| v.len() >= 2)))
+        .filter(|c| is(c, "Curve") && kept(c))
         .flat_map(|c| c.children().filter(|s| is(s, "segments")).flat_map(|s| s.children().filter(|x| x.is_element() && is_gml(x))))
         .map(|x| local(&x))
         .filter(|n| *n != "LineStringSegment")
@@ -509,7 +521,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                         kind.parts_lost += parts_lost(&g);
                         let approx = approximated(&g);
                         kind.approximated += usize::from(!approx.is_empty());
-                        approx.into_iter().for_each(|n| kind.approximated_names.add(n));
+                        for n in approx {
+                            kind.approximated_names.add(n);
+                        }
                     }
                     None => {
                         bad = true;
@@ -1094,6 +1108,36 @@ mod tests {
         ));
         let layers = read("a.gml", gml.as_bytes()).unwrap();
         assert!(said(&layers[0], "a: 1 part of multi-geometries not read"), "{:?}", layers[0].1.messages);
+        assert!(!said(&layers[0], "approximated"), "{:?}", layers[0].1.messages);
+    }
+
+    /// #1700: the curves of a ring are approximated only when the ring is kept.
+    #[test]
+    fn curves_of_rings_are_said_only_when_the_ring_is_kept() {
+        let ring = |pos: &str| {
+            format!(
+                "<gml:Ring><gml:curveMember><gml:Curve><gml:segments><gml:Arc><gml:posList>{pos}</gml:posList></gml:Arc></gml:segments></gml:Curve></gml:curveMember></gml:Ring>"
+            )
+        };
+        let good = ring("10 48 10.5 47.5 11 48 11 49 10 48");
+        let member = |g: &str| doc(&format!("<wfs:member><app:p><app:g>{g}</app:g></app:p></wfs:member>"));
+        for (open, close) in
+            [("Polygon", "Polygon"), ("Surface><gml:patches><gml:PolygonPatch", "PolygonPatch></gml:patches></gml:Surface")]
+        {
+            let gml = member(&format!("<gml:{open}><gml:exterior>{good}</gml:exterior></gml:{close}>"));
+            let layers = read("a.gml", gml.as_bytes()).unwrap();
+            assert!(layers[0].0.features[0].geometry.is_some(), "{:?}", layers[0].1.messages);
+            assert!(said(&layers[0], "approximated by their control points (Arc)"), "{:?}", layers[0].1.messages);
+        }
+        // An interior ring too short to keep is left out, so its arc is not approximated (the exterior
+        // has no curve).
+        let gml = member(&format!(
+            "<gml:Polygon><gml:exterior><gml:LinearRing><gml:posList>10 48 11 48 11 49 10 48</gml:posList></gml:LinearRing></gml:exterior><gml:interior>{}</gml:interior></gml:Polygon>",
+            ring("10 48 11 48 10 48")
+        ));
+        let layers = read("a.gml", gml.as_bytes()).unwrap();
+        assert!(layers[0].0.features[0].geometry.is_some(), "{:?}", layers[0].1.messages);
+        assert!(said(&layers[0], "1 ring or surface patch of a geometry was left out"), "{:?}", layers[0].1.messages);
         assert!(!said(&layers[0], "approximated"), "{:?}", layers[0].1.messages);
     }
 
