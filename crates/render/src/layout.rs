@@ -1423,9 +1423,38 @@ fn scale_bar(
 fn shown_legends(map: &Map, scale: f64) -> Vec<(u32, Vec<LegendEntry>)> {
     map.layers
         .iter()
-        .filter(|l| map.draws_at(l, scale) && !l.graphics && !l.is_raster())
-        .filter_map(|l| l.shown_legend(scale).map(|entries| (l.id, entries)))
+        .filter(|l| map.draws_at(l, scale) && !l.graphics)
+        .filter_map(|l| shown_entries(l, scale).map(|entries| (l.id, entries)))
         .collect()
+}
+
+/// A classified raster's legend rows ([`rustgis_map::raster::RasterLayer::legend_classes`]): a filled
+/// swatch each, as the Layers pane draws them. Empty for a raster whose key is the colorbar.
+fn raster_entries(r: &rustgis_map::raster::RasterLayer, all: bool) -> Vec<LegendEntry> {
+    r.legend_classes(all)
+        .into_iter()
+        .map(|(c, label)| LegendEntry {
+            label,
+            symbol: rustgis_map::Symbol {
+                fill: c,
+                stroke: c.shade(0.6),
+                stroke_width: 0.7,
+                size: 0.0,
+                marker: rustgis_map::Marker::Circle,
+            },
+            strokes: Vec::new(),
+            fallback: false,
+        })
+        .collect()
+}
+
+/// What a layer's legend shows at a scale: a vector layer's classes it draws ([`rustgis_map::Layer::shown_legend`]),
+/// a classified raster's classes in its statistics; `None` when there are none.
+fn shown_entries(l: &rustgis_map::Layer, scale: f64) -> Option<Vec<LegendEntry>> {
+    match &l.raster {
+        Some(r) => Some(raster_entries(r, false)).filter(|e| !e.is_empty()),
+        None => l.shown_legend(scale),
+    }
 }
 
 /// Complete-source legends retain one minimal value per used class, never its geometry.
@@ -1433,13 +1462,12 @@ fn complete_shown_legends(map: &mut Map, scale: f64) -> Option<Vec<(u32, Vec<Leg
     if !map.layers.iter().any(|l| l.source.as_ref().and_then(|s| s.chunk_source()).is_some()) {
         return Some(shown_legends(map, scale));
     }
-    let wanted: Vec<usize> =
-        map.layers.iter().enumerate().filter(|(_, l)| map.draws_at(l, scale) && !l.graphics && !l.is_raster()).map(|(i, _)| i).collect();
+    let wanted: Vec<usize> = map.layers.iter().enumerate().filter(|(_, l)| map.draws_at(l, scale) && !l.graphics).map(|(i, _)| i).collect();
     let mut out = Vec::new();
     for index in wanted {
         let layer = map.layers.get_mut(index)?;
         let Some(source) = layer.source.as_ref().and_then(|s| s.chunk_source()) else {
-            if let Some(entries) = layer.shown_legend(scale) {
+            if let Some(entries) = shown_entries(layer, scale) {
                 out.push((layer.id, entries));
             }
             continue;
@@ -1733,7 +1761,7 @@ fn legend_rows<'a>(map: &'a Map, drawn: Option<&[(u32, Vec<LegendEntry>)]>, opts
                 continue;
             }
         };
-        if !(map.shows(l) && !l.graphics && !l.is_raster() && !excluded(&l.name)) {
+        if !(map.shows(l) && !l.graphics && !excluded(&l.name)) {
             continue;
         }
         let mut entries = match drawn {
@@ -1741,8 +1769,12 @@ fn legend_rows<'a>(map: &'a Map, drawn: Option<&[(u32, Vec<LegendEntry>)]>, opts
                 Some((_, entries)) => entries.clone(),
                 None => continue,
             },
-            None => l.renderer.legend(),
+            None => l.raster.as_ref().map_or_else(|| l.renderer.legend(), |r| raster_entries(r, true)),
         };
+        // A raster without classes has its colorbar: no swatch of its own.
+        if l.is_raster() && entries.is_empty() {
+            continue;
+        }
         // The fallback row only (a class that happens to bear its name stays).
         if opts.hide_other && entries.iter().any(|e| e.fallback) {
             entries.retain(|e| !e.fallback);
@@ -3074,6 +3106,72 @@ mod tests {
         let mut map = Map::new("m");
         map.add_raster("dem", rl);
         map
+    }
+
+    /// A map with a 4 × 1 raster of the classes 1, 1, 2, 3 and a colour table, styled by `renderer`.
+    fn classes_map(renderer: impl Fn(&rustgis_data::raster::Raster) -> rustgis_map::raster::RasterRenderer) -> Map {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 0.25, pixel_height: -1.0 };
+        let mut palette = vec![[0, 0, 0, 0]; 256];
+        palette[1..4].copy_from_slice(&[[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]]);
+        let r = Raster::new("cover", 4, 1, vec![vec![1.0, 1.0, 2.0, 3.0]], gt, Crs::LonLat, None, ColorHint::Palette(palette), "UInt8")
+            .unwrap();
+        let mut rl = rustgis_map::raster::RasterLayer::from_path(r.clone(), "cover.tif");
+        rl.style.renderer = renderer(&r);
+        let mut map = Map::new("m");
+        map.add_raster("Cover", rl);
+        map
+    }
+
+    fn class_labels(map: &Map, all: bool, exclude: &[String]) -> Vec<String> {
+        let drawn = shown_legends(map, 1e6);
+        let opts = LegendOptions { hide_other: false, exclude, scale: 1e6 };
+        legend_rows(map, (!all).then_some(drawn.as_slice()), &opts)
+            .into_iter()
+            .filter_map(|r| if let LegendRow::Class(_, en) = r { Some(en.label) } else { None })
+            .collect()
+    }
+
+    /// A classified raster is in the legend (#1679): its categories (or, for Unique Values with
+    /// `allClasses`, every entry), under its name, by name left out, and no other raster is.
+    #[test]
+    fn legend_lists_a_classified_raster() {
+        use rustgis_map::raster::{RasterRenderer, Stretch};
+        let map = classes_map(|_| RasterRenderer::Colormap);
+        assert_eq!(class_labels(&map, false, &[]), ["1", "2", "3"]);
+        assert_eq!(class_labels(&map, true, &[]), ["1", "2", "3"], "a colormap has no more");
+        assert!(class_labels(&map, false, &["cover".into()]).is_empty(), "left out by name");
+        let (w, h) = legend_sizes_mm(&mut map.clone(), 1e6, false, false, &[]).unwrap()[0];
+        let row = f64::from(LEGEND_ROW) * 25.4 / 96.0;
+        assert!(w > 0.0 && (h - 4.0 * row).abs() < 1e-9, "its name and three classes: {w} × {h} mm");
+        assert_eq!(legend_sizes_mm(&mut map.clone(), 1e6, false, false, &["Cover".into()]).unwrap()[0].1, 0.0);
+
+        // Unique Values with a class no cell has: only the used ones, unless all are asked for.
+        let map = classes_map(|r| {
+            let mut u = rustgis_map::raster::unique_values(r, 0, rustgis_map::Ramp::Harbour);
+            if let RasterRenderer::UniqueValues { values, .. } = &mut u {
+                values.push((7.0, rustgis_map::Rgba::rgb(1, 2, 3)));
+            }
+            u
+        });
+        assert_eq!(class_labels(&map, false, &[]), ["1", "2", "3"]);
+        assert_eq!(class_labels(&map, true, &[]), ["1", "2", "3", "7"]);
+        let mut hidden = map.clone();
+        if let Some(r) = hidden.layers.first_mut().and_then(|l| l.raster.as_mut()) {
+            r.style.mask.values = vec![2.0];
+        }
+        assert_eq!(class_labels(&hidden, false, &[]), ["1", "3"], "without what its mask hides");
+
+        // A stretch, hillshade or RGB raster has the colorbar, not rows; with or without all classes.
+        for renderer in [
+            RasterRenderer::Stretch { band: 0, ramp: rustgis_map::Ramp::Greys, invert: false },
+            RasterRenderer::Rgb { red: 0, green: 0, blue: 0 },
+        ] {
+            let map = ramp_map(renderer, Stretch::None);
+            assert!(shown_legends(&map, 1e6).is_empty());
+            assert!(legend_rows(&map, None, &LegendOptions { hide_other: false, exclude: &[], scale: 1e6 }).is_empty());
+            assert_eq!(legend_sizes_mm(&mut map.clone(), 1e6, true, false, &[]).unwrap()[0].1, 0.0);
+        }
     }
 
     /// A page with a main frame and an inset (5–55 mm) that outlines it in `color` at `width`.

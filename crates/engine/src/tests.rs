@@ -7944,6 +7944,25 @@ fn a_publication_layouts_raster_gets_a_colorbar() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sheet whose only theme is a raster in classes gets them in a filled legend, not an empty box:
+/// without its colorbar, which says the same, the rows are its key (#1679).
+#[test]
+fn a_publication_keys_a_classified_raster_in_its_legend() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let mut s = Session::new(Project::default());
+    let z: Vec<f32> = (0..400).map(|i| (i % 4) as f32 + 1.0).collect();
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 0.5, pixel_height: -0.5 };
+    let r = Raster::new("classes", 20, 20, vec![z], gt, Crs::LonLat, None, ColorHint::Gray, "Byte").unwrap();
+    let bytes = geotiff::write(&r, 0).unwrap();
+    crate::cmd::raster::add_raster(&mut s, "classes", rustgis_map::RasterLayer::from_bytes(r, "classes.tif".to_string(), bytes)).unwrap();
+    s.run("raster.symbology", &json!({"type": "unique"})).unwrap();
+    let r = s.run("layout.publication", &json!({"author": "", "locator": "none", "colorbar": "none"})).unwrap();
+    let l = s.project.layouts.last().unwrap();
+    assert!(l.elements.iter().all(|e| e.name != "Colorbar"), "{r}");
+    let legend = l.elements.iter().find(|e| e.name == "Legend").unwrap_or_else(|| panic!("no legend: {r}"));
+    assert!(legend.h > 0.0 && legend.w > 0.0, "{r}");
+}
+
 #[test]
 fn layouts_compose_export_and_round_trip() {
     use base64::Engine;

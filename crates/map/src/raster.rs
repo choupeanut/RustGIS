@@ -1605,6 +1605,23 @@ pub enum RasterLegend {
 impl RasterLayer {
     /// Legend rows for the Layers pane.
     pub fn legend(&self) -> Vec<RasterLegend> {
+        self.legend_with(false)
+    }
+
+    /// The classes of a Colormap, Unique Values or Classify raster as a swatch colour and label, for
+    /// a layout legend; empty for any other renderer, whose key is the colorbar. With `all`, every
+    /// entry of a Unique Values renderer; otherwise only the values in the band's statistics (all
+    /// of them while it has none). A Colormap lists its categories either way, and a Classify its
+    /// intervals, which have no values to count.
+    pub fn legend_classes(&self, all: bool) -> Vec<(Rgba, String)> {
+        self.legend_with(!all)
+            .into_iter()
+            .filter_map(|e| if let RasterLegend::Class { color, label } = e { Some((color, label)) } else { None })
+            .collect()
+    }
+
+    /// [`RasterLayer::legend`], with `seen` leaving a Unique Values renderer's classes the band's statistics don't have.
+    fn legend_with(&self, seen: bool) -> Vec<RasterLegend> {
         let Some(r) = &self.data else { return Vec::new() };
         let band_name = |b: usize| r.bands.get(b).map(|b| b.name.clone()).unwrap_or_default();
         // A class's name in the file (GDAL's category names), or else its value.
@@ -1646,6 +1663,10 @@ impl RasterLayer {
             RasterRenderer::UniqueValues { band, values, .. } => values
                 .iter()
                 .filter(|(v, _)| !mask.hides(*v as f32))
+                .filter(|(v, _)| {
+                    let cats = r.bands.get(*band).and_then(|b| b.stats.categories.as_ref());
+                    !seen || cats.is_none_or(|c| c.contains(v))
+                })
                 .map(|(v, c)| RasterLegend::Class { color: *c, label: class_label(*band, *v) })
                 .collect(),
             RasterRenderer::Colormap => {

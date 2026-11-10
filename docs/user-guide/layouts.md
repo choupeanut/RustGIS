@@ -172,6 +172,12 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     (`"allClasses": true`) to list every class of every visible layer instead, and **Hide other
     values** (`"hideOther": true`) to leave `<all other values>` out of the legend in either
     mode (the features it stands for are still drawn).
+    A raster drawn in classes (Colormap, Unique Values or Classify) is listed under its name with
+    the rows the Layers pane shows: the values in its statistics, without those its mask hides, or
+    every Unique Values entry with `"allClasses": true`. Stretch, hillshade and RGB rasters add no
+    rows (the colorbar is their key), and `exclude` leaves a raster out like any layer, in layouts
+    saved before this too. A publication's colorbar for a raster in classes says the same as its
+    rows: `"colorbar": "none"` leaves it out.
   - **Columns** (`"columns"`, 1 to 3): its rows side by side under its title, as even as they go,
     each column as wide as its widest row, with its own column of symbols, and a layer's name
     staying with the row under it. The box keeps its size, so widen it for the columns: in a box
