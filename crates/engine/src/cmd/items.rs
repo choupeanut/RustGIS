@@ -122,6 +122,8 @@ pub fn commands() -> Vec<C> {
             }
             l.labels.repoint_missing_fields(&l.dataset);
             l.transparency = st.transparency;
+            let area_notice = super::design::display_area_message(l);
+            if let Some(notice) = area_notice { s.notify(notice,false); }
             if relock {
                 s.map_mut().label_lock = None;
                 s.map_mut().label_lock_line_anchors.clear();
@@ -454,10 +456,11 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
             }
             vec![m]
         }
-        Err(_) => match Project::from_import_json(&text, dir.as_deref()) {
+        Err(_) => match Project::from_import_maps_json(&text, dir.as_deref(), MAX_IMPORTED_MAPS) {
             Ok(mut project) => {
-                for notice in project.take_read_notices(&[crate::project::ReadPart::Labels, crate::project::ReadPart::Diagrams]) {
-                    s.notify(notice, false);
+                let parts = [crate::project::ReadPart::Labels, crate::project::ReadPart::Diagrams, crate::project::ReadPart::Maps];
+                for notice in project.take_read_notices(&parts) {
+                    s.notify_text(notice, false);
                 }
                 // Hidden diagrams of the maps imported only.
                 let imported = project.maps.iter().take(MAX_IMPORTED_MAPS).flat_map(|m| &m.layers);
@@ -473,6 +476,7 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
         },
     };
     let mut names = Vec::new();
+    let first_map = s.project.maps.len();
     for mut m in maps.into_iter().take(MAX_IMPORTED_MAPS) {
         // A binding in a file is no authority to use a login here.
         crate::s3_connections::clear_bindings(m.addresses_mut());
@@ -487,10 +491,13 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
         m.renew_instance_id();
         s.project.maps.push(m);
     }
+    if let Some(message) = super::design::display_area_messages(s.project.maps.iter().skip(first_map).flat_map(|map| map.layers.iter())) {
+        s.notify(message, false);
+    }
     // Repair what was read (rasters reopen, cameras clamp); the sources that read S3 wait for
     // the saved connection that is to read them.
-    for notice in s.project.normalize() {
-        s.notify(notice, false);
+    for notice in s.project.normalize_text() {
+        s.notify_text(notice, false);
     }
     super::connections::restore_active(s);
     super::connections::resolve_project(s);
@@ -548,7 +555,7 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
         let mut project = project.map_err(|e| not_a(e, "layer file, map file or project"))?;
         // Styles take the layers' renderers and labels, not their diagrams or the layouts.
         for notice in project.take_read_notices(&[crate::project::ReadPart::Labels]) {
-            s.notify(notice, false);
+            s.notify_text(notice, false);
         }
         project.maps.into_iter().flat_map(|m| m.layers).collect()
     };

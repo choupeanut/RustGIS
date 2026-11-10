@@ -53,8 +53,8 @@ pub fn commands() -> Vec<C> {
             let (left_out, table) =
                 rustgis_data::io::write_path_to(&t.dataset, Path::new(path), Crs::LonLat, &gpkg).map_err(|e| e.to_string())?;
             s.check_continuation(&owner).map_err(|why| super::exports::completion_refused(Some(path), why))?;
-            if left_out > 0 {
-                s.notify(format!("{path}: {left_out} features without drawable geometry were left out"), false);
+            if let Some(note) = rustgis_data::io::left_out_note(path, &ext, left_out) {
+                s.notify(note, false);
             }
             for note in notes.into_iter().chain(dbf_notes) {
                 s.notify(note, false);
@@ -340,11 +340,17 @@ fn export_view(
 /// The map view on one PDF page (for printing): the page is the view's shape at 96 points per
 /// inch of screen, kept as vectors with what is pixels by nature drawn at `dpi`.
 pub fn map_pdf(s: &mut Session, dpi: f64) -> Result<Vec<u8>, String> {
+    let revisions = rustgis_render::archive_revisions([s.map()]);
+    let result = map_pdf_inner(s, dpi);
+    revisions.finish_revision(rustgis_render::archive_revisions([s.map()]), Some(result), "could not draw the map")?
+}
+
+fn map_pdf_inner(s: &mut Session, dpi: f64) -> Result<Vec<u8>, String> {
     let (vw, vh) = s.view_size;
     let ppp = (dpi / 96.0).clamp(0.5, 6.0);
     let view =
         View { width: vw.clamp(16.0, 8000.0), height: vh.clamp(16.0, 8000.0), pixels_per_point: ppp, camera: s.map().camera, sky: false };
-    let drawing = rustgis_render::render_drawing(s.map_mut(), &view).ok_or("could not draw the map")?;
+    let drawing = rustgis_render::render_drawing(s.map_mut(), &view)?;
     let mm = |pt: f64| pt * 25.4 / 96.0;
     let (w, h) = (mm(view.width), mm(view.height));
     let page = if drawing.overflowed() {
@@ -643,11 +649,9 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         dbf_notes.extend(rustgis_data::io::shapefile_values_notes(ds, path));
     }
     // FlatGeobuf, KML, GPX and Shapefile hold features with geometry only (a Shapefile, only
-    // geometry it can draw).
+    // geometry it can draw, of the layer's kind).
     let mut said = Vec::new();
-    if left_out > 0 {
-        said.push(format!("{path}: {left_out} features without drawable geometry were left out"));
-    }
+    said.extend(rustgis_data::io::left_out_note(path, &ext, left_out));
     if skipped > 0 {
         said.push(format!("{path}: {skipped} rows couldn't be read and were left out"));
     }
