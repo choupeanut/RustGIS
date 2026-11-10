@@ -366,6 +366,22 @@ fn parts_lost(g: &Node) -> usize {
         .sum()
 }
 
+/// The kinds of curve segment (an `Arc`, a `BSpline`…) under the curves a geometry keeps that are read
+/// as their control points: only `LineStringSegment`s are the polyline they say. A curve of a
+/// multi-curve that gives too few coordinates isn't kept (counted by `parts_lost`), so it isn't here.
+fn approximated(g: &Node) -> Vec<String> {
+    let scratch = Cell::new(false);
+    let multi = matches!(local(g), "MultiCurve" | "MultiLineString");
+    let is = |n: &Node, name: &str| n.is_element() && is_gml(n) && local(n) == name;
+    g.descendants()
+        .filter(|c| is(c, "Curve") && (!multi || coords(c, &scratch).is_some_and(|v| v.len() >= 2)))
+        .flat_map(|c| c.children().filter(|s| is(s, "segments")).flat_map(|s| s.children().filter(|x| x.is_element() && is_gml(x))))
+        .map(|x| local(&x))
+        .filter(|n| *n != "LineStringSegment")
+        .map(str::to_string)
+        .collect()
+}
+
 /// The first few distinct names of what a notice counts; more are said as `…`.
 #[derive(Default)]
 struct Names(Vec<String>, bool);
@@ -411,6 +427,9 @@ struct Kind {
     parts_lost: usize,
     /// Rings and surface patches of its geometries left out.
     lost: usize,
+    /// Features with curve segments read as their control points: how many, and the first few kinds.
+    approximated: usize,
+    approximated_names: Names,
 }
 
 /// Reads a GML file into a layer per feature type (those with features).
@@ -488,6 +507,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                         rings_lost += lost.get();
                         geom = Some(gm);
                         kind.parts_lost += parts_lost(&g);
+                        let approx = approximated(&g);
+                        kind.approximated += usize::from(!approx.is_empty());
+                        approx.into_iter().for_each(|n| kind.approximated_names.add(n));
                     }
                     None => {
                         bad = true;
@@ -618,6 +640,15 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
             rep.messages.push(format!(
                 "{}: {parts} {what} of multi-geometries not read (a reference, too short, invalid coordinates, or of a kind not read)",
                 ds.name
+            ));
+        }
+        if kind.approximated > 0 {
+            let what = if kind.approximated == 1 { "feature" } else { "features" };
+            rep.messages.push(format!(
+                "{}: {} {what} had curve segments approximated by their control points ({})",
+                ds.name,
+                kind.approximated,
+                kind.approximated_names.said()
             ));
         }
         if unread > 0 {
@@ -1018,6 +1049,52 @@ mod tests {
         ));
         let layers = read("n.gml", gml.as_bytes()).unwrap();
         assert!(!said(&layers[0], "multi-geometries"), "{:?}", layers[0].1.messages);
+    }
+
+    /// #1700: a curve segment that isn't a line string segment is read as its control points, and
+    /// said per feature type; a curve of line string segments says nothing.
+    #[test]
+    fn approximated_curve_segments_are_said_on_their_own_feature_type() {
+        let arc = "<gml:Arc><gml:posList>10 48 10.5 48.5 11 48</gml:posList></gml:Arc>";
+        let seg = "<gml:LineStringSegment><gml:posList>10 48 11 49</gml:posList></gml:LineStringSegment>";
+        let curve = |s: &str| format!("<gml:Curve><gml:segments>{s}</gml:segments></gml:Curve>");
+        let member = |kind: &str, g: &str| format!("<wfs:member><app:{kind}><app:g>{g}</app:g></app:{kind}></wfs:member>");
+        let gml = doc(&format!(
+            "{}{}{}{}",
+            member("roads", &curve(&format!("{seg}{arc}"))),
+            member("roads", &curve(&format!("{arc}<gml:Circle><gml:posList>1 1 2 2 3 1</gml:posList></gml:Circle>"))),
+            member("roads", &curve(seg)),
+            member("rails", &curve(seg)),
+        ));
+        let layers = read("a.gml", gml.as_bytes()).unwrap();
+        assert!(layers[0].0.features.iter().all(|f| f.geometry.is_some()));
+        assert!(
+            said(&layers[0], "a roads: 2 features had curve segments approximated by their control points (Arc, Circle)"),
+            "{:?}",
+            layers[0].1.messages
+        );
+        assert!(!said(&layers[1], "approximated"), "{:?}", layers[1].1.messages);
+        // A circle by centre point with one position makes no line: the feature isn't read, and the
+        // approximation isn't said a second time.
+        let gml = doc(&member(
+            "c",
+            &curve("<gml:CircleByCenterPoint><gml:pos>10 48</gml:pos><gml:radius uom=\"m\">5</gml:radius></gml:CircleByCenterPoint>"),
+        ));
+        let layers = read("a.gml", gml.as_bytes()).unwrap();
+        assert_eq!(layers[0].1.skipped, 1, "{:?}", layers[0].1.messages);
+        assert!(!said(&layers[0], "approximated"), "{:?}", layers[0].1.messages);
+        // In a multi-curve the same part is lost (said as such), not approximated.
+        let line = "<gml:LineString><gml:posList>10 48 11 48</gml:posList></gml:LineString>";
+        let gml = doc(&member(
+            "m",
+            &format!(
+                "<gml:MultiCurve><gml:curveMember>{}</gml:curveMember><gml:curveMember>{line}</gml:curveMember></gml:MultiCurve>",
+                curve("<gml:CircleByCenterPoint><gml:pos>10 48</gml:pos></gml:CircleByCenterPoint>")
+            ),
+        ));
+        let layers = read("a.gml", gml.as_bytes()).unwrap();
+        assert!(said(&layers[0], "a: 1 part of multi-geometries not read"), "{:?}", layers[0].1.messages);
+        assert!(!said(&layers[0], "approximated"), "{:?}", layers[0].1.messages);
     }
 
     /// A GML 2 feature whose only shape is a GeometryCollection had geometry that couldn't be read.
