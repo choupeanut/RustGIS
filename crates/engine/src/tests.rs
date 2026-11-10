@@ -27997,9 +27997,24 @@ fn a_new_renderer_from_a_style_or_subtypes_ends_no_fill() {
         f.attrs.push(rustgis_data::Value::Int(1));
     }
     s.run("layer.noFill", &Value::Null).unwrap();
+    let mark = s.notice_mark();
     s.run("data.subtypes", &json!({"field": "code", "subtypes": [{"code": 1, "name": "one"}]})).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains("turning No Fill off drops")), "{said:?}");
     let l = s.map().layer(id).unwrap();
     assert!(l.no_fill.is_none() && l.hidden_fills.is_none());
+}
+
+/// A class's fill colour chosen while No Fill is on is recorded for Restore Fill only while the
+/// saved opacities match the symbols: a record of other symbols is left as it is.
+#[test]
+fn class_style_leaves_a_mismatched_opacity_record_alone() {
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.map_mut().layer_mut(id).unwrap().hidden_fills.as_mut().unwrap().alphas = vec![0x11];
+    s.run("layer.classStyle", &json!({"value": "a", "color": "#336699"})).unwrap();
+    let hidden = s.map().layer(id).unwrap().hidden_fills.as_ref().unwrap();
+    assert_eq!(hidden.alphas, vec![0x11], "{:?}", hidden.alphas);
 }
 
 /// The layer's own fill layers No Fill hid don't replace fill layers set since; Restore Fill says
@@ -28112,6 +28127,14 @@ fn turning_no_fill_off_says_what_it_drops() {
     s.run("layer.fillLayers", &json!({"fills": [{"pattern": "hatch", "color": "#ff0000"}]})).unwrap();
     let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
     assert!(said.len() == 1 && said[0].contains("drops"), "{said:?}");
+    assert!(s.map().layer(id).unwrap().no_fill.is_none());
+    // A fill colour given to the layer turns No Fill off and says what it drops, too.
+    let (mut s, id) = no_fill_layer(false);
+    s.run("layer.noFill", &Value::Null).unwrap();
+    let mark = s.notice_mark();
+    s.run("layer.color", &json!({"layer": id, "color": "#336699"})).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains("drops")), "{said:?}");
     assert!(s.map().layer(id).unwrap().no_fill.is_none());
 }
 

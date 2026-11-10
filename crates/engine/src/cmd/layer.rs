@@ -5715,9 +5715,12 @@ fn class_style(s: &mut Session, p: &Value) -> CmdResult {
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     let g = l.geometry_type();
     let e = l.renderer.set_class_style(&class, &style, g)?;
-    // A fill colour chosen while No Fill hides the fills is the one Restore Fill shows.
+    // A fill colour chosen while No Fill hides the fills is the one Restore Fill shows. The saved
+    // opacities are only this class's while they still match the symbols, as Restore Fill needs.
     let at = symbol_position(&l.renderer, &class).filter(|_| style.color.is_some());
-    if let Some(a) = at.and_then(|i| l.hidden_fills.as_mut()?.alphas.get_mut(i)) {
+    let mut now = 0;
+    l.renderer.map_symbols(|_| now += 1);
+    if let Some(a) = at.and_then(|i| l.hidden_fills.as_mut().filter(|h| h.alphas.len() == now)?.alphas.get_mut(i)) {
         *a = e.symbol.fill.a();
     }
     Ok(json!({"label": e.label, "color": e.symbol.fill.hex(), "outline": e.symbol.stroke.hex()}))
