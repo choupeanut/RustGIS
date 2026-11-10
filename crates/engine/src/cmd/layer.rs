@@ -1051,32 +1051,37 @@ fn restore_fill(l: &mut rustgis_map::Layer) -> Result<Vec<String>, String> {
 
 /// The layer's renderer with what No Fill hid put back, as Restore Fill would: a style saved from
 /// the layer keeps its fills (No Fill is a way of drawing the layer, not part of its symbology).
-pub(crate) fn renderer_with_fills(l: &rustgis_map::Layer) -> Renderer {
+/// Also how many it couldn't put back: class stacks (the class has fills of its own now, or is
+/// gone) and symbols' opacities (not kept, or kept for other classes), for a notice.
+pub(crate) fn renderer_with_fills(l: &rustgis_map::Layer) -> (Renderer, usize) {
     let mut r = l.renderer.clone();
     if l.no_fill.is_none() {
-        return r;
+        return (r, 0);
     }
-    let Some(hidden) = &l.hidden_fills else { return r };
-    for (class, f) in &hidden.class_fills {
-        if r.class_fills(class).is_ok_and(<[_]>::is_empty) {
-            // A stack read bounded as it was kept: setting it can't fail, and if it did the
-            // style would keep the class as drawn now.
-            let _ = r.set_class_fills(class, f.clone());
-        }
+    let mut left_out = 0;
+    let (class_fills, alphas) = match &l.hidden_fills {
+        Some(h) => (h.class_fills.as_slice(), h.alphas.as_slice()),
+        None => (&[][..], &[][..]),
+    };
+    for (class, f) in class_fills {
+        let placed = r.class_fills(class).is_ok_and(<[_]>::is_empty) && r.set_class_fills(class, f.clone()).is_ok();
+        left_out += usize::from(!placed);
     }
     if l.no_fill == Some(NoFill::Symbols) {
         let mut now = 0;
         r.map_symbols(|_| now += 1);
-        if hidden.alphas.len() == now {
-            let mut was = hidden.alphas.iter();
-            r.map_symbols(|s| {
-                if let Some(a) = was.next().filter(|_| s.fill.a() == 0) {
-                    s.fill = s.fill.with_alpha(*a);
+        let mut was = alphas.iter().filter(|_| alphas.len() == now);
+        r.map_symbols(|s| {
+            let a = was.next();
+            if s.fill.a() == 0 {
+                match a {
+                    Some(a) => s.fill = s.fill.with_alpha(*a),
+                    None => left_out += 1,
                 }
-            });
-        }
+            }
+        });
     }
-    r
+    (r, left_out)
 }
 
 /// The layer's own fill layers No Fill hid come back unless it has fill layers of its own now;

@@ -26803,6 +26803,16 @@ fn a_style_saved_during_no_fill_keeps_the_hidden_fills() {
     let style = s.project.styles.iter().find(|t| t.name == "kept").unwrap();
     assert_eq!(style.renderer, before);
     assert!(s.map().layer(id).unwrap().no_fill.is_some(), "the layer itself stays as it is");
+
+    // Clean: no notice. A class given fills of its own since: the hidden hatch is left out, said once.
+    let mark = s.notice_mark();
+    s.run("style.new", &json!({"name": "clean"})).unwrap();
+    assert!(s.notices_since(mark).is_empty());
+    s.run("layer.fillLayers", &json!({"value": "a", "fills": [{"pattern": "dots"}]})).unwrap();
+    let mark = s.notice_mark();
+    s.run("style.new", &json!({"name": "dots"})).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said.iter().filter(|t| t.contains("couldn't be put back")).count(), 1, "{said:?}");
 }
 
 /// A whole-layer fill in another colour, set while No Fill is on, is hidden by No Fill on again

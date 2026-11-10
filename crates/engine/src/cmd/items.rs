@@ -80,8 +80,13 @@ pub fn commands() -> Vec<C> {
             let id = s.layer_id(p)?;
             let l = s.map().layer(id).ok_or("no such layer")?;
             let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| l.name.clone());
-            let item = StyleItem { name: name.clone(), geometry: l.geometry_type(), renderer: super::layer::renderer_with_fills(l), labels: l.labels.clone(), transparency: l.transparency };
+            let (renderer, left_out) = super::layer::renderer_with_fills(l);
+            let layer = l.name.clone();
+            let item = StyleItem { name: name.clone(), geometry: l.geometry_type(), renderer, labels: l.labels.clone(), transparency: l.transparency };
             add_style(s, item);
+            if left_out > 0 {
+                s.notify(format!("Style {name} from {layer}: {left_out} fill(s) No Fill hid couldn't be put back in it, as their classes have fills of their own now, are gone or their opacity wasn't kept; it draws them as the layer does now"), false);
+            }
             Ok(json!({"style": name}))
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_feature_layer)
