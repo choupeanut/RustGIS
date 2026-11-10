@@ -188,7 +188,8 @@ fn secret_store() -> Option<Arc<dyn SecretStore>> {
 }
 
 /// Gives the credential store a token is remembered in (the desktop's keychain; the command
-/// line's and Python's when they opt in to saved secrets). It is read when first needed.
+/// line's and Python's when they opt in to saved secrets). The app reads it at launch, the command
+/// line and Python when a command first needs it.
 pub fn set_secret_store(store: Option<Arc<dyn SecretStore>>) {
     let mut read = lock(&REMEMBERED.read);
     *lock(&REMEMBERED.store) = store;
@@ -211,7 +212,8 @@ pub enum Restored {
 /// this session first wins: the store then only tells whether it holds that token (another session
 /// of the process may have remembered it). An expired or damaged one is deleted. Reading may ask
 /// the system to unlock its store: the app calls this off the frame (requests to data hosts call
-/// it themselves).
+/// it themselves, and the command line and Python before a command that names one binds its
+/// accounts).
 pub fn restore() -> Restored {
     let mut read = lock(&REMEMBERED.read);
     if *read {

@@ -922,7 +922,7 @@ fn permission_policy_exact_runtime_account_rotation() {
 
 /// A remembered Earthdata token read before a node binds keeps it current; read after, it cancels
 /// with a message that says why; a login or replacement keeps the ordinary message. The command
-/// line and Python read it in `prefs::opt_in`, so their first command is not cancelled.
+/// line and Python read it for a command that names a data host, so that command is not cancelled.
 #[test]
 fn permission_policy_remembered_earthdata_token_read_mid_run() {
     // The token and its store are process-wide: isolate them from every parallel plan reader.
@@ -998,13 +998,30 @@ fn permission_policy_remembered_earthdata_token_read_mid_run() {
     let said = s.download_continues(id).unwrap_err();
     assert!(said.contains("account changed") && !said.contains("remembered"), "{said}");
 
-    // The command line and Python opt in to saved secrets: that reads the token, so the first
-    // command binds it and is not cancelled.
+    // Run as the command line and Python run a command.
+    let run = |s: &mut Session, url: &str| {
+        s.run("layer.addUrl", &json!({ "url": url })).unwrap();
+        let request = s.take_url_requests().pop().unwrap();
+        let id = s.download_started_for(&request).unwrap();
+        (id, s.download_still(id).unwrap())
+    };
+    let data_host = "https://data.ornldaac.earthdata.nasa.gov/remembered.geojson";
+    // Without the opt-in (the app, which reads it off the frame) a command doesn't read the token.
+    relaunch();
+    run(&mut s, data_host);
+    assert!(!earthdata::has_token());
+
+    // Opting in to saved secrets reads nothing, and neither does a command naming no data host.
+    // One that names a data host reads the token first, binds it and is not cancelled.
     let store = MemorySecrets::new();
     store.save(earthdata::ACCOUNT, &Secret::new("synthetic-remembered")).unwrap();
     earthdata::set_token(None).unwrap();
     crate::prefs::opt_in(&mut s, store, |_| {});
-    let (id, still) = start(&mut s, 1630);
+    assert!(!earthdata::has_token());
+    run(&mut s, "https://example.invalid/remembered.geojson");
+    assert!(!earthdata::has_token());
+    let (id, still) = run(&mut s, data_host);
+    assert!(earthdata::has_token());
     assert_eq!(earthdata::restore(), earthdata::Restored::Nothing);
     assert!(still() && s.download_continues(id).is_ok());
     earthdata::set_secret_store(None);

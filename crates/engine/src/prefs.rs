@@ -82,9 +82,7 @@ pub fn opt_in(
     });
     let store: Arc<dyn SecretStore> = Arc::new(store);
     crate::render::rustgis_tiles::earthdata::set_secret_store(Some(store.clone()));
-    // Read the remembered Earthdata token now, so a command started later binds it instead of
-    // meeting it mid-run and cancelling (#1626).
-    crate::render::rustgis_tiles::earthdata::restore();
+    s.saved_secrets_opted_in = true;
     use_saved_secrets(s, &prefs, store);
     prefs
 }
