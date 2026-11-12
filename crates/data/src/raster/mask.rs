@@ -26,27 +26,43 @@ pub(super) enum Found {
     Elsewhere,
     /// The file has no mask.
     None,
+    /// The scan stopped before the end of the file, or an image it passed over can't be read, so
+    /// a mask may be there unseen; the reason, in words.
+    Unscanned(String),
 }
 
 /// The mask of the image at `image` (0: the full one, else an overview) whose size is `size`: the
 /// first mask image of that size, an overview's with the reduced-resolution bit set. Leaves the
 /// decoder at the mask.
 pub(super) fn find<R: Read + Seek>(dec: &mut Decoder<R>, image: usize, size: (u32, u32)) -> Found {
-    if dec.seek_to_image(0).is_err() {
-        return Found::None;
+    if let Err(e) = dec.seek_to_image(0) {
+        return Found::Unscanned(format!("the image directories can't be read: {e}"));
     }
     let (mut index, mut masks) = (0, false);
     loop {
-        let subfile = dec.find_tag_unsigned::<u32>(Tag::NewSubfileType).ok().flatten().unwrap_or(0);
+        let subfile = match dec.find_tag_unsigned::<u32>(Tag::NewSubfileType) {
+            Ok(tag) => tag.unwrap_or(0),
+            Err(e) => return Found::Unscanned(format!("image {index}'s type can't be read: {e}")),
+        };
         if subfile & 4 != 0 {
-            if (subfile & 1 != 0) == (image != 0) && dec.dimensions().ok() == Some(size) {
+            let dims = match dec.dimensions() {
+                Ok(dims) => dims,
+                Err(e) => return Found::Unscanned(format!("image {index}'s size can't be read: {e}")),
+            };
+            if (subfile & 1 != 0) == (image != 0) && dims == size {
                 return Found::At(index);
             }
             masks = true;
         }
         index += 1;
-        if index >= MAX_IMAGES || !dec.more_images() || dec.next_image().is_err() {
+        if !dec.more_images() {
             return if masks { Found::Elsewhere } else { Found::None };
+        }
+        if index >= MAX_IMAGES {
+            return Found::Unscanned(format!("the scan stopped after {MAX_IMAGES} images"));
+        }
+        if let Err(e) = dec.next_image() {
+            return Found::Unscanned(format!("image {index} can't be read: {e}"));
         }
     }
 }
@@ -57,24 +73,25 @@ pub(super) fn find<R: Read + Seek>(dec: &mut Decoder<R>, image: usize, size: (u3
 pub(super) fn read<R: Read + Seek>(dec: &mut Decoder<R>, index: usize, step: u32) -> Result<Vec<bool>> {
     dec.seek_to_image(index).map_err(err)?;
     let (w, h) = dec.dimensions().map_err(err)?;
-    let tag = |dec: &mut Decoder<R>, t: Tag| dec.find_tag_unsigned::<u32>(t).ok().flatten();
-    let bits = dec.find_tag_unsigned_vec::<u16>(Tag::BitsPerSample).ok().flatten().unwrap_or_else(|| vec![1]);
-    if bits != [1] || tag(dec, Tag::SamplesPerPixel).is_some_and(|s| s != 1) {
+    // An absent tag is its default; one that can't be read is an error, not a default.
+    let tag = |dec: &mut Decoder<R>, t: Tag| dec.find_tag_unsigned::<u32>(t).map_err(err);
+    let bits = dec.find_tag_unsigned_vec::<u16>(Tag::BitsPerSample).map_err(err)?.unwrap_or_else(|| vec![1]);
+    if bits != [1] || tag(dec, Tag::SamplesPerPixel)?.is_some_and(|s| s != 1) {
         return Err(err("a transparency mask isn't 1 bit a pixel"));
     }
-    let compression = tag(dec, Tag::Compression).unwrap_or(1);
+    let compression = tag(dec, Tag::Compression)?.unwrap_or(1);
     if !matches!(compression, 1 | 5 | 8 | 32773 | 32946) {
         return Err(err(format!("a transparency mask's compression ({compression}) isn't supported")));
     }
-    if tag(dec, Tag::Predictor).is_some_and(|p| p != 1) {
+    if tag(dec, Tag::Predictor)?.is_some_and(|p| p != 1) {
         return Err(err("a transparency mask with a predictor isn't supported"));
     }
-    let lsb_first = tag(dec, Tag::FillOrder) == Some(2);
-    let tiled = tag(dec, Tag::TileWidth).is_some();
+    let lsb_first = tag(dec, Tag::FillOrder)? == Some(2);
+    let tiled = tag(dec, Tag::TileWidth)?.is_some();
     let (cw, ch) = if tiled {
-        (tag(dec, Tag::TileWidth).unwrap_or(0), tag(dec, Tag::TileLength).unwrap_or(0))
+        (tag(dec, Tag::TileWidth)?.unwrap_or(0), tag(dec, Tag::TileLength)?.unwrap_or(0))
     } else {
-        (w, tag(dec, Tag::RowsPerStrip).unwrap_or(h).min(h))
+        (w, tag(dec, Tag::RowsPerStrip)?.unwrap_or(h).min(h))
     };
     if cw == 0 || ch == 0 || step == 0 {
         return Err(err("a transparency mask has chunks of no size"));
@@ -150,7 +167,8 @@ fn packbits(input: &[u8], max: usize) -> Vec<u8> {
             out.extend_from_slice(input.get(i..(i + run).min(input.len())).unwrap_or_default());
             i += run;
         } else if n != -128 {
-            let byte = input.get(i).copied().unwrap_or(0);
+            // A repeat with no value byte ends the data: the short chunk is then an error.
+            let Some(&byte) = input.get(i) else { break };
             i += 1;
             out.extend(std::iter::repeat_n(byte, (1 - i16::from(n)) as usize));
         }
@@ -247,6 +265,8 @@ mod tests {
         assert_eq!(packbits(&[0xFE, 9], 2), [9, 9]);
         // Cut short mid-run: what is there is kept.
         assert_eq!(packbits(&[5, 1, 2], 100), [1, 2]);
+        // A run with no value byte: nothing from it.
+        assert!(packbits(&[0xF9], 100).is_empty());
     }
 
     #[test]
@@ -254,5 +274,25 @@ mod tests {
         let rows = rows();
         let mut dec = Decoder::new(std::io::Cursor::new(striped(10, 7, 7, 1, &[rows[..5].concat()]))).expect("decoder");
         assert!(read(&mut dec, 0, 1).is_err());
+    }
+
+    /// A packbits run that lacks its value byte is a short chunk, not eight transparent pixels.
+    #[test]
+    fn a_packbits_run_without_its_byte_is_a_short_chunk() {
+        let mut dec = Decoder::new(std::io::Cursor::new(striped(8, 8, 8, 32773, &[vec![0xF9]]))).expect("decoder");
+        assert!(read(&mut dec, 0, 1).is_err());
+    }
+
+    /// A damaged image directory chain is said, not taken for a file without a mask.
+    #[test]
+    fn a_damaged_image_chain_is_unscanned_not_no_mask() {
+        let mut bytes = striped(10, 7, 7, 1, &[rows().concat()]);
+        // The next image directory points past the end of the file.
+        let ifd = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        let next = ifd + 2 + 12 * 10;
+        bytes[next..next + 4].copy_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+        let mut dec = Decoder::new(std::io::Cursor::new(bytes)).expect("decoder");
+        // The overview's mask isn't the first image's, so the scan goes on past it and fails.
+        assert!(matches!(find(&mut dec, 1, (10, 7)), Found::Unscanned(_)));
     }
 }

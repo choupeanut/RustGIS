@@ -1478,6 +1478,7 @@ pub(super) fn read_limited_with_nodata(
             Err(e) => mask_lost = Some(e.to_string()),
         },
         super::mask::Found::Elsewhere => mask_lost = Some("the file has none for the image read".to_string()),
+        super::mask::Found::Unscanned(why) => mask_lost = Some(why),
         super::mask::Found::None => {}
     }
     let mask_lost = mask_lost.map(|why| format!("its transparency mask isn't applied ({why}): masked pixels draw as stored"));
