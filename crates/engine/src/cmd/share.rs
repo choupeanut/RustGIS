@@ -689,7 +689,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         return Err(format!("{path}: {e}"));
     }
     let parquet = matches!(ext.as_str(), "parquet" | "geoparquet");
-    let (written, left_out, skipped, table, unfit, null_numbers, moved, csv, dates) = match &chunks {
+    let (written, left_out, skipped, table, unfit, null_numbers, moved, csv, dates, text) = match &chunks {
         Some((src, layer)) => {
             let (e, table) =
                 rustgis_data::export::write_source_to(src.as_ref(), layer, Path::new(&path), crs, &gpkg).map_err(|e| e.to_string())?;
@@ -702,7 +702,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
                 .collect();
             dates.extend(rustgis_data::io::utc_dates_note(&layer.fields, &e.utc_dates, path));
             dates.extend(e.date_messages.iter().map(|n| format!("{path}: {n}")));
-            (e.written, e.left_out, e.skipped, table, unfit, e.null_numbers, moved, e.csv, dates)
+            (e.written, e.left_out, e.skipped, table, unfit, e.null_numbers, moved, e.csv, dates, e.text.notes(&layer.fields, path))
         }
         None => {
             let (left_out, table) = rustgis_data::io::write_path_to(ds, Path::new(&path), crs, &gpkg).map_err(|e| e.to_string())?;
@@ -712,7 +712,8 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
             let mut dates: Vec<String> =
                 unreadable.dates.iter().map(|n| format!("{path}: {}: {n}, so they're empty in the export", ds.name)).collect();
             dates.extend(gpkg_dates_note(ds, &ext, path));
-            (ds.features.len().saturating_sub(left_out), left_out, unread, table, unfit, null_numbers, None, csv, dates)
+            let text = rustgis_data::io::text_read_back_notes(ds, &ext, rustgis_data::io::name_field(ds), path);
+            (ds.features.len().saturating_sub(left_out), left_out, unread, table, unfit, null_numbers, None, csv, dates, text)
         }
     };
     // The features written give their own extent. A streamed layer written a chunk at a time has
@@ -751,6 +752,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     }
     said.extend(notes);
     said.extend(dbf_notes);
+    said.extend(text);
     said.extend(unfit);
     said.extend(dates);
     if shapefile && rustgis_data::raster::wkt::to_wkt(crs).is_none() {

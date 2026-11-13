@@ -43,6 +43,8 @@ pub struct Exported {
     pub beyond_web_mercator: usize,
     /// Geometry a CSV can't hold, counted over all chunks (none for the other formats).
     pub csv: crate::io::CsvLosses,
+    /// Text a CSV file reads back trimmed or as null (CSV only).
+    pub text: crate::io::TextReadBack,
     /// Per field of the layer, values of the source's date fields that weren't dates, so are
     /// written as null ([`crate::source::Batch::unread_dates`], said by
     /// [`crate::source::unread_dates_note`]).
@@ -134,6 +136,7 @@ fn write_chunks_as(
     let mut beyond_web_mercator = 0usize;
     let mut null_numbers = 0usize;
     let mut csv = crate::io::CsvLosses::default();
+    let mut text = crate::io::TextReadBack::default();
     let mut unread_dates = Vec::new();
     let mut utc_dates = Vec::new();
     let mut feed = |add: &mut dyn FnMut(&[Feature]) -> Result<()>| -> Result<()> {
@@ -142,6 +145,7 @@ fn write_chunks_as(
         beyond_web_mercator = 0;
         null_numbers = 0;
         csv = crate::io::CsvLosses::default();
+        text = crate::io::TextReadBack::default();
         utc_dates.clear();
         // The writers count the features; a source that doesn't know how many leaves the total at 0.
         crate::progress::begin(src.info().count.map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)));
@@ -162,6 +166,7 @@ fn write_chunks_as(
             null_numbers = null_numbers.saturating_add(numbers_written_as_null(&chunk, &layer.fields, ext));
             if ext == "csv" {
                 csv += crate::io::CsvLosses::of(&chunk, geometry_type);
+                text.merge(&crate::io::TextReadBack::of_csv(&chunk));
             }
             if ext == "gpkg" {
                 crate::source::add_unread_dates(&mut utc_dates, &crate::io::offset_dates(chunk.iter(), &layer.fields));
@@ -211,7 +216,19 @@ fn write_chunks_as(
     };
     let written = total.saturating_sub(left_out);
     Ok((
-        Exported { written, left_out, skipped, null_numbers, unfit, beyond_web_mercator, csv, unread_dates, utc_dates, date_messages },
+        Exported {
+            written,
+            left_out,
+            skipped,
+            null_numbers,
+            unfit,
+            beyond_web_mercator,
+            csv,
+            text,
+            unread_dates,
+            utc_dates,
+            date_messages,
+        },
         table,
     ))
 }

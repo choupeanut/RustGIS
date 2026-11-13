@@ -20244,7 +20244,9 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
         "{n:?}"
     );
     let n = said(&mut s, "share.exportLayer", json!({"layer": "Sites", "path": out("sites.gpx")}));
-    assert!(n.len() == 1 && n[0].contains("1 multipoint was written as a waypoint for each"), "{n:?}");
+    // 'height' is empty in both of its features, which GPX holds no field for.
+    assert!(n.len() == 2 && n[0].contains("1 multipoint was written as a waypoint for each"), "{n:?}");
+    assert!(n[1].contains("1 field is empty in every feature") && n[1].ends_with("'height'"), "{n:?}");
     let n = said(&mut s, "data.convert", json!({"layer": "Areas", "format": "gpx"}));
     assert!(n.iter().any(|t| t.contains("'height'")) && n.iter().any(|t| t.contains("tracks")), "{n:?}");
     let n = said(&mut s, "data.convert", json!({"layer": "Areas", "format": "csv"}));
@@ -20255,7 +20257,9 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
     s.map_mut().add_dataset(rows);
     for format in ["kml", "gpx"] {
         let n = said(&mut s, "data.convert", json!({"layer": "Rows", "format": format}));
-        assert!(n.len() == 1 && n[0].contains("1 features without drawable geometry were left out"), "{format}: {n:?}");
+        // The field that is null in the feature written is said too.
+        assert!(n.len() == 2 && n.iter().any(|t| t.contains("1 features without drawable geometry were left out")), "{format}: {n:?}");
+        assert!(n.iter().any(|t| t.contains("1 field is empty in every feature") && t.ends_with("'height'")), "{format}: {n:?}");
     }
     // A standalone table keeps geometry too: Export Table says the same, and nothing for a clean one.
     let areas = layer("Area table", GeometryType::Polygon, vec![(square(0.0, true), vec![V::Text("A".into()), V::Float(2.5)])]);
@@ -20267,18 +20271,21 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
     assert!(n.len() == 1 && n[0].contains("the geometry of 1 feature wasn't written"), "{n:?}");
     let n = said(&mut s, "share.exportTable", json!({"table": 9001, "path": out("table.gpx")}));
     assert!(n.iter().any(|t| t.contains("'height'")) && n.iter().any(|t| t.contains("1 hole left out")), "{n:?}");
-    for ext in ["csv", "gpx"] {
-        let n = said(&mut s, "share.exportTable", json!({"table": 9002, "path": out(&format!("clean-table.{ext}"))}));
-        assert_eq!(n, Vec::<String>::new(), "{ext}");
-    }
-    // Points alone, their other field empty: CSV and GPX hold them whole.
-    for ext in ["csv", "gpx"] {
-        assert_eq!(
-            said(&mut s, "share.exportLayer", json!({"layer": "Clean", "path": out(&format!("clean.{ext}"))})),
-            Vec::<String>::new()
-        );
-        assert_eq!(said(&mut s, "data.convert", json!({"layer": "Clean", "format": ext})), Vec::<String>::new());
-    }
+    // Points alone: CSV holds them whole; GPX has no value for the field that is empty in the
+    // feature, which it says and nothing else.
+    let empty_field = |n: &[String]| n.len() == 1 && n[0].contains("1 field is empty in every feature") && n[0].ends_with("'height'");
+    let n = said(&mut s, "share.exportTable", json!({"table": 9002, "path": out("clean-table.csv")}));
+    assert!(n.is_empty(), "{n:?}");
+    let n = said(&mut s, "share.exportTable", json!({"table": 9002, "path": out("clean-table.gpx")}));
+    assert!(empty_field(&n), "{n:?}");
+    let n = said(&mut s, "share.exportLayer", json!({"layer": "Clean", "path": out("clean.csv")}));
+    assert!(n.is_empty(), "{n:?}");
+    let n = said(&mut s, "share.exportLayer", json!({"layer": "Clean", "path": out("clean.gpx")}));
+    assert!(empty_field(&n), "{n:?}");
+    let n = said(&mut s, "data.convert", json!({"layer": "Clean", "format": "csv"}));
+    assert!(n.is_empty(), "{n:?}");
+    let n = said(&mut s, "data.convert", json!({"layer": "Clean", "format": "gpx"}));
+    assert!(empty_field(&n), "{n:?}");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
