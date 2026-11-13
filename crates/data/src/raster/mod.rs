@@ -839,14 +839,20 @@ impl Raster {
         let nd = self.nodata.map(|v| v as f32);
         let valid = move |v: f32| v.is_finite() && nd.is_none_or(|d| v != d);
         let overview = self.overview.is_some();
+        // Bands whose attribute table's class names aren't used: the file names their classes.
+        let mut unused_tables = 0usize;
         for (i, band) in self.bands.iter_mut().enumerate() {
             let p = pam.band(i + 1);
             if let Some(d) = p.and_then(|p| p.description.as_ref()) {
                 band.name = d.clone();
             }
             // A table's names don't replace those the file's own metadata gave.
-            if let Some(p) = p.filter(|p| !p.categories.is_empty() && !(p.from_table && !band.classes.is_empty())) {
-                band.classes = p.categories.clone();
+            if let Some(p) = p.filter(|p| !p.categories.is_empty()) {
+                if p.from_table && !band.classes.is_empty() {
+                    unused_tables += 1;
+                } else {
+                    band.classes = p.categories.clone();
+                }
             }
             if let Some(w) = p.and_then(|p| p.wavelength) {
                 band.wavelength = Some(w);
@@ -855,6 +861,11 @@ impl Raster {
             if recompute || stored.is_some() {
                 band.stats = BandStats::compute_with(&band.data, valid, stored);
             }
+        }
+        if unused_tables > 0 {
+            self.lost.push(format!(
+                "{from}: {unused_tables} attribute table(s) of class names not read: the file's own metadata names those bands' classes"
+            ));
         }
     }
 
@@ -1657,6 +1668,16 @@ pub(crate) mod tests {
         assert_eq!(b.classes, ["", "Water", "", "Forest"]);
         assert_eq!((b.class_name(1.0), b.class_name(3.0), b.class_name(2.0)), (Some("Water"), Some("Forest"), None));
         assert!(back.lost.is_empty(), "{:?}", back.lost);
+        // Class names the GeoTIFF gives itself are kept over the table's, and that is said.
+        let mut named = r.clone();
+        named.bands[0].classes = vec![String::new(), "Lake".into()];
+        std::fs::write(&tif, geotiff::write(&named, 0).unwrap()).unwrap();
+        let own = read_path(&tif).unwrap();
+        assert_eq!(own.bands[0].classes, ["", "Lake"]);
+        assert_eq!(
+            own.lost,
+            ["its .aux.xml sidecar: 1 attribute table(s) of class names not read: the file's own metadata names those bands' classes"]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

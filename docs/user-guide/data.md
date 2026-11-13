@@ -1178,7 +1178,8 @@ Colormap or Unique Values layer; a value without a name shows the value itself. 
 names, the name column of a raster attribute table in the sidecar labels them the same way (a table
 of value ranges isn't read, and is said). The band
 descriptions GDAL and rasterio write inside a GeoTIFF (its `GDAL_METADATA` tag) name its bands
-too, a sidecar's taking precedence; a table's names don't replace class names the GeoTIFF itself gives.
+too, a sidecar's taking precedence; a table's names don't replace class names the GeoTIFF itself
+gives, or the sidecar's category names, and a table left unread that way is said.
 Exporting a raster opened from an overview writes that overview; the results of adding and of
 exporting it (`layer.addData`, `share.exportRaster`) give the full size as `overviewOf`, so scripts
 and the MCP server see it too. A GeoTIFF read in place that is added before its overview is in

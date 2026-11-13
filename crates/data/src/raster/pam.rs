@@ -31,6 +31,9 @@ const MAX_BANDS: usize = 65_536;
 const MAX_CATEGORIES: usize = 65_536;
 /// Most rows read from a band's raster attribute table.
 const MAX_RAT_ROWS: usize = 262_144;
+/// Most class values all of a sidecar's attribute tables hold together (each up to the highest
+/// value a table names), so a few bytes of table can't make each of many bands hold 65,536 names.
+const MAX_RAT_SLOTS: usize = 1 << 20;
 /// Longest band description or class name read from GDAL's metadata tag, in characters.
 const MAX_NAME: usize = 256;
 
@@ -373,12 +376,15 @@ fn parse_sidecar(text: &str) -> Result<Pam, String> {
             categories.pop();
         }
         // Without category names, a raster attribute table's name column names the classes.
+        // A table beside category names isn't read, and is counted when it names classes too.
         let mut from_table = false;
-        if categories.is_empty()
-            && let Some(table) = b.children().find(|n| n.has_tag_name("GDALRasterAttributeTable"))
-        {
-            categories = table_names(table, &mut kept, &mut rat);
-            from_table = !categories.is_empty();
+        if let Some(table) = b.children().find(|n| n.has_tag_name("GDALRasterAttributeTable")) {
+            if categories.is_empty() {
+                categories = table_names(table, &mut kept, &mut rat);
+                from_table = !categories.is_empty();
+            } else {
+                rat.named += usize::from(name_column(&table_fields(table)).is_some());
+            }
         }
         pam.bands.push(PamBand { band, description, nodata, stats, categories, from_table, wavelength });
     }
@@ -433,30 +439,37 @@ fn parse_sidecar(text: &str) -> Result<Pam, String> {
     if rat.rows > 0 {
         pam.lost.push(format!("{} attribute table row(s) past the first {MAX_RAT_ROWS} left out", rat.rows));
     }
+    if rat.over > 0 {
+        pam.lost.push(format!(
+            "{} class name(s) of an attribute table past the sidecar's first {MAX_RAT_SLOTS} class values left out",
+            rat.over
+        ));
+    }
+    if rat.named > 0 {
+        pam.lost.push(format!("{} attribute table(s) of class names not read: the band's category names are used", rat.named));
+    }
     if cut > 0 {
         pam.lost.push(format!("{cut} band or class name(s) cut to {MAX_NAME} characters"));
     }
     Ok(pam)
 }
 
-/// What reading raster attribute tables left out, for [`parse_sidecar`] to say.
+/// What reading raster attribute tables left out, for [`parse_sidecar`] to say, and how many
+/// class values they hold so far (against [`MAX_RAT_SLOTS`]).
 #[derive(Default)]
 struct RatLost {
     ranges: usize,
     odd: usize,
     again: usize,
     rows: usize,
+    over: usize,
+    named: usize,
+    slots: usize,
 }
 
-/// The class names a GDAL raster attribute table holds, by value (as `PamBand::categories`).
-/// The names are in the field GDAL gives the name usage, else a text field called `Class_Name`
-/// and the like; a table with none names nothing and loses nothing. A row's value is its
-/// value field (the min-max usage, else one called `Value`), else from the table's linear
-/// binning, else the row's number (GDAL's convention for a table with no value field). A table
-/// of value ranges can't name single values and is counted.
-fn table_names(table: roxmltree::Node<'_, '_>, kept: &mut dyn FnMut(&str) -> String, lost: &mut RatLost) -> Vec<String> {
-    // Each field's lower-case name, type and usage, in order.
-    let fields: Vec<(String, Option<u32>, Option<u32>)> = table
+/// A table's fields, in order: each one's lower-case name, type and usage.
+fn table_fields(table: roxmltree::Node<'_, '_>) -> Vec<(String, Option<u32>, Option<u32>)> {
+    table
         .children()
         .filter(|n| n.has_tag_name("FieldDefn"))
         .map(|f| {
@@ -467,25 +480,40 @@ fn table_names(table: roxmltree::Node<'_, '_>, kept: &mut dyn FnMut(&str) -> Str
                 text("Usage").and_then(|u| u.parse().ok()),
             )
         })
-        .collect();
+        .collect()
+}
+
+/// The field of a table's class names: the one GDAL gives the name usage, else a text field
+/// called `Class_Name` and the like.
+fn name_column(fields: &[(String, Option<u32>, Option<u32>)]) -> Option<usize> {
     const NAMES: [&str; 6] = ["class_name", "classname", "class_names", "class", "name", "label"];
-    let Some(name_at) =
-        fields.iter().position(|f| f.2 == Some(2)).or_else(|| fields.iter().position(|f| f.1 == Some(2) && NAMES.contains(&f.0.as_str())))
-    else {
+    fields.iter().position(|f| f.2 == Some(2)).or_else(|| fields.iter().position(|f| f.1 == Some(2) && NAMES.contains(&f.0.as_str())))
+}
+
+/// The class names a GDAL raster attribute table holds, by value (as `PamBand::categories`).
+/// The names are in its [`name_column`]; a table with none names nothing and loses nothing. A
+/// row's value is its value field (the min-max usage, else one called `Value`); without one, the
+/// whole number in its unit bin when the table gives linear binning (`Row0Min` and `BinSize`,
+/// row `index` from `Row0Min`), else its `index` (GDAL's convention for a table with no value
+/// field). A table of value ranges (bins wider than 1, or a min and a max with no value) can't
+/// name single values and is counted.
+fn table_names(table: roxmltree::Node<'_, '_>, kept: &mut dyn FnMut(&str) -> String, lost: &mut RatLost) -> Vec<String> {
+    let fields = table_fields(table);
+    let Some(name_at) = name_column(&fields) else {
         return Vec::new();
     };
     let value_at = fields.iter().position(|f| f.2 == Some(5)).or_else(|| fields.iter().position(|f| f.0 == "value"));
     let (min, bin) = (
-        table.attribute("Row0Min").and_then(|v| v.trim().parse::<f64>().ok()),
+        table.attribute("Row0Min").and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()),
         table.attribute("BinSize").and_then(|v| v.trim().parse::<f64>().ok()),
     );
+    let binned = min.zip(bin);
     let has = |usage| fields.iter().any(|f| f.2 == Some(usage));
-    if value_at.is_none() && ((has(3) && has(4)) || bin.is_some_and(|b| b != 1.0)) {
+    let wide = bin.is_some_and(|b| b != 1.0);
+    if wide || (value_at.is_none() && binned.is_none() && has(3) && has(4)) {
         lost.ranges += 1;
         return Vec::new();
     }
-    // Linear binning of whole values from `Row0Min`, when the table gives both.
-    let first = min.zip(bin).map(|(m, _)| m);
     let rows: Vec<_> = table.children().filter(|n| n.has_tag_name("Row")).collect();
     lost.rows += rows.len().saturating_sub(MAX_RAT_ROWS);
     let mut categories: Vec<String> = Vec::new();
@@ -496,9 +524,13 @@ fn table_names(table: roxmltree::Node<'_, '_>, kept: &mut dyn FnMut(&str) -> Str
         if name.is_empty() {
             continue;
         }
-        let value = match value_at {
-            Some(at) => cell(at).parse::<f64>().ok(),
-            None => Some(first.unwrap_or(0.0) + i as f64),
+        // The row's number as the file gives it, else its place.
+        let index = row.attribute("index").map_or(Some(i as f64), |v| v.trim().parse::<usize>().ok().map(|v| v as f64));
+        let value = match (value_at, binned) {
+            (Some(at), _) => cell(at).parse::<f64>().ok(),
+            // The whole number in the unit bin [Row0Min + index, Row0Min + index + 1).
+            (None, Some((m, _))) => index.map(|r| (m + r).ceil()),
+            (None, None) => index,
         };
         let Some(v) = value.filter(|v| v.fract() == 0.0 && (0.0..MAX_CATEGORIES as f64).contains(v)) else {
             lost.odd += 1;
@@ -510,6 +542,12 @@ fn table_names(table: roxmltree::Node<'_, '_>, kept: &mut dyn FnMut(&str) -> Str
             continue;
         }
         if categories.len() <= v {
+            let grow = v + 1 - categories.len();
+            if lost.slots + grow > MAX_RAT_SLOTS {
+                lost.over += 1;
+                continue;
+            }
+            lost.slots += grow;
             categories.resize(v + 1, String::new());
         }
         categories[v] = kept(name);
@@ -1016,7 +1054,50 @@ mod tests {
 </PAMRasterBand></PAMDataset>"#;
         let pam = parse(xml).unwrap();
         assert_eq!(pam.band(1).unwrap().categories, ["a", "b"]);
-        assert!(!pam.band(1).unwrap().from_table && pam.lost.is_empty(), "{:?}", pam.lost);
+        assert!(!pam.band(1).unwrap().from_table);
+        assert_eq!(pam.lost, ["1 attribute table(s) of class names not read: the band's category names are used"]);
+        // A table that names nothing isn't counted.
+        let counts = xml.replace("<Type>2</Type><Usage>2</Usage>", "<Type>0</Type><Usage>1</Usage>");
+        assert!(parse(&counts).unwrap().lost.is_empty());
+    }
+
+    #[test]
+    fn a_tables_rows_keep_their_index_and_unit_bins_name_the_whole_number_in_them() {
+        // Rows given out of order keep the values of their `index`.
+        let xml = r#"<PAMDataset><PAMRasterBand band="1"><GDALRasterAttributeTable>
+<FieldDefn index="0"><Name>Class_Name</Name><Type>2</Type><Usage>2</Usage></FieldDefn>
+<Row index="1"><F>Forest</F></Row><Row index="0"><F>Water</F></Row></GDALRasterAttributeTable></PAMRasterBand></PAMDataset>"#;
+        assert_eq!(parse(xml).unwrap().band(1).unwrap().categories, ["Water", "Forest"]);
+        // A bin from -0.5 to 0.5 holds 0.
+        let half = parse(&table(r#"Row0Min="-0.5" BinSize="1""#, &[("Name", 2, 2)], &[&["zero"], &["one"]])).unwrap();
+        assert_eq!(half.band(1).unwrap().categories, ["zero", "one"]);
+        assert!(half.lost.is_empty(), "{:?}", half.lost);
+        // A value field wins over unit bins; wider bins are ranges even beside one.
+        let valued = parse(&table(r#"Row0Min="0" BinSize="1""#, &[("Value", 0, 5), ("Name", 2, 2)], &[&["2", "two"]])).unwrap();
+        assert_eq!(valued.band(1).unwrap().categories, ["", "", "two"]);
+        let wide = parse(&table(r#"Row0Min="0" BinSize="10""#, &[("Value", 0, 5), ("Name", 2, 2)], &[&["2", "two"]])).unwrap();
+        assert!(wide.band(1).unwrap().categories.is_empty());
+        assert_eq!(wide.lost, ["1 attribute table(s) of value ranges not read as class names"]);
+    }
+
+    #[test]
+    fn tables_hold_a_bounded_number_of_class_values() {
+        // Each band's one row at the highest value would hold 65,536 names.
+        let bands = MAX_RAT_SLOTS / MAX_CATEGORIES + 3;
+        let band = |b: usize| {
+            format!(
+                r#"<PAMRasterBand band="{b}"><GDALRasterAttributeTable><FieldDefn index="0"><Name>Value</Name><Type>0</Type><Usage>5</Usage></FieldDefn><FieldDefn index="1"><Name>Name</Name><Type>2</Type><Usage>2</Usage></FieldDefn><Row index="0"><F>{}</F><F>top</F></Row></GDALRasterAttributeTable></PAMRasterBand>"#,
+                MAX_CATEGORIES - 1
+            )
+        };
+        let xml = format!("<PAMDataset>{}</PAMDataset>", (1..=bands).map(band).collect::<String>());
+        let pam = parse(&xml).unwrap();
+        let held: usize = pam.bands.iter().map(|b| b.categories.len()).sum();
+        assert!(held <= MAX_RAT_SLOTS, "{held}");
+        assert_eq!(
+            pam.lost,
+            [format!("3 class name(s) of an attribute table past the sidecar's first {MAX_RAT_SLOTS} class values left out")]
+        );
     }
 
     #[test]
