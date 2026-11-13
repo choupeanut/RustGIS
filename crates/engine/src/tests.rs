@@ -43452,6 +43452,14 @@ fn long_commands_stop_when_cancelled_while_they_run() {
         note(command, read.run(&control).map(|_| ()), &control);
     }
 
+    // Column Statistics counts every row of a layer on a thread of its own in the desktop app.
+    {
+        let read = crate::cmd::reads::read_ahead(&mut s, "table.statistics", &json!({"layer": "Cities", "field": "pop_max"})).unwrap();
+        assert!(read.reads());
+        let control = Control::cancelled_once_started();
+        note("table.statistics", read.run(&control).map(|_| ()), &control);
+    }
+
     // The tools whose work grows past a second or two on real data: buffers, overlays, joins,
     // hulls, densities and interpolation. Run in the background as the Analysis pane runs them; a
     // new long tool is added here (AGENTS.md › Never hold the window).

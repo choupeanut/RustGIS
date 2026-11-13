@@ -97,3 +97,145 @@ fn bad_requests_are_errors_and_nothing_is_recorded() {
     stats(&mut s, json!({"layer": "parcels", "field": "name", "selected": true}));
     assert_eq!((s.undo_depth(), s.dirty()), (depth, dirty), "read only: no undo step, project not marked changed");
 }
+
+/// A layer "w" with one column per kind, from `rows` of (whole, decimal-or-whole, text).
+fn layer_of(name: &str, fields: Vec<Field>, rows: Vec<Vec<V>>) -> Session {
+    let mut s = Session::new(Project::default());
+    let mut ds = Dataset::new(name, rustgis_data::GeometryType::Point, fields);
+    for (i, r) in rows.into_iter().enumerate() {
+        ds.push(Some(Geometry::Point(rustgis_geom::Coord::new(i as f64, 0.0))), r);
+    }
+    crate::cmd::layer::add_dataset(&mut s, ds);
+    s
+}
+
+#[test]
+fn whole_numbers_past_2_53_are_added_up_exactly_and_say_nothing() {
+    let big = (1_i64 << 53) + 1;
+    let mut s = layer_of("w", vec![Field::new("n", FieldType::Integer)], vec![vec![V::Int(big)], vec![V::Int(big + 2)], vec![V::Null]]);
+    let mark = s.notice_mark();
+    let v = stats(&mut s, json!({"layer": "w", "field": "n"}));
+    assert_eq!(v["sum"], 2 * big + 2, "{v}");
+    assert_eq!((v["min"].clone(), v["max"].clone()), (json!(big), json!(big + 2)));
+    // Population standard deviation of two values 2 apart is 1, however large they are.
+    assert_eq!(v["stdDev"], 1.0);
+    assert!((v["mean"].as_f64().unwrap() - (big + 1) as f64).abs() <= 2.0);
+    assert!(s.notices_since(mark).is_empty(), "exact: nothing approximated, nothing said");
+    // A sum past i64 is its digits, not a rounded number.
+    let mut s = layer_of("w", vec![Field::new("n", FieldType::Integer)], vec![vec![V::Int(i64::MAX)], vec![V::Int(i64::MAX)]]);
+    let v = stats(&mut s, json!({"layer": "w", "field": "n"}));
+    assert_eq!(v["sum"], "18446744073709551614");
+    assert_eq!(v["max"], i64::MAX);
+    // Within 2^53 the answer stays a plain number.
+    let mut s = layer_of("w", vec![Field::new("n", FieldType::Integer)], vec![vec![V::Int(3)], vec![V::Int(4)]]);
+    assert_eq!(stats(&mut s, json!({"layer": "w", "field": "n"}))["sum"], 7.0);
+}
+
+#[test]
+fn whole_numbers_added_with_decimals_past_2_53_say_how_many_are_rounded() {
+    let big = (1_i64 << 53) + 1;
+    let fields = vec![Field::new("x", FieldType::Double)];
+    let mut s = layer_of("w", fields.clone(), vec![vec![V::Int(big)], vec![V::Float(0.5)], vec![V::Int(-big)]]);
+    let mark = s.notice_mark();
+    stats(&mut s, json!({"layer": "w", "field": "x"}));
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said, ["w: 2 whole number(s) in 'x' past 2^53 are rounded in the statistics, because the column also holds decimals"]);
+    // The same column with values a decimal holds: nothing said.
+    let mut s = layer_of("w", fields, vec![vec![V::Int(5)], vec![V::Float(0.5)]]);
+    let mark = s.notice_mark();
+    assert_eq!(stats(&mut s, json!({"layer": "w", "field": "x"}))["sum"], 5.5);
+    assert!(s.notices_since(mark).is_empty());
+}
+
+#[test]
+fn a_sum_too_large_for_a_decimal_is_left_out_with_a_notice_and_the_mean_stays_right() {
+    let fields = vec![Field::new("x", FieldType::Double)];
+    let mut s = layer_of("w", fields.clone(), vec![vec![V::Float(1e308)], vec![V::Float(1e308)]]);
+    let mark = s.notice_mark();
+    let v = stats(&mut s, json!({"layer": "w", "field": "x"}));
+    assert_eq!(v["sum"], Value::Null);
+    assert_eq!(v["mean"], 1e308, "the running mean doesn't overflow");
+    assert_eq!(v["count"], 2);
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said, ["w: the sum of 'x' is too large to hold as a decimal number (past about 1.8e308) and is left out"]);
+    // A mean that can't be held either (opposite extremes) is said as well.
+    let mut s = layer_of("w", fields, vec![vec![V::Float(1.7e308)], vec![V::Float(-1.7e308)]]);
+    let mark = s.notice_mark();
+    let v = stats(&mut s, json!({"layer": "w", "field": "x"}));
+    assert_eq!(v["sum"], 0.0);
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("standard deviation")), "{v}");
+}
+
+#[test]
+fn distinct_texts_are_counted_to_a_bound_and_past_it_the_answer_says_so() {
+    let fields = vec![Field::new("id", FieldType::Text)];
+    let rows = |n: usize| (0..n).map(|i| vec![V::Text(format!("id{i}"))]).collect::<Vec<_>>();
+    let mut s = layer_of("w", fields.clone(), rows(crate::cmd::table_stats::MAX_DISTINCT + 5));
+    let mark = s.notice_mark();
+    let v = stats(&mut s, json!({"layer": "w", "field": "id"}));
+    assert_eq!(v["distinct"], crate::cmd::table_stats::MAX_DISTINCT);
+    assert_eq!(v["distinctCapped"], true);
+    assert_eq!(v["count"], crate::cmd::table_stats::MAX_DISTINCT + 5, "everything else is still counted");
+    assert_eq!(v["max"], "id99999");
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said, ["w: 'id' has more than 100000 distinct values; the distinct count stops at 100000"]);
+    // Exactly the bound: counted whole, nothing said.
+    let mut s = layer_of("w", fields, rows(crate::cmd::table_stats::MAX_DISTINCT));
+    let mark = s.notice_mark();
+    let v = stats(&mut s, json!({"layer": "w", "field": "id"}));
+    assert_eq!(v["distinct"], crate::cmd::table_stats::MAX_DISTINCT);
+    assert!(v.get("distinctCapped").is_none() && s.notices_since(mark).is_empty());
+}
+
+#[test]
+fn the_name_is_looked_up_as_given_before_its_trimmed_form() {
+    let fields = vec![Field::new(" area ", FieldType::Double), Field::new("area", FieldType::Double)];
+    let mut s = layer_of("w", fields, vec![vec![V::Float(1.0), V::Float(10.0)]]);
+    assert_eq!(stats(&mut s, json!({"layer": "w", "field": " area "}))["sum"], 1.0, "as given");
+    assert_eq!(stats(&mut s, json!({"layer": "w", "field": "area"}))["sum"], 10.0);
+    // Stray spaces on a name with none: the trimmed form is the fallback.
+    let mut s = layer_of("w", vec![Field::new("area", FieldType::Double)], vec![vec![V::Float(2.0)]]);
+    assert_eq!(stats(&mut s, json!({"layer": "w", "field": "  AREA "}))["sum"], 2.0);
+    // Blank is no name.
+    assert!(s.run("table.statistics", &json!({"layer": "w", "field": "   "})).is_err());
+}
+
+#[test]
+fn a_column_is_told_apart_by_its_place_when_names_repeat() {
+    let fields = vec![Field::new("v", FieldType::Double), Field::new("v", FieldType::Double)];
+    let mut s = layer_of("w", fields, vec![vec![V::Float(1.0), V::Float(100.0)]]);
+    assert_eq!(stats(&mut s, json!({"layer": "w", "field": "v"}))["sum"], 1.0, "by name: the first");
+    let second = stats(&mut s, json!({"layer": "w", "field": "v", "index": 1}));
+    assert_eq!((second["sum"].clone(), second["index"].clone()), (json!(100.0), json!(1)));
+    assert_eq!(stats(&mut s, json!({"layer": "w", "index": 1}))["sum"], 100.0, "no name needed");
+    assert!(s.run("table.statistics", &json!({"layer": "w", "index": 2})).unwrap_err().contains("no column 2"));
+    assert!(s.run("table.statistics", &json!({"layer": "w", "index": "x"})).is_err());
+}
+
+#[test]
+fn the_desktops_count_ahead_is_what_the_command_answers_and_a_changed_layer_is_refused() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    let mut s = parcels();
+    let p = json!({"layer": "parcels", "field": "area"});
+    let here = stats(&mut s, p.clone());
+    let ahead = read_ahead(&mut s, "table.statistics", &p).unwrap();
+    assert!(ahead.reads());
+    let read = ahead.run(&Control::stoppable()).unwrap();
+    assert_eq!(read_land(&mut s, read).unwrap(), here);
+    assert!(s.read_ahead.is_none(), "the count was taken");
+    // Edited while it was counted: said, not counted again here.
+    let read = read_ahead(&mut s, "table.statistics", &p).unwrap().run(&Control::stoppable()).unwrap();
+    s.run("edit.setValue", &json!({"layer": "parcels", "row": 0, "field": "area", "value": "9"})).unwrap();
+    let e = read_land(&mut s, read).unwrap_err();
+    assert!(e.contains("changed while the statistics were counted"), "{e}");
+    // A request that is wrong makes no count ahead: the command says why as it lands.
+    let ahead = read_ahead(&mut s, "table.statistics", &json!({"layer": "parcels", "field": "nope"})).unwrap();
+    assert!(!ahead.reads());
+    let read = ahead.run(&Control::stoppable()).unwrap();
+    assert!(read_land(&mut s, read).unwrap_err().contains("'nope'"));
+    // Cancelled as it starts, the count looks and stops.
+    let control = Control::cancelled_once_started();
+    let e = read_ahead(&mut s, "table.statistics", &p).unwrap().run(&control).err().unwrap();
+    assert!(e.to_lowercase().contains("cancel") && control.looked() > 0, "{e}");
+}

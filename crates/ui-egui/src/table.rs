@@ -31,9 +31,45 @@ pub struct TableState {
 
 /// What `table.statistics` answered for a column of a layer, kept to show.
 struct ColumnStats {
-    /// The layer it was run on: shown another table, the window goes.
+    /// The layer it was run on, by its id and by its instance (a layer that takes a removed one's
+    /// id is another): shown another table, the window goes.
     layer: u32,
+    instance: u64,
+    /// The project and map it was run in ([`rustgis_engine::Session::opened`], the map's
+    /// instance): a script or an agent can change them between two frames, so they are compared
+    /// before the window shows.
+    opened: u64,
+    map: u64,
     answer: Value,
+}
+
+impl ColumnStats {
+    /// Whether it is still of the table showing: the same project, map and layer instance.
+    fn of(&self, app: &RustGisApp, layer: Option<u32>) -> bool {
+        let live = layer.and_then(|id| app.session.map().layer(id));
+        Some(self.layer) == layer
+            && self.opened == app.session.opened
+            && self.map == app.session.map().instance_id()
+            && live.is_some_and(|l| l.instance_id() == self.instance)
+    }
+}
+
+impl RustGisApp {
+    /// What the Statistics window holds, for tests.
+    #[cfg(test)]
+    pub(crate) fn table_stats_kept(&self) -> Option<&Value> {
+        self.table.stats.as_ref().map(|s| &s.answer)
+    }
+}
+
+/// Keeps what `table.statistics` answered for the window, once it has counted (on a thread of its
+/// own on the desktop, so here as it lands). Shown only if the layer is still the one it counted.
+pub(crate) fn statistics_landed(app: &mut RustGisApp, landed: crate::Landed) {
+    // Said already if it failed or never ran.
+    let crate::Landed::Ran(Ok(answer)) = landed else { return };
+    let Some(layer) = answer.get("layerId").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) else { return };
+    let Some(instance) = app.session.map().layer(layer).map(|l| l.instance_id()) else { return };
+    app.table.stats = Some(ColumnStats { layer, instance, opened: app.session.opened, map: app.session.map().instance_id(), answer });
 }
 
 /// A table's identity for its view: a live layer, by its instance (so a layer that takes a removed
@@ -52,6 +88,7 @@ pub(crate) fn prune_views(app: &mut RustGisApp) {
     // again at 1, so no view carries over.
     if app.table.opened != app.session.opened {
         app.table.views.clear();
+        app.table.stats = None;
         app.table.opened = app.session.opened;
     }
     let project = &app.session.project;
@@ -204,7 +241,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         app.table.stats = None;
         return;
     }
-    if app.table.stats.as_ref().is_some_and(|s| Some(s.layer) != layer_id) {
+    if app.table.stats.as_ref().is_some_and(|s| !s.of(app, layer_id)) {
         app.table.stats = None;
     }
     let t = Tokens::get(ui.ctx());
@@ -504,13 +541,13 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             {
                 // Refused (a layer read in place, not all loaded): said, unless the command said so.
                 let mark = app.session.notice_mark();
-                match app.run("table.statistics", json!({"layer": layer, "field": fd.name, "selected": app.table.selected_only})) {
-                    Ok(answer) => app.table.stats = Some(ColumnStats { layer, answer }),
-                    Err(e) => {
-                        if app.session.notices_since(mark).is_empty() {
-                            app.session.notify(e, true);
-                        }
-                    }
+                // By the column's place, so a second column of the same name is its own. The count
+                // runs on a thread of its own; `statistics_landed` keeps the answer for the window.
+                let asked = json!({"layer": layer, "field": fd.name, "index": i, "selected": app.table.selected_only});
+                if let Err(e) = app.run("table.statistics", asked)
+                    && app.session.notices_since(mark).is_empty()
+                {
+                    app.session.notify(e, true);
                 }
             }
             if let Some((i, ty)) = convert
@@ -637,7 +674,10 @@ fn stats_lines(answer: &Value) -> Vec<(String, String)> {
     let number = answer.get("kind").and_then(Value::as_str) == Some("number");
     let count = |k: &str| fmt_stat(answer.get(k).and_then(Value::as_f64).unwrap_or(0.0));
     let value = |k: &str| match answer.get(k) {
+        // A whole number past 2^53 is an integer (or its digits), shown as it is, never as a decimal.
+        Some(Value::Number(n)) if !n.is_f64() => n.to_string().parse::<i128>().map(fmt_whole).unwrap_or_else(|_| n.to_string()),
         Some(Value::Number(n)) => n.as_f64().map(fmt_stat).unwrap_or_default(),
+        Some(Value::String(s)) if number => s.parse::<i128>().map(fmt_whole).unwrap_or_else(|_| s.clone()),
         Some(Value::String(s)) => s.clone(),
         _ => tl!("none").to_string(),
     };
@@ -652,11 +692,29 @@ fn stats_lines(answer: &Value) -> Vec<(String, String)> {
             out.push((tl!("Not numbers").to_string(), count("skipped")));
         }
     } else {
-        out.push((tl!("Distinct").to_string(), count("distinct")));
+        let distinct = if answer.get("distinctCapped").and_then(Value::as_bool).unwrap_or(false) {
+            crate::i18n::fmt("more than {n}", &[("n", &count("distinct"))])
+        } else {
+            count("distinct")
+        };
+        out.push((tl!("Distinct").to_string(), distinct));
         out.push((tl!("Minimum").to_string(), value("min")));
         out.push((tl!("Maximum").to_string(), value("max")));
     }
     out
+}
+
+/// A whole number with all its digits, grouped by thousands.
+fn fmt_whole(v: i128) -> String {
+    let digits = v.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if v < 0 { format!("-{out}") } else { out }
 }
 
 /// A number for reading: digits grouped by thousands, a fraction to the precision its size
@@ -1082,7 +1140,8 @@ mod tests {
         app.session.table_layer = Some(id);
         let answer = app.run("table.statistics", json!({"layer": id, "field": num})).unwrap();
         let sum = fmt_stat(answer["sum"].as_f64().unwrap());
-        app.table.stats = Some(ColumnStats { layer: id, answer });
+        statistics_landed(&mut app, crate::Landed::Ran(Ok(answer)));
+        assert!(app.table.stats.is_some(), "the answer is kept for the window");
         let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
             |ui, app: &mut RustGisApp| {
                 let ctx = ui.ctx().clone();
@@ -1098,5 +1157,71 @@ mod tests {
         h.state_mut().session.table_layer = None;
         h.run_steps(2);
         assert!(h.state().table.stats.is_none());
+    }
+
+    #[test]
+    fn whole_numbers_past_2_53_and_a_capped_distinct_count_are_shown_as_they_are() {
+        assert_eq!(fmt_whole(9_007_199_254_740_993), "9,007,199,254,740,993");
+        assert_eq!(fmt_whole(-1_234), "-1,234");
+        assert_eq!(fmt_whole(0), "0");
+        let numbers = json!({"kind": "number", "count": 2, "nulls": 0, "skipped": 0, "sum": 18_014_398_509_481_986_i64,
+            "mean": 9.0e15, "min": 9_007_199_254_740_993_i64, "max": "170141183460469231731687303715884105727", "stdDev": 0.0});
+        let lines = stats_lines(&numbers);
+        let of = |n: &str| lines.iter().find(|l| l.0 == n).map(|l| l.1.clone());
+        assert_eq!(of("Sum").as_deref(), Some("18,014,398,509,481,986"));
+        assert_eq!(of("Minimum").as_deref(), Some("9,007,199,254,740,993"));
+        assert_eq!(of("Maximum").as_deref(), Some("170,141,183,460,469,231,731,687,303,715,884,105,727"));
+        // A text column's minimum is text, never regrouped as a number.
+        let text =
+            json!({"kind": "text", "count": 1, "nulls": 0, "distinct": 100000, "distinctCapped": true, "min": "12345", "max": "12345"});
+        let lines = stats_lines(&text);
+        assert_eq!(lines.iter().find(|l| l.0 == "Distinct").map(|l| l.1.as_str()), Some("more than 100,000"));
+        assert_eq!(lines.iter().find(|l| l.0 == "Minimum").map(|l| l.1.as_str()), Some("12345"));
+        let exact = json!({"kind": "text", "count": 1, "nulls": 0, "distinct": 5, "min": "a", "max": "b"});
+        assert_eq!(stats_lines(&exact).iter().find(|l| l.0 == "Distinct").map(|l| l.1.as_str()), Some("5"));
+    }
+
+    /// Statistics left from another project, map or layer instance are not shown.
+    #[test]
+    fn statistics_of_another_project_map_or_layer_are_not_kept() {
+        let mut app = RustGisApp::with_sample();
+        let id = app.session.map().layers.first().map(|l| l.id).unwrap();
+        let field = app.session.map().layer(id).unwrap().dataset.fields.iter().find(|f| f.ty.is_numeric()).map(|f| f.name.clone()).unwrap();
+        app.session.table_layer = Some(id);
+        let answer = app.run("table.statistics", json!({"layer": id, "field": field})).unwrap();
+        statistics_landed(&mut app, crate::Landed::Ran(Ok(answer)));
+        let st = app.table.stats.as_ref().unwrap();
+        assert!(st.of(&app, Some(id)), "the table it was run on");
+        assert!(!st.of(&app, Some(id + 1000)), "another layer");
+        assert!(!st.of(&app, None), "no table");
+        let mut other_project =
+            ColumnStats { layer: st.layer, instance: st.instance, opened: st.opened + 1, map: st.map, answer: Value::Null };
+        assert!(!other_project.of(&app, Some(id)), "another project");
+        other_project.opened = st.opened;
+        other_project.map += 1;
+        assert!(!other_project.of(&app, Some(id)), "another map");
+        other_project.map = st.map;
+        other_project.instance += 1;
+        assert!(!other_project.of(&app, Some(id)), "a layer that took the id of another");
+        // A project opened between two frames drops it with the views.
+        app.session.opened += 1;
+        prune_views(&mut app);
+        assert!(app.table.stats.is_none());
+    }
+
+    /// Of two columns of one name, Statistics… counts the one chosen, by its place.
+    #[test]
+    fn statistics_of_a_second_column_of_the_same_name_count_that_column() {
+        use rustgis_engine::data::{Field, FieldType, GeometryType};
+        let mut app = RustGisApp::with_sample();
+        let mut ds =
+            Dataset::new("twins", GeometryType::Point, vec![Field::new("v", FieldType::Double), Field::new("v", FieldType::Double)]);
+        ds.push(None, vec![V::Float(1.0), V::Float(100.0)]);
+        rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+        let id = app.session.map().layer_by_name("twins").map(|l| l.id).unwrap();
+        let second = app.run("table.statistics", json!({"layer": id, "field": "v", "index": 1})).unwrap();
+        assert_eq!((second["sum"].clone(), second["index"].clone()), (json!(100.0), json!(1)));
+        let by_name = app.run("table.statistics", json!({"layer": id, "field": "v"})).unwrap();
+        assert_eq!(by_name["sum"], 1.0, "by name alone, the first");
     }
 }
