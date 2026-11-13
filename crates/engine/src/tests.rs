@@ -12384,12 +12384,92 @@ fn plugin_host_gives_layer_crs_and_features_in_it() {
     assert_eq!(m["crs"]["properties"]["name"], "EPSG:32617");
     let w = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "EPSG:4326"})).unwrap();
     assert!(w.get("crs").is_none(), "{w}");
-    // Refused: unknown, unparseable, not text.
-    for bad in [json!("EPSG:999999"), json!("nonsense"), json!(7)] {
+    // A bare code reads as EPSG; refused: unknown, unparseable, not text. All say `crs:`.
+    let bare = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "32637"})).unwrap();
+    assert_eq!(bare["crs"]["properties"]["name"], "EPSG:32637");
+    for bad in [json!("EPSG:999999"), json!("nonsense"), json!(7), json!("EPSG:"), json!("EPSG:12x")] {
         let e = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": bad})).unwrap_err();
-        assert!(e.contains("crs"), "{bad}: {e}");
+        assert!(e.contains("crs:"), "{bad}: {e}");
     }
     rustgis_plugins::unload("eng-crs");
+}
+
+#[test]
+fn plugin_host_features_takes_only_epsg_codes_so_it_registers_nothing() {
+    let mut s = world();
+    plugin("eng-crs-reg", &[]);
+    // WKT and PROJ text from a plugin (no permission needed) never reaches the process-wide table.
+    let proj = "+proj=tmerc +lat_0=0 +lon_0=33 +k=0.9996 +x_0=500000 +y_0=0 +datum=WGS84 +units=m +no_defs";
+    let wkt = "PROJCS[\"x\",GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],\
+        PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],UNIT[\"metre\",1]]";
+    for (i, text) in [proj.to_string(), wkt.to_string(), format!("{proj} +k={}", 1)].into_iter().enumerate() {
+        let e = forward(&mut s, "eng-crs-reg", "host.features", json!({"layer": "Cities", "crs": text})).unwrap_err();
+        assert!(e.contains("crs:") && e.contains("EPSG"), "{i}: {e}");
+    }
+    // The same text typed a few hundred distinct ways still leaves room for later PROJ systems.
+    for n in 0..300 {
+        let text = format!("+proj=tmerc +lon_0={} +k=0.9996 +datum=WGS84", 100.0 + f64::from(n) * 0.001);
+        assert!(forward(&mut s, "eng-crs-reg", "host.features", json!({"layer": "Cities", "crs": text})).is_err());
+    }
+    assert!(rustgis_data::raster::Crs::parse("+proj=tmerc +lon_0=7.77777 +k=0.9996 +datum=WGS84").is_ok());
+    rustgis_plugins::unload("eng-crs-reg");
+}
+
+#[test]
+fn plugin_host_features_refuses_what_it_can_not_place_with_crs_errors() {
+    use rustgis_data::raster::{Crs, crs::CustomCrs};
+    let mut s = world();
+    plugin("eng-crs-no", &[]);
+    let ask = |s: &mut Session, layer: &str, crs: &str| forward(s, "eng-crs-no", "host.features", json!({"layer": layer, "crs": crs}));
+    let custom = |proj4: &str| {
+        Crs::custom(CustomCrs { proj4: proj4.into(), label: "Mine".into(), geokeys: Vec::new(), doubles: Vec::new(), ascii: String::new() })
+            .unwrap()
+    };
+    let point = |lon: f64, lat: f64| {
+        let t = format!(
+            r#"{{"type":"FeatureCollection","features":[{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[{lon},{lat}]}}}},
+            {{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[{lon},{lat}]}}}}]}}"#
+        );
+        rustgis_data::io::read_geojson(&t, "P").unwrap().0
+    };
+    // Past Web Mercator's limit: refused with the count, nothing returned; inside it, answered.
+    s.map_mut().add_dataset(point(10.0, 89.0));
+    let e = ask(&mut s, "P", "EPSG:3857").unwrap_err();
+    assert!(e.contains("crs: 2 feature(s) of P can't be placed in EPSG:3857") && e.contains("nothing was returned"), "{e}");
+    s.run("map.projection", &json!({"type": "EPSG:3857"})).unwrap();
+    let e = ask(&mut s, "P", "map").unwrap_err();
+    assert!(e.contains("crs: 2 feature(s)"), "{e}");
+    let mut inside = point(10.0, 85.0);
+    inside.name = "Q".into();
+    s.map_mut().add_dataset(inside);
+    let ok = ask(&mut s, "Q", "EPSG:3857").unwrap();
+    assert_eq!(ok["features"].as_array().map(Vec::len), Some(2), "{ok}");
+    // A layer's own system without an EPSG code: "layer" is refused, and says how to read it.
+    let mut ds = point(10.0, 10.0);
+    ds.crs = Some(custom("+proj=sinu +lon_0=5 +R=6371000 +units=m +no_defs"));
+    ds.name = "Sinu".into();
+    s.map_mut().add_dataset(ds);
+    let e = ask(&mut s, "Sinu", "layer").unwrap_err();
+    assert!(e.contains("crs:") && e.contains("no EPSG code"), "{e}");
+    // `host.layers` still names it (not the null of an unread raster).
+    let layers = forward(&mut s, "eng-crs-no", "host.layers", json!({})).unwrap();
+    let sinu = layers.as_array().unwrap().iter().find(|l| l["name"] == "Sinu").unwrap();
+    assert!(sinu["crs"].as_str().is_some_and(|t| t.contains("Sinusoidal")), "{sinu}");
+    // Geocentric targets can't carry a third coordinate.
+    let e = ask(&mut s, "P", "EPSG:4978").unwrap_err();
+    assert!(e.contains("crs:") && e.contains("geocentric"), "{e}");
+    // A layer on another body can't be given in an Earth system.
+    let mut mars = point(10.0, 10.0);
+    mars.crs = Some(custom("+proj=longlat +a=3396190 +b=3376200 +no_defs"));
+    mars.name = "Mars".into();
+    s.map_mut().add_dataset(mars);
+    let e = ask(&mut s, "Mars", "EPSG:32637").unwrap_err();
+    assert!(e.contains("crs:") && e.contains("another body"), "{e}");
+    // The map of another body has none either.
+    s.run("map.body", &json!({"name": "Mars", "basemap": false})).unwrap();
+    let e = ask(&mut s, "P", "map").unwrap_err();
+    assert!(e.contains("crs:") && e.contains("Mars"), "{e}");
+    rustgis_plugins::unload("eng-crs-no");
 }
 
 #[test]

@@ -438,7 +438,7 @@ fn layers_of(s: &Session) -> Value {
                     "geometry": format!("{:?}", l.dataset.geometry_type), "features": l.dataset.features.len(),
                     "selected": l.selection.len(), "active": Some(l.id) == active,
                     "extent": super::project::bbox(l.extent()), "transparency": l.transparency,
-                    "crs": layer_crs(l).and_then(crs_name),
+                    "crs": layer_crs(l).map(crs_name),
                     "group": s.map().group_of(l.id).map(|g| g.name.as_str()),
                     "fields": l.dataset.fields.iter().map(|f| json!({"name": f.name, "type": format!("{:?}", f.ty)})).collect::<Vec<_>>(),
                 })
@@ -458,9 +458,10 @@ fn layer_crs(l: &rustgis_map::Layer) -> Option<rustgis_data::raster::Crs> {
     }
 }
 
-/// A system as `host.layers` names it: `EPSG:<code>`, else its WKT, else `None`.
-fn crs_name(crs: rustgis_data::raster::Crs) -> Option<String> {
-    if crs.epsg() > 0 { Some(format!("EPSG:{}", crs.epsg())) } else { rustgis_data::raster::wkt::to_wkt(crs) }
+/// A system as `host.layers` names it: `EPSG:<code>`, else its WKT, else its PROJ definition, so a
+/// layer whose system is known is never given the `null` of a raster not yet read.
+fn crs_name(crs: rustgis_data::raster::Crs) -> String {
+    if crs.epsg() > 0 { format!("EPSG:{}", crs.epsg()) } else { rustgis_data::raster::wkt::to_wkt(crs).unwrap_or_else(|| crs.code()) }
 }
 
 /// The map's flat coordinate system, for `"crs": "map"`: Web Mercator for the globe too (as a
@@ -484,23 +485,39 @@ fn map_crs(m: &rustgis_map::Map) -> Result<rustgis_data::raster::Crs, String> {
 }
 
 /// The system `host.features` was asked for with `crs`: `None` for WGS 84 (absent, or named so),
-/// `"layer"` the layer's own, `"map"` the map's, else text [`Crs::parse`] reads (EPSG code, WKT,
-/// PROJ string), as `share.exportLayer` takes it.
+/// `"layer"` the layer's own, `"map"` the map's, else an EPSG code (`"EPSG:32637"` or `32637`).
+/// Never WKT or a PROJ string: reading one registers a system in the process-wide table, which
+/// any plugin (the request needs no permission) could fill, and the answer names an EPSG code
+/// anyway. Every refusal starts with `crs:`.
 fn asked_crs(m: &rustgis_map::Map, l: &rustgis_map::Layer, p: &Value) -> Result<Option<rustgis_data::raster::Crs>, String> {
     use rustgis_data::raster::Crs;
     let text = match p.get("crs") {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::String(t)) => t.trim(),
-        Some(_) => return Err("crs must be text: \"layer\", \"map\" or a coordinate system such as \"EPSG:32637\"".into()),
+        Some(_) => return Err("crs: must be text: \"layer\", \"map\" or an EPSG code such as \"EPSG:32637\"".into()),
     };
     let crs = match text.to_ascii_lowercase().as_str() {
         "" => return Ok(None),
-        "layer" => layer_crs(l).ok_or_else(|| format!("{}'s coordinate system isn't known yet", l.name))?,
-        "map" => map_crs(m)?,
-        _ => Crs::parse(text).map_err(|e| format!("crs: {e}"))?,
+        "layer" => layer_crs(l).ok_or_else(|| format!("crs: {}'s coordinate system isn't known yet", l.name))?,
+        "map" => map_crs(m).map_err(|e| format!("crs: {e}"))?,
+        _ => {
+            let digits = text.get(..5).filter(|p| p.eq_ignore_ascii_case("epsg:")).map_or(text, |_| text.get(5..).unwrap_or("").trim());
+            match digits.parse::<u32>() {
+                Ok(code) if digits.chars().all(|c| c.is_ascii_digit()) => {
+                    Crs::from_epsg(code).ok_or_else(|| format!("crs: unknown coordinate system EPSG:{code}"))?
+                }
+                _ => {
+                    let shown: String = text.chars().take(40).collect();
+                    return Err(format!("crs: '{shown}' isn't \"layer\", \"map\" or an EPSG code such as \"EPSG:32637\""));
+                }
+            }
+        }
     };
     Ok((crs != Crs::LonLat).then_some(crs))
 }
+
+/// How many features `host.features` reprojects between looks at Cancel.
+const CANCEL_EVERY: usize = 512;
 
 /// Answers a running plugin's requests.
 struct Bridge<'a> {
@@ -537,6 +554,12 @@ impl Bridge<'_> {
     /// most `limit`. In longitude/latitude, or in `crs` (`"layer"`, `"map"` or a coordinate
     /// system) when given, with a GeoJSON `crs` member naming it, as `host.addLayer` reads.
     /// Features that can't be placed in it are refused, not dropped.
+    ///
+    /// Runs on the calling thread, like every host request: a plugin command is on the window's
+    /// thread on the desktop, bounded by the plugin's run-time cap, and a request answers in one
+    /// piece (there is nothing to hand a background run's result back to). The work is one cheap
+    /// transform per vertex, and the loop looks at a run's Cancel ([`rustgis_data::progress`])
+    /// every [`CANCEL_EVERY`] features for the runs that have one.
     fn features(&self, p: &Value) -> CmdResult {
         let id = self.s.layer_id(p)?;
         let l = self.s.map().layer(id).ok_or("no such layer")?;
@@ -564,15 +587,29 @@ impl Bridge<'_> {
             if crs.epsg() == 0 {
                 return Err(format!("crs: {} has no EPSG code, so GeoJSON can't name it; use an EPSG code", crs.label()));
             }
+            if crs.is_geocentric() {
+                return Err(format!(
+                    "crs: {} is geocentric; a response holds two coordinates per point, so it can't carry this system",
+                    crs.label()
+                ));
+            }
             if let Some(e) = rustgis_data::export_error(&ds, crs) {
                 return Err(format!("crs: {e}"));
             }
             let t = crs.transformer().map_err(|e| format!("crs: {e}"))?;
             let (mut failed, mut first) = (0usize, None);
-            for f in ds.features.iter_mut() {
+            // Web Mercator clamps a latitude past its limit, which would move the point unsaid.
+            let mercator = crs == rustgis_data::raster::Crs::WebMercator;
+            for (n, f) in ds.features.iter_mut().enumerate() {
+                if n % CANCEL_EVERY == 0 {
+                    rustgis_data::progress::check().map_err(|_| "crs: cancelled".to_string())?;
+                }
                 let Some(g) = f.geometry.take() else { continue };
-                let g = g.map_coords(&|c| t.from_lonlat(c).unwrap_or(crate::geom::Coord::new(f64::NAN, f64::NAN)));
                 let mut ok = true;
+                if mercator {
+                    g.for_each_coord(|c| ok &= c.y.abs() <= rustgis_geom::MAX_LAT || !c.y.is_finite());
+                }
+                let g = if ok { g.map_coords(&|c| t.from_lonlat(c).unwrap_or(crate::geom::Coord::new(f64::NAN, f64::NAN))) } else { g };
                 g.for_each_coord(|c| ok &= c.is_finite());
                 if !ok {
                     failed += 1;
