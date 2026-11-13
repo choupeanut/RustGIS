@@ -25,6 +25,15 @@ pub struct TableState {
     views: HashMap<ViewKey, ColumnView>,
     /// The project the views are for ([`rustgis_engine::Session::opened`]).
     opened: u64,
+    /// The answer of Statistics… for a column, shown in a window until it is closed.
+    stats: Option<ColumnStats>,
+}
+
+/// What `table.statistics` answered for a column of a layer, kept to show.
+struct ColumnStats {
+    /// The layer it was run on: shown another table, the window goes.
+    layer: u32,
+    answer: Value,
 }
 
 /// A table's identity for its view: a live layer, by its instance (so a layer that takes a removed
@@ -192,7 +201,11 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         app.table.editing = None;
     }
     if layer_id.is_none() && app.session.table_standalone.is_none() {
+        app.table.stats = None;
         return;
+    }
+    if app.table.stats.as_ref().is_some_and(|s| Some(s.layer) != layer_id) {
+        app.table.stats = None;
     }
     let t = Tokens::get(ui.ctx());
     let pass = ui.ctx().cumulative_pass_nr();
@@ -316,6 +329,8 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             let mut column_action: Option<(usize, ColumnAction)> = None;
             // A text field to convert to dates ("date") or date-times ("datetime").
             let mut convert: Option<(usize, &str)> = None;
+            // A field to show the statistics of.
+            let mut statistics: Option<usize> = None;
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 let mut tb = TableBuilder::new(ui)
                     .striped(true)
@@ -369,6 +384,13 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                     if ui.add_enabled(hidden_n > 0, egui::Button::new(tl!("Show All Columns"))).clicked() {
                                         show_all = true;
                                         ui.close();
+                                    }
+                                    if is_layer {
+                                        ui.separator();
+                                        if ui.button(tl!("Statistics…")).clicked() {
+                                            statistics = Some(i);
+                                            ui.close();
+                                        }
                                     }
                                     if is_layer && fd.ty == rustgis_engine::data::FieldType::Text {
                                         ui.separator();
@@ -476,6 +498,21 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     view.show_all();
                 }
             }
+            if let Some(i) = statistics
+                && let Some(fd) = ds.fields.get(i)
+                && let Some(layer) = layer_id
+            {
+                // Refused (a layer read in place, not all loaded): said, unless the command said so.
+                let mark = app.session.notice_mark();
+                match app.run("table.statistics", json!({"layer": layer, "field": fd.name, "selected": app.table.selected_only})) {
+                    Ok(answer) => app.table.stats = Some(ColumnStats { layer, answer }),
+                    Err(e) => {
+                        if app.session.notices_since(mark).is_empty() {
+                            app.session.notify(e, true);
+                        }
+                    }
+                }
+            }
             if let Some((i, ty)) = convert
                 && let Some(fd) = ds.fields.get(i)
             {
@@ -538,6 +575,126 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 }
             }
         });
+    statistics_window(app, ui.ctx());
+}
+
+/// The window with a column's statistics, until it is closed.
+fn statistics_window(app: &mut RustGisApp, ctx: &egui::Context) {
+    let Some(st) = app.table.stats.as_ref() else { return };
+    let (title, covers, lines) = (stats_title(&st.answer), stats_coverage(&st.answer), stats_lines(&st.answer));
+    let mut open = true;
+    egui::Window::new(tl!("Column Statistics"))
+        .id(egui::Id::unique("column_statistics"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new(title).strong());
+            ui.label(egui::RichText::new(covers).weak());
+            ui.add_space(4.0);
+            egui::Grid::new("column_statistics_grid").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                for (name, value) in &lines {
+                    ui.label(name);
+                    ui.label(egui::RichText::new(value).monospace());
+                    ui.end_row();
+                }
+            });
+            ui.add_space(4.0);
+            if ui.button(tl!("Copy")).clicked() {
+                let text: Vec<String> = lines.iter().map(|(n, v)| format!("{n}\t{v}")).collect();
+                ui.ctx().copy_text(text.join("\n"));
+            }
+        });
+    if !open {
+        app.table.stats = None;
+    }
+}
+
+/// The window's first line: the layer and the field.
+fn stats_title(answer: &Value) -> String {
+    let text = |k: &str| answer.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+    crate::i18n::fmt("{layer} › {field}", &[("layer", &text("layer")), ("field", &text("field"))])
+}
+
+/// Which rows the statistics cover: all of them, or the selected ones.
+fn stats_coverage(answer: &Value) -> String {
+    let n = answer.get("rows").and_then(Value::as_u64).unwrap_or(0);
+    let selected = answer.get("selected").and_then(Value::as_bool).unwrap_or(false);
+    let count = fmt_stat(n as f64);
+    let args = [("n", count.as_str())];
+    match (selected, n) {
+        (true, 1) => crate::i18n::fmt("The 1 selected row", &args),
+        (true, _) => crate::i18n::fmt("The {n} selected rows", &args),
+        (false, 1) => crate::i18n::fmt("All 1 row", &args),
+        (false, _) => crate::i18n::fmt("All {n} rows", &args),
+    }
+}
+
+/// The rows of the statistics window: each statistic's name and its value, as the field's kind
+/// has them (a text or date field has no sum or mean); the values left out, when there are any,
+/// last.
+fn stats_lines(answer: &Value) -> Vec<(String, String)> {
+    let number = answer.get("kind").and_then(Value::as_str) == Some("number");
+    let count = |k: &str| fmt_stat(answer.get(k).and_then(Value::as_f64).unwrap_or(0.0));
+    let value = |k: &str| match answer.get(k) {
+        Some(Value::Number(n)) => n.as_f64().map(fmt_stat).unwrap_or_default(),
+        Some(Value::String(s)) => s.clone(),
+        _ => tl!("none").to_string(),
+    };
+    let mut out = vec![(tl!("Count").to_string(), count("count")), (tl!("Empty").to_string(), count("nulls"))];
+    if number {
+        out.push((tl!("Sum").to_string(), value("sum")));
+        out.push((tl!("Mean").to_string(), value("mean")));
+        out.push((tl!("Minimum").to_string(), value("min")));
+        out.push((tl!("Maximum").to_string(), value("max")));
+        out.push((tl!("Standard deviation").to_string(), value("stdDev")));
+        if answer.get("skipped").and_then(Value::as_u64).unwrap_or(0) > 0 {
+            out.push((tl!("Not numbers").to_string(), count("skipped")));
+        }
+    } else {
+        out.push((tl!("Distinct").to_string(), count("distinct")));
+        out.push((tl!("Minimum").to_string(), value("min")));
+        out.push((tl!("Maximum").to_string(), value("max")));
+    }
+    out
+}
+
+/// A number for reading: digits grouped by thousands, a fraction to the precision its size
+/// deserves (6 places below 1, 4 below 1,000, else 2) without trailing zeros, and very large or
+/// small ones in scientific form.
+fn fmt_stat(x: f64) -> String {
+    if !x.is_finite() {
+        return x.to_string();
+    }
+    let a = x.abs();
+    if a != 0.0 && !(1e-6..1e15).contains(&a) {
+        return format!("{x:e}");
+    }
+    let places = if x.fract() == 0.0 {
+        0
+    } else if a >= 1000.0 {
+        2
+    } else if a >= 1.0 {
+        4
+    } else {
+        6
+    };
+    let text = format!("{a:.places$}");
+    let (whole, fraction) = text.split_once('.').unwrap_or((text.as_str(), ""));
+    let fraction = fraction.trim_end_matches('0');
+    let mut out = String::new();
+    for (i, c) in whole.chars().enumerate() {
+        if i > 0 && (whole.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if !fraction.is_empty() {
+        out.push('.');
+        out.push_str(fraction);
+    }
+    // A value that rounds to nothing is no minus zero.
+    if x < 0.0 && out.chars().any(|c| c.is_ascii_digit() && c != '0') { format!("-{out}") } else { out }
 }
 
 /// Whether `text` reads as a value of a `ty` field (`Value::parse`'s reading): blank is null;
@@ -890,5 +1047,56 @@ mod tests {
         ] {
             assert_eq!(fits(text, ty), ok, "{text:?} as {ty:?}");
         }
+    }
+
+    #[test]
+    fn statistics_are_formatted_for_reading() {
+        assert_eq!(fmt_stat(1234567.0), "1,234,567");
+        assert_eq!(fmt_stat(-1234.5), "-1,234.5");
+        assert_eq!(fmt_stat(0.25), "0.25");
+        assert_eq!(fmt_stat(12.345678), "12.3457");
+        assert_eq!(fmt_stat(12345.678), "12,345.68");
+        assert_eq!(fmt_stat(0.0), "0");
+        assert_eq!(fmt_stat(1e20), "1e20");
+        let all = json!({"layer": "L", "field": "f", "selected": false, "rows": 1234});
+        assert_eq!(stats_coverage(&all), "All 1,234 rows");
+        let some = json!({"layer": "L", "field": "f", "selected": true, "rows": 12});
+        assert_eq!(stats_coverage(&some), "The 12 selected rows");
+        let numbers = json!({"kind": "number", "count": 3, "nulls": 1, "skipped": 0, "sum": 12000.5, "mean": 4000.1667, "min": 2.0, "max": 6.0, "stdDev": 1.5});
+        let lines = stats_lines(&numbers);
+        assert_eq!(lines.iter().find(|(n, _)| n == "Sum").map(|l| l.1.as_str()), Some("12,000.5"));
+        assert!(lines.iter().all(|(n, _)| n != "Not numbers"));
+        let text = json!({"kind": "text", "count": 3, "nulls": 0, "distinct": 2, "min": "a", "max": "b"});
+        let names: Vec<String> = stats_lines(&text).into_iter().map(|l| l.0).collect();
+        assert_eq!(names, ["Count", "Empty", "Distinct", "Minimum", "Maximum"]);
+    }
+
+    /// Statistics… on a column answers in a window that names the rows it covers and shows the sum.
+    #[test]
+    fn the_statistics_window_shows_the_column_sum() {
+        let mut app = RustGisApp::with_sample();
+        let id = app.session.map().layers.first().map(|l| l.id).unwrap();
+        let ds = &app.session.map().layer(id).unwrap().dataset;
+        let num = ds.fields.iter().find(|f| f.ty.is_numeric()).map(|f| f.name.clone()).expect("a number field");
+        let rows = ds.features.len();
+        app.session.table_layer = Some(id);
+        let answer = app.run("table.statistics", json!({"layer": id, "field": num})).unwrap();
+        let sum = fmt_stat(answer["sum"].as_f64().unwrap());
+        app.table.stats = Some(ColumnStats { layer: id, answer });
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        assert!(h.query_by_label(&sum).is_some(), "the sum {sum} is shown");
+        assert!(h.query_by_label(&format!("All {} rows", fmt_stat(rows as f64))).is_some());
+        // Closing the table drops the window.
+        h.state_mut().session.table_layer = None;
+        h.run_steps(2);
+        assert!(h.state().table.stats.is_none());
     }
 }

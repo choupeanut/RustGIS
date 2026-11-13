@@ -628,6 +628,11 @@ pub fn commands() -> Vec<C> {
         .view()
         .key("Ctrl+T")
         .when(need_feature_layer),
+        C::new("table.statistics", "Column Statistics", "Data › Table", super::table_stats::run)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
+            .view()
+            .params(r#"{"layer"?: name|id (default: the active layer), "field": name, "selected"?: bool (only the layer's selected features; default: all)} → a numeric field: {layer, field, kind: "number", selected, rows (features considered), count (numbers used), nulls (null or empty), skipped (not finite numbers: NaN, infinity, or text that isn't a number; said in a notice), sum, mean, min, max, stdDev (the population one, divided by n, as Summary Statistics' STD)}; a text, date or other field: {…, kind: "text"|"date", count, nulls, distinct, min, max (text by character code, dates by date)}"#),
         C::new("table.close", "Close Table", "Data › Table", |s, _| {
             s.table_layer = None;
             Ok(Value::Null)

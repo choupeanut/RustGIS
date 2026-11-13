@@ -12,6 +12,9 @@ mod permission_policy;
 #[path = "tests/review_boundaries.rs"]
 mod review_boundaries;
 
+#[path = "tests/table_statistics.rs"]
+mod table_statistics;
+
 #[path = "tests/task_reentry.rs"]
 mod task_reentry;
 
