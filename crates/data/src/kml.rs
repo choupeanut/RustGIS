@@ -441,6 +441,13 @@ impl Reader {
                     _ => None,
                 };
                 if let Some((k, v)) = pair.filter(|(k, _)| !k.trim().is_empty()) {
+                    // The attribute reader uses the first entry for a key. Count and discard
+                    // later entries here, including duplicates across Data and SimpleData and
+                    // names past the column cap.
+                    if !seen.insert(k.clone()) {
+                        duplicates += 1;
+                        continue;
+                    }
                     if !self.keys.contains(&k) {
                         // At most MAX_KEYS columns of extended data; the rest are dropped.
                         if self.keys.len() >= MAX_KEYS {
@@ -448,12 +455,6 @@ impl Reader {
                             continue;
                         }
                         self.keys.push(k.clone());
-                    }
-                    // The attribute reader uses the first entry for a key. Count and discard
-                    // later entries here, including duplicates across Data and SimpleData.
-                    if !seen.insert(k.clone()) {
-                        duplicates += 1;
-                        continue;
                     }
                     data.push((k, v));
                 }
@@ -657,6 +658,33 @@ mod tests {
             assert_eq!(ds.value(0, ds.field_index("kind").unwrap()), &Value::Text("first".into()));
         }
         assert_eq!(layers[0].dataset.value(1, layers[0].dataset.field_index("n").unwrap()), &Value::Int(7));
+    }
+
+    #[test]
+    fn repeated_names_past_the_column_cap_are_counted() {
+        let mut first = String::from("<Placemark><ExtendedData>");
+        for i in 0..MAX_KEYS {
+            first.push_str(&format!("<Data name=\"k{i}\"><value>1</value></Data>"));
+        }
+        first.push_str("</ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark>");
+        let over = |extra: &str| {
+            format!(
+                "<kml><Document>{first}<Placemark><ExtendedData>{extra}</ExtendedData>\
+                 <Point><coordinates>3,4</coordinates></Point></Placemark></Document></kml>"
+            )
+        };
+        let twice = over("<Data name=\"extra\"><value>1</value></Data><Data name=\"extra\"><value>2</value></Data>");
+        let layers = read("cap.kml", twice.as_bytes()).unwrap();
+        let messages: Vec<_> = layers.iter().flat_map(|l| &l.report.messages).collect();
+        assert!(messages.iter().any(|m| m.contains("1 repeated ExtendedData entries in 1 placemarks")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("distinct names")), "the cap is still said: {messages:?}");
+        assert_eq!(layers[0].dataset.fields.len() - layers[0].dataset.field_index("k0").unwrap(), MAX_KEYS);
+        // Once past the cap is the cap only, not a repeat.
+        let once = over("<Data name=\"extra\"><value>1</value></Data>");
+        let layers = read("cap.kml", once.as_bytes()).unwrap();
+        let messages: Vec<_> = layers.iter().flat_map(|l| &l.report.messages).collect();
+        assert!(!messages.iter().any(|m| m.contains("repeated")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("distinct names")), "{messages:?}");
     }
 
     #[test]
