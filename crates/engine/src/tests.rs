@@ -12334,6 +12334,65 @@ fn plugin_commands_run_like_commands() {
 }
 
 #[test]
+fn plugin_host_gives_layer_crs_and_features_in_it() {
+    let mut s = world();
+    plugin("eng-crs", &["edit"]);
+    // A layer read in UTM 37N: stored in longitude/latitude, with its own system kept.
+    let text = r#"{"type":"FeatureCollection","crs":{"type":"name","properties":{"name":"EPSG:32637"}},
+        "features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[500000.0,3320000.0]}}]}"#;
+    let (ds, _) = rustgis_data::io::read_geojson(text, "Mine").unwrap();
+    assert_eq!(ds.crs.map(|c| c.epsg()), Some(32637));
+    s.map_mut().add_dataset(ds);
+    let layers = forward(&mut s, "eng-crs", "host.layers", json!({})).unwrap();
+    let find = |n: &str| layers.as_array().unwrap().iter().find(|l| l["name"] == n).unwrap().clone();
+    assert_eq!(find("Mine")["crs"], "EPSG:32637");
+    assert_eq!(find("Cities")["crs"], "EPSG:4326");
+    assert!(find("Cities")["extent"].is_array(), "the other members stay");
+    // Without crs: degrees, no crs member, as before.
+    let deg = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine"})).unwrap();
+    assert!(deg.get("crs").is_none(), "{deg}");
+    let (lon, lat) = (
+        deg["features"][0]["geometry"]["coordinates"][0].as_f64().unwrap(),
+        deg["features"][0]["geometry"]["coordinates"][1].as_f64().unwrap(),
+    );
+    assert!((lon - 39.0).abs() < 1e-6 && (lat - 30.0).abs() < 0.1, "{deg}");
+    // "layer": the source's metres, named so host.addLayer reads them back.
+    for asked in ["layer", "EPSG:32637", " Layer "] {
+        let m = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": asked})).unwrap();
+        let c = &m["features"][0]["geometry"]["coordinates"];
+        assert!((c[0].as_f64().unwrap() - 500000.0).abs() < 0.01 && (c[1].as_f64().unwrap() - 3320000.0).abs() < 0.01, "{asked}: {m}");
+        assert_eq!(m["crs"]["properties"]["name"], "EPSG:32637");
+        assert_eq!(m["features"][0]["row"], 0);
+    }
+    // A round trip through host.addLayer lands where it was.
+    let m = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "layer"})).unwrap();
+    forward(&mut s, "eng-crs", "host.addLayer", json!({"name": "Again", "geojson": m})).unwrap();
+    let again = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Again"})).unwrap();
+    for i in 0..2 {
+        let (a, b) = (
+            again["features"][0]["geometry"]["coordinates"][i].as_f64().unwrap(),
+            deg["features"][0]["geometry"]["coordinates"][i].as_f64().unwrap(),
+        );
+        assert!((a - b).abs() < 1e-9, "{again} vs {deg}");
+    }
+    // "map" is the map's projection; WGS 84 asked for is the plain answer.
+    let m = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "map"})).unwrap();
+    assert_eq!(m["crs"]["properties"]["name"], "EPSG:3857");
+    assert!(m["features"][0]["geometry"]["coordinates"][0].as_f64().unwrap().abs() > 1000.0, "{m}");
+    s.run("map.projection", &json!({"type": "EPSG:32617"})).unwrap();
+    let m = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "map"})).unwrap();
+    assert_eq!(m["crs"]["properties"]["name"], "EPSG:32617");
+    let w = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "EPSG:4326"})).unwrap();
+    assert!(w.get("crs").is_none(), "{w}");
+    // Refused: unknown, unparseable, not text.
+    for bad in [json!("EPSG:999999"), json!("nonsense"), json!(7)] {
+        let e = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": bad})).unwrap_err();
+        assert!(e.contains("crs"), "{bad}: {e}");
+    }
+    rustgis_plugins::unload("eng-crs");
+}
+
+#[test]
 fn plugin_edits_are_one_undo_step() {
     let mut s = world();
     plugin("eng-edit", &["edit"]);

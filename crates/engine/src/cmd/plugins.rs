@@ -438,12 +438,68 @@ fn layers_of(s: &Session) -> Value {
                     "geometry": format!("{:?}", l.dataset.geometry_type), "features": l.dataset.features.len(),
                     "selected": l.selection.len(), "active": Some(l.id) == active,
                     "extent": super::project::bbox(l.extent()), "transparency": l.transparency,
+                    "crs": layer_crs(l).and_then(crs_name),
                     "group": s.map().group_of(l.id).map(|g| g.name.as_str()),
                     "fields": l.dataset.fields.iter().map(|f| json!({"name": f.name, "type": format!("{:?}", f.ty)})).collect::<Vec<_>>(),
                 })
             })
             .collect(),
     )
+}
+
+/// The coordinate system a layer's own coordinates are in (what `share.exportLayer` keeps when it
+/// is not given a `crs`): a vector layer's dataset system, longitude/latitude when it has none;
+/// a raster's, once read (`None` before that).
+fn layer_crs(l: &rustgis_map::Layer) -> Option<rustgis_data::raster::Crs> {
+    use rustgis_data::raster::Crs;
+    match &l.raster {
+        Some(r) => r.data.as_ref().map(|d| d.crs),
+        None => Some(l.dataset.crs.unwrap_or(Crs::LonLat)),
+    }
+}
+
+/// A system as `host.layers` names it: `EPSG:<code>`, else its WKT, else `None`.
+fn crs_name(crs: rustgis_data::raster::Crs) -> Option<String> {
+    if crs.epsg() > 0 { Some(format!("EPSG:{}", crs.epsg())) } else { rustgis_data::raster::wkt::to_wkt(crs) }
+}
+
+/// The map's flat coordinate system, for `"crs": "map"`: Web Mercator for the globe too (as a
+/// pick's map coordinates), the projection's EPSG system, or a custom one. Not for another
+/// body's map.
+fn map_crs(m: &rustgis_map::Map) -> Result<rustgis_data::raster::Crs, String> {
+    use rustgis_data::raster::{Crs, crs::CustomCrs};
+    if !m.body().is_earth() {
+        return Err(format!("the map of {} has no coordinate system a plugin can be given", m.body().name));
+    }
+    match &m.projection {
+        rustgis_map::Projection::Globe | rustgis_map::Projection::WebMercator => Ok(Crs::WebMercator),
+        rustgis_map::Projection::Custom(code) => {
+            let (proj4, label) = rustgis_map::projection::lookup(code)?;
+            if let Some(crs) = label.strip_prefix("EPSG:").and_then(|n| n.parse::<u32>().ok()).and_then(Crs::from_epsg) {
+                return Ok(crs);
+            }
+            Crs::custom(CustomCrs { proj4, label, geokeys: Vec::new(), doubles: Vec::new(), ascii: String::new() })
+        }
+    }
+}
+
+/// The system `host.features` was asked for with `crs`: `None` for WGS 84 (absent, or named so),
+/// `"layer"` the layer's own, `"map"` the map's, else text [`Crs::parse`] reads (EPSG code, WKT,
+/// PROJ string), as `share.exportLayer` takes it.
+fn asked_crs(m: &rustgis_map::Map, l: &rustgis_map::Layer, p: &Value) -> Result<Option<rustgis_data::raster::Crs>, String> {
+    use rustgis_data::raster::Crs;
+    let text = match p.get("crs") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(t)) => t.trim(),
+        Some(_) => return Err("crs must be text: \"layer\", \"map\" or a coordinate system such as \"EPSG:32637\"".into()),
+    };
+    let crs = match text.to_ascii_lowercase().as_str() {
+        "" => return Ok(None),
+        "layer" => layer_crs(l).ok_or_else(|| format!("{}'s coordinate system isn't known yet", l.name))?,
+        "map" => map_crs(m)?,
+        _ => Crs::parse(text).map_err(|e| format!("crs: {e}"))?,
+    };
+    Ok((crs != Crs::LonLat).then_some(crs))
 }
 
 /// Answers a running plugin's requests.
@@ -478,13 +534,16 @@ impl Bridge<'_> {
     }
 
     /// A layer's features as GeoJSON: all of them, or its selection (`"selected": true`), at
-    /// most `limit`.
+    /// most `limit`. In longitude/latitude, or in `crs` (`"layer"`, `"map"` or a coordinate
+    /// system) when given, with a GeoJSON `crs` member naming it, as `host.addLayer` reads.
+    /// Features that can't be placed in it are refused, not dropped.
     fn features(&self, p: &Value) -> CmdResult {
         let id = self.s.layer_id(p)?;
         let l = self.s.map().layer(id).ok_or("no such layer")?;
         if l.is_raster() {
             return Err(format!("{} is a raster layer", l.name));
         }
+        let target = asked_crs(self.s.map(), l, p)?;
         let limit = uint(p, "limit").and_then(|n| usize::try_from(n).ok()).unwrap_or(usize::MAX);
         let rows: Vec<usize> = if b(p, "selected") == Some(true) { l.selection.clone() } else { (0..l.dataset.features.len()).collect() };
         let ds = rustgis_data::Dataset {
@@ -493,12 +552,48 @@ impl Bridge<'_> {
             fields: l.dataset.fields.clone(),
             features: rows.iter().take(limit).filter_map(|&i| l.dataset.features.get(i).cloned()).collect(),
             source: None,
-            crs: None,
+            crs: l.dataset.crs,
             crs_incomplete: false,
             zm_dropped: false,
             windowed: false,
         };
+        let mut ds = ds;
+        let mut member = None;
+        if let Some(crs) = target {
+            // Only a system `host.addLayer` can read back is named, so a round trip works.
+            if crs.epsg() == 0 {
+                return Err(format!("crs: {} has no EPSG code, so GeoJSON can't name it; use an EPSG code", crs.label()));
+            }
+            if let Some(e) = rustgis_data::export_error(&ds, crs) {
+                return Err(format!("crs: {e}"));
+            }
+            let t = crs.transformer().map_err(|e| format!("crs: {e}"))?;
+            let (mut failed, mut first) = (0usize, None);
+            for f in ds.features.iter_mut() {
+                let Some(g) = f.geometry.take() else { continue };
+                let g = g.map_coords(&|c| t.from_lonlat(c).unwrap_or(crate::geom::Coord::new(f64::NAN, f64::NAN)));
+                let mut ok = true;
+                g.for_each_coord(|c| ok &= c.is_finite());
+                if !ok {
+                    failed += 1;
+                    first.get_or_insert(f.id);
+                }
+                f.geometry = Some(g);
+            }
+            if failed > 0 {
+                return Err(format!(
+                    "crs: {failed} feature(s) of {} can't be placed in {} (the first is feature {}); nothing was returned",
+                    l.name,
+                    crs.label(),
+                    first.unwrap_or_default()
+                ));
+            }
+            member = Some(json!({"type": "name", "properties": {"name": format!("EPSG:{}", crs.epsg())}}));
+        }
         let mut gj = rustgis_data::io::to_geojson(&ds);
+        if let (Some(m), Some(o)) = (member, gj.as_object_mut()) {
+            o.insert("crs".into(), m);
+        }
         // The row of each feature, for selecting or editing it afterwards.
         if let Some(fs) = gj.get_mut("features").and_then(Value::as_array_mut) {
             for (f, row) in fs.iter_mut().zip(rows.iter()) {
