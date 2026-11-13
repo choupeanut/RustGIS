@@ -495,7 +495,7 @@ fn name_column(fields: &[(String, Option<u32>, Option<u32>)]) -> Option<usize> {
 /// row's value is its value field (the min-max usage, else one called `Value`); without one, the
 /// whole number in its unit bin when the table gives linear binning (`Row0Min` and `BinSize`,
 /// row `index` from `Row0Min`), else its `index` (GDAL's convention for a table with no value
-/// field). A table of value ranges (bins wider than 1, or a min and a max with no value) can't
+/// field). A table of value ranges (bins wider than 1, or a min or a max with no value) can't
 /// name single values and is counted.
 fn table_names(table: roxmltree::Node<'_, '_>, kept: &mut dyn FnMut(&str) -> String, lost: &mut RatLost) -> Vec<String> {
     let fields = table_fields(table);
@@ -510,7 +510,7 @@ fn table_names(table: roxmltree::Node<'_, '_>, kept: &mut dyn FnMut(&str) -> Str
     let binned = min.zip(bin);
     let has = |usage| fields.iter().any(|f| f.2 == Some(usage));
     let wide = bin.is_some_and(|b| b != 1.0);
-    if wide || (value_at.is_none() && binned.is_none() && has(3) && has(4)) {
+    if wide || (value_at.is_none() && binned.is_none() && (has(3) || has(4))) {
         lost.ranges += 1;
         return Vec::new();
     }
@@ -1105,6 +1105,12 @@ mod tests {
         let ranges = parse(&table("", &[("Min", 0, 3), ("Max", 0, 4), ("Name", 2, 2)], &[&["0", "10", "low"]])).unwrap();
         assert!(ranges.band(1).unwrap().categories.is_empty());
         assert_eq!(ranges.lost, ["1 attribute table(s) of value ranges not read as class names"]);
+        // One bound alone is a range too.
+        for usage in [3, 4] {
+            let one = parse(&table("", &[("Bound", 0, usage), ("Name", 2, 2)], &[&["10", "Forest"]])).unwrap();
+            assert!(one.band(1).unwrap().categories.is_empty(), "usage {usage}");
+            assert_eq!(one.lost, ["1 attribute table(s) of value ranges not read as class names"], "usage {usage}");
+        }
         let wide = parse(&table(r#"Row0Min="0" BinSize="10""#, &[("Name", 2, 2)], &[&["low"]])).unwrap();
         assert_eq!(wide.lost, ["1 attribute table(s) of value ranges not read as class names"]);
         let odd = parse(&table(
