@@ -426,6 +426,15 @@ fn parse_sidecar(text: &str) -> Result<Pam, String> {
     if rat.ranges > 0 {
         pam.lost.push(format!("{} attribute table(s) of value ranges not read as class names", rat.ranges));
     }
+    if rat.unread_tables > 0 {
+        pam.lost.push(format!(
+            "{} attribute table(s) with a bin or a field type or usage that isn't a number not read as class names",
+            rat.unread_tables
+        ));
+    }
+    if rat.text_tables > 0 {
+        pam.lost.push(format!("{} attribute table(s) with text fields but no name column not read as class names", rat.text_tables));
+    }
     if rat.odd > 0 {
         pam.lost.push(format!(
             "{} class name(s) of an attribute table for a value that isn't a whole number from 0 to {} left out",
@@ -459,6 +468,8 @@ fn parse_sidecar(text: &str) -> Result<Pam, String> {
 #[derive(Default)]
 struct RatLost {
     ranges: usize,
+    unread_tables: usize,
+    text_tables: usize,
     odd: usize,
     again: usize,
     rows: usize,
@@ -490,8 +501,24 @@ fn name_column(fields: &[(String, Option<u32>, Option<u32>)]) -> Option<usize> {
     fields.iter().position(|f| f.2 == Some(2)).or_else(|| fields.iter().position(|f| f.1 == Some(2) && NAMES.contains(&f.0.as_str())))
 }
 
+/// Whether a field's type or usage is given but isn't a number, so which column GDAL means by its
+/// usage can't be told.
+fn odd_field_numbers(table: roxmltree::Node<'_, '_>) -> bool {
+    table.children().filter(|n| n.has_tag_name("FieldDefn")).any(|f| {
+        ["Type", "Usage"].iter().any(|&tag| {
+            f.children()
+                .find(|n| n.has_tag_name(tag))
+                .and_then(|n| n.text())
+                .map(str::trim)
+                .is_some_and(|t| !t.is_empty() && t.parse::<u32>().is_err())
+        })
+    })
+}
+
 /// The class names a GDAL raster attribute table holds, by value (as `PamBand::categories`).
-/// The names are in its [`name_column`]; a table with none names nothing and loses nothing. A
+/// The names are in its [`name_column`]. A table whose bins or field types or usages aren't
+/// numbers isn't read, and neither is one with a text field but no name column: both are counted,
+/// as those could hold names. A table with neither names nothing and loses nothing. A
 /// row's value is its value field (the min-max usage, else one called `Value`); without one, the
 /// whole number in its unit bin when the table gives linear binning (`Row0Min` and `BinSize`,
 /// row `index` from `Row0Min`), else its `index` (GDAL's convention for a table with no value
@@ -499,7 +526,15 @@ fn name_column(fields: &[(String, Option<u32>, Option<u32>)]) -> Option<usize> {
 /// name single values and is counted.
 fn table_names(table: roxmltree::Node<'_, '_>, kept: &mut dyn FnMut(&str) -> String, lost: &mut RatLost) -> Vec<String> {
     let fields = table_fields(table);
+    // A bin that isn't a number (or a non-finite `Row0Min`) would number the rows without a notice.
+    let bin_odd = table.attribute("Row0Min").is_some_and(|v| v.trim().parse::<f64>().ok().is_none_or(|v| !v.is_finite()))
+        || table.attribute("BinSize").is_some_and(|v| v.trim().parse::<f64>().is_err());
+    if bin_odd || odd_field_numbers(table) {
+        lost.unread_tables += 1;
+        return Vec::new();
+    }
     let Some(name_at) = name_column(&fields) else {
+        lost.text_tables += usize::from(fields.iter().any(|f| f.1 == Some(2)));
         return Vec::new();
     };
     let value_at = fields.iter().position(|f| f.2 == Some(5)).or_else(|| fields.iter().position(|f| f.0 == "value"));
@@ -1043,6 +1078,29 @@ mod tests {
         let c = &binned.band(1).unwrap().categories;
         assert_eq!((c.len(), c[10].as_str(), c[12].as_str()), (13, "zero", "two"));
         assert!(binned.lost.is_empty(), "{:?}", binned.lost);
+    }
+
+    #[test]
+    fn a_table_that_cannot_be_read_as_names_is_said() {
+        let bins_msg = "1 attribute table(s) with a bin or a field type or usage that isn't a number not read as class names";
+        let text_msg = "1 attribute table(s) with text fields but no name column not read as class names";
+        // A bin that isn't a number would number the rows without a notice.
+        let bin = parse(&table(r#"Row0Min="x" BinSize="1""#, &[("Name", 2, 2)], &[&["zero"]])).unwrap();
+        assert!(bin.band(1).unwrap().categories.is_empty());
+        assert_eq!(bin.lost, [bins_msg]);
+        let wide = parse(&table(r#"BinSize="wide""#, &[("Name", 2, 2)], &[&["zero"]])).unwrap();
+        assert_eq!(wide.lost, [bins_msg]);
+        // A usage that isn't a number may be the name column's.
+        let usage = r#"<PAMDataset><PAMRasterBand band="1"><GDALRasterAttributeTable><FieldDefn index="0"><Name>Value</Name><Type>0</Type><Usage>5</Usage></FieldDefn><FieldDefn index="1"><Name>Desc</Name><Type>2</Type><Usage>two</Usage></FieldDefn><Row index="0"><F>1</F><F>one</F></Row></GDALRasterAttributeTable></PAMRasterBand></PAMDataset>"#;
+        let usage = parse(usage).unwrap();
+        assert!(usage.band(1).unwrap().categories.is_empty());
+        assert_eq!(usage.lost, [bins_msg]);
+        // A text field that no usage or name marks as names is said; a table with none isn't.
+        let text = parse(&table("", &[("Value", 0, 5), ("Desc", 2, 0)], &[&["2", "Urban"]])).unwrap();
+        assert!(text.band(1).unwrap().categories.is_empty());
+        assert_eq!(text.lost, [text_msg]);
+        let plain = parse(&table("", &[("Value", 0, 5), ("Count", 0, 1)], &[&["2", "7"]])).unwrap();
+        assert!(plain.lost.is_empty(), "{:?}", plain.lost);
     }
 
     #[test]
