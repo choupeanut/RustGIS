@@ -43,6 +43,8 @@ mod extensionsui;
 mod failureui;
 mod fieldlists;
 mod fieldmenu;
+#[cfg(not(target_arch = "wasm32"))]
+mod filedialog;
 mod fill_editor;
 mod geocodeui;
 mod geolibreui;
@@ -631,7 +633,6 @@ pub enum RightPane {
     Geoprocessing,
     Symbology,
     History,
-    Details,
     Editing,
     Design,
     Workflows,
@@ -1962,10 +1963,14 @@ impl RustGisApp {
             // cannot confirm that this renamed document reached a file.
             self.session.mark_unsaved();
         }
-        self.session.notify(
-            crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)]),
-            false,
-        );
+        // On Android the file is written once the user has chosen its place, and the shell
+        // says then whether it was.
+        let offered = if cfg!(target_os = "android") {
+            crate::i18n::fmt("Choose where to save {name}.", &[("name", &file)])
+        } else {
+            crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)])
+        };
+        self.session.notify(offered, false);
         report.notify(&mut self.session);
         self.ui.web_file = Some(file);
         Ok(())
@@ -1985,7 +1990,12 @@ impl RustGisApp {
                     self.session.notify(e, true);
                     return false;
                 }
-                self.session.notify(crate::i18n::fmt("Download offered: {name}", &[("name", name)]), false);
+                let offered = if cfg!(target_os = "android") {
+                    crate::i18n::fmt("Choose where to save {name}.", &[("name", name)])
+                } else {
+                    crate::i18n::fmt("Download offered: {name}", &[("name", name)])
+                };
+                self.session.notify(offered, false);
                 true
             }
             None => false,
@@ -2441,6 +2451,9 @@ impl RustGisApp {
             }
             if id == "service.add" && params.get("text").and_then(Value::as_str).is_some() {
                 return readjob::run(self, "service.add", params);
+            }
+            if id == "layer.repairSource" {
+                return readjob::run(self, "layer.repairSource", params);
             }
             let archive = match id {
                 "map.reloadTiles" => Some("map.reloadTiles"),
@@ -2909,15 +2922,27 @@ impl RustGisApp {
     /// `layout.arrangement` changed them.
     fn save_layout_favourite(&mut self) {
         if self.session.layout_arrangements != self.ui.layout_arrangements_saved && !self.ui.layout_arrangements_unreadable {
-            // An arrangement removed here takes with it the entries passed over beside it under
-            // the same name but for case, so it doesn't come back at the next start.
-            let kept = &self.session.layout_arrangements;
+            // An arrangement removed, saved or replaced here takes with it the entries passed over
+            // beside it under the same name but for case: one removed doesn't come back at the next
+            // start, and one saved isn't passed over then for the older entry.
+            let (kept, before) = (&self.session.layout_arrangements, &self.ui.layout_arrangements_saved);
             let removed: Vec<String> =
-                self.ui.layout_arrangements_saved.keys().filter(|k| !kept.contains_key(*k)).map(|k| k.to_lowercase()).collect();
+                before.keys().chain(kept.keys()).filter(|k| before.get(*k) != kept.get(*k)).map(|k| k.to_lowercase()).collect();
             // Only those this version would use: one it can't read stays as it was.
+            let passed = self.ui.layout_arrangements_unread.len();
             self.ui.layout_arrangements_unread.retain(|name, corners| {
                 !removed.contains(&name.to_lowercase()) || !rustgis_engine::cmd::layout::usable_saved_arrangement(name, corners)
             });
+            let dropped = passed - self.ui.layout_arrangements_unread.len();
+            if dropped > 0 {
+                self.session.notify(
+                    crate::i18n::fmt(
+                        "Saved arrangements of publication layouts passed over under a name saved or removed now are dropped: {count}.",
+                        &[("count", &dropped.to_string())],
+                    ),
+                    false,
+                );
+            }
             self.ui.layout_arrangements_saved = self.session.layout_arrangements.clone();
             // Those this version couldn't use go back as they were, but where one saved here took
             // their very name.
@@ -2974,7 +2999,16 @@ impl RustGisApp {
                 toggle_right(&mut self.ui, RightPane::Symbology)
             }
             "ui.pane.history" => toggle_right(&mut self.ui, RightPane::History),
-            "ui.pane.details" => toggle_right(&mut self.ui, RightPane::Details),
+            // The Layer Properties pane on its Source tab (#1803), for the layer given (`{"layer"}`)
+            // or the selected one; with neither, it hides the pane when it is in view on Source.
+            "ui.pane.details" => {
+                let layer = p.get("layer").filter(|l| !l.is_null());
+                if layer.is_none() && layerprops::source_in_view(&self.ui) {
+                    self.ui.close_right(RightPane::LayerProperties);
+                } else {
+                    return self.run_ui("ui.pane.layerProperties", &json!({"tab": "source", "layer": layer}));
+                }
+            }
             "ui.pane.editing" => toggle_right(&mut self.ui, RightPane::Editing),
             "ui.pane.design" => toggle_right(&mut self.ui, RightPane::Design),
             "ui.pane.script" => toggle_right(&mut self.ui, RightPane::Script),
@@ -3937,7 +3971,7 @@ impl RustGisApp {
             }
             "ui.addFolder" => {
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                if let Some(dir) = crate::filedialog::FileDialog::new().pick_folder() {
                     return self.run("project.addFolder", json!({"path": dir.display().to_string()}));
                 }
                 #[cfg(target_arch = "wasm32")]
@@ -5695,6 +5729,16 @@ impl RustGisApp {
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
+        }
+        // A picker Android doesn't have was asked for: said, as the click did nothing.
+        #[cfg(target_os = "android")]
+        for what in filedialog::take_refused() {
+            let text = match what {
+                "choose a folder" => tl!("Choosing a folder isn't available on Android yet."),
+                "save a file" => tl!("Saving to a file of your choice isn't available here on Android yet."),
+                _ => tl!("Choosing a file isn't available here on Android yet."),
+            };
+            self.session.notify(text, false);
         }
         // Files from the async picker or browser drops.
         let arrived: Vec<(String, Vec<u8>)> = match &self.services.inbox {
