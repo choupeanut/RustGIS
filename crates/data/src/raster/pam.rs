@@ -29,6 +29,8 @@ const MAX_BYTES: u64 = 16 << 20;
 const MAX_BANDS: usize = 65_536;
 /// Most class names read for a band: one for each value of a 16-bit band.
 const MAX_CATEGORIES: usize = 65_536;
+/// Most rows read from a band's raster attribute table.
+const MAX_RAT_ROWS: usize = 262_144;
 /// Longest band description or class name read from GDAL's metadata tag, in characters.
 const MAX_NAME: usize = 256;
 
@@ -52,6 +54,9 @@ pub struct PamBand {
     /// The names of the band's classes, by value (GDAL's category names): `categories[v]` names
     /// value `v`, and is empty when that value has none. Empty when the band names no class.
     pub categories: Vec<String>,
+    /// Whether `categories` come from a raster attribute table rather than from category names,
+    /// which a source the raster already has them from (its GDAL metadata) takes precedence over.
+    pub from_table: bool,
     /// The band's central wavelength in nanometres, when the file gives one ([`wavelength_nm`]).
     pub wavelength: Option<f64>,
 }
@@ -282,6 +287,9 @@ fn parse_sidecar(text: &str) -> Result<Pam, String> {
     // Wavelength units given again otherwise for the dataset or a band (the first is read).
     let mut units_again = other_units(mdi_texts(root, WAVELENGTH_UNITS));
     let (mut seen, mut twice) = (std::collections::HashSet::new(), 0usize);
+    // Raster attribute tables of value ranges, class names of one for a value that isn't a whole
+    // number from 0 to `MAX_CATEGORIES - 1` or that is named again, and rows past `MAX_RAT_ROWS`.
+    let mut rat = RatLost::default();
     // The unit the dataset gives its bands' wavelengths in, for a band that gives none; a
     // wavelength of the dataset's own is for no band.
     let dataset_units = mdi_text(root, WAVELENGTH_UNITS);
@@ -364,7 +372,15 @@ fn parse_sidecar(text: &str) -> Result<Pam, String> {
         while categories.last().is_some_and(String::is_empty) {
             categories.pop();
         }
-        pam.bands.push(PamBand { band, description, nodata, stats, categories, wavelength });
+        // Without category names, a raster attribute table's name column names the classes.
+        let mut from_table = false;
+        if categories.is_empty()
+            && let Some(table) = b.children().find(|n| n.has_tag_name("GDALRasterAttributeTable"))
+        {
+            categories = table_names(table, &mut kept, &mut rat);
+            from_table = !categories.is_empty();
+        }
+        pam.bands.push(PamBand { band, description, nodata, stats, categories, from_table, wavelength });
     }
     if odd_bands > 0 {
         pam.lost.push(format!("{odd_bands} band record(s) for no band from 1 to {MAX_BANDS} left out"));
@@ -401,10 +417,104 @@ fn parse_sidecar(text: &str) -> Result<Pam, String> {
     if beyond > 0 {
         pam.lost.push(format!("{beyond} class name(s) past the first {MAX_CATEGORIES} of a band left out"));
     }
+    if rat.ranges > 0 {
+        pam.lost.push(format!("{} attribute table(s) of value ranges not read as class names", rat.ranges));
+    }
+    if rat.odd > 0 {
+        pam.lost.push(format!(
+            "{} class name(s) of an attribute table for a value that isn't a whole number from 0 to {} left out",
+            rat.odd,
+            MAX_CATEGORIES - 1
+        ));
+    }
+    if rat.again > 0 {
+        pam.lost.push(format!("{} class name(s) of an attribute table given again for a value left out (the first is kept)", rat.again));
+    }
+    if rat.rows > 0 {
+        pam.lost.push(format!("{} attribute table row(s) past the first {MAX_RAT_ROWS} left out", rat.rows));
+    }
     if cut > 0 {
         pam.lost.push(format!("{cut} band or class name(s) cut to {MAX_NAME} characters"));
     }
     Ok(pam)
+}
+
+/// What reading raster attribute tables left out, for [`parse_sidecar`] to say.
+#[derive(Default)]
+struct RatLost {
+    ranges: usize,
+    odd: usize,
+    again: usize,
+    rows: usize,
+}
+
+/// The class names a GDAL raster attribute table holds, by value (as `PamBand::categories`).
+/// The names are in the field GDAL gives the name usage, else a text field called `Class_Name`
+/// and the like; a table with none names nothing and loses nothing. A row's value is its
+/// value field (the min-max usage, else one called `Value`), else from the table's linear
+/// binning, else the row's number (GDAL's convention for a table with no value field). A table
+/// of value ranges can't name single values and is counted.
+fn table_names(table: roxmltree::Node<'_, '_>, kept: &mut dyn FnMut(&str) -> String, lost: &mut RatLost) -> Vec<String> {
+    // Each field's lower-case name, type and usage, in order.
+    let fields: Vec<(String, Option<u32>, Option<u32>)> = table
+        .children()
+        .filter(|n| n.has_tag_name("FieldDefn"))
+        .map(|f| {
+            let text = |tag: &str| f.children().find(|n| n.has_tag_name(tag)).and_then(|n| n.text()).map(str::trim);
+            (
+                text("Name").unwrap_or_default().to_lowercase(),
+                text("Type").and_then(|t| t.parse().ok()),
+                text("Usage").and_then(|u| u.parse().ok()),
+            )
+        })
+        .collect();
+    const NAMES: [&str; 6] = ["class_name", "classname", "class_names", "class", "name", "label"];
+    let Some(name_at) =
+        fields.iter().position(|f| f.2 == Some(2)).or_else(|| fields.iter().position(|f| f.1 == Some(2) && NAMES.contains(&f.0.as_str())))
+    else {
+        return Vec::new();
+    };
+    let value_at = fields.iter().position(|f| f.2 == Some(5)).or_else(|| fields.iter().position(|f| f.0 == "value"));
+    let (min, bin) = (
+        table.attribute("Row0Min").and_then(|v| v.trim().parse::<f64>().ok()),
+        table.attribute("BinSize").and_then(|v| v.trim().parse::<f64>().ok()),
+    );
+    let has = |usage| fields.iter().any(|f| f.2 == Some(usage));
+    if value_at.is_none() && ((has(3) && has(4)) || bin.is_some_and(|b| b != 1.0)) {
+        lost.ranges += 1;
+        return Vec::new();
+    }
+    // Linear binning of whole values from `Row0Min`, when the table gives both.
+    let first = min.zip(bin).map(|(m, _)| m);
+    let rows: Vec<_> = table.children().filter(|n| n.has_tag_name("Row")).collect();
+    lost.rows += rows.len().saturating_sub(MAX_RAT_ROWS);
+    let mut categories: Vec<String> = Vec::new();
+    for (i, row) in rows.iter().take(MAX_RAT_ROWS).enumerate() {
+        let cell =
+            |at: usize| row.children().filter(|n| n.has_tag_name("F")).nth(at).and_then(|n| n.text()).map(str::trim).unwrap_or_default();
+        let name = cell(name_at);
+        if name.is_empty() {
+            continue;
+        }
+        let value = match value_at {
+            Some(at) => cell(at).parse::<f64>().ok(),
+            None => Some(first.unwrap_or(0.0) + i as f64),
+        };
+        let Some(v) = value.filter(|v| v.fract() == 0.0 && (0.0..MAX_CATEGORIES as f64).contains(v)) else {
+            lost.odd += 1;
+            continue;
+        };
+        let v = v as usize;
+        if categories.get(v).is_some_and(|c| !c.is_empty()) {
+            lost.again += 1;
+            continue;
+        }
+        if categories.len() <= v {
+            categories.resize(v + 1, String::new());
+        }
+        categories[v] = kept(name);
+    }
+    categories
 }
 
 /// The band descriptions a GeoTIFF holds itself, in GDAL's metadata tag (`GDAL_METADATA`, 42112),
@@ -839,6 +949,118 @@ mod tests {
                 "1 band colour table(s) not read: left out (only the file's own is drawn)".to_string(),
                 "1 no-data value(s) that aren't numbers left out: those pixels are read as values".to_string(),
             ]
+        );
+    }
+
+    /// A band's raster attribute table, as GDAL writes it, from its attributes, fields and rows.
+    fn table(attrs: &str, fields: &[(&str, u32, u32)], rows: &[&[&str]]) -> String {
+        let fields: String = fields
+            .iter()
+            .enumerate()
+            .map(|(i, (n, t, u))| format!(r#"<FieldDefn index="{i}"><Name>{n}</Name><Type>{t}</Type><Usage>{u}</Usage></FieldDefn>"#))
+            .collect();
+        let rows: String = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!(r#"<Row index="{i}">{}</Row>"#, r.iter().map(|f| format!("<F>{f}</F>")).collect::<String>()))
+            .collect();
+        format!(
+            r#"<PAMDataset><PAMRasterBand band="1"><GDALRasterAttributeTable {attrs}>{fields}{rows}</GDALRasterAttributeTable></PAMRasterBand></PAMDataset>"#
+        )
+    }
+
+    #[test]
+    fn a_raster_attribute_table_names_classes() {
+        let xml = r#"<PAMDataset><PAMRasterBand band="1">
+  <GDALRasterAttributeTable Row0Min="0" BinSize="1" tableType="thematic">
+    <FieldDefn index="0"><Name>Value</Name><Type>0</Type><Usage>5</Usage></FieldDefn>
+    <FieldDefn index="1"><Name>Count</Name><Type>0</Type><Usage>1</Usage></FieldDefn>
+    <FieldDefn index="2"><Name>Class_Name</Name><Type>2</Type><Usage>2</Usage></FieldDefn>
+    <Row index="0"><F>1</F><F>100</F><F>Water</F></Row>
+    <Row index="1"><F>3</F><F>250</F><F> Forest </F></Row>
+  </GDALRasterAttributeTable></PAMRasterBand></PAMDataset>"#;
+        let pam = parse(xml).unwrap();
+        let b = pam.band(1).unwrap();
+        assert_eq!(b.categories, ["", "Water", "", "Forest"]);
+        assert!(b.from_table && pam.lost.is_empty(), "{:?}", pam.lost);
+        // The name column is found by its usage, however it is called, else by a name.
+        let odd = parse(&table("", &[("Value", 0, 5), ("Desc", 2, 2)], &[&["2", "Urban"]])).unwrap();
+        assert_eq!(odd.band(1).unwrap().categories, ["", "", "Urban"]);
+        let named = parse(&table("", &[("VALUE", 0, 0), ("CLASS_NAME", 2, 0)], &[&["1", "Crops"]])).unwrap();
+        assert_eq!(named.band(1).unwrap().categories, ["", "Crops"]);
+        // A table with no name column names nothing and loses nothing.
+        let none = parse(&table("", &[("Value", 0, 5), ("Count", 0, 1), ("Red", 0, 6)], &[&["1", "5", "9"]])).unwrap();
+        assert!(none.band(1).unwrap().categories.is_empty() && none.lost.is_empty(), "{none:?}");
+        let number = parse(&table("", &[("Name", 0, 0)], &[&["1"]])).unwrap();
+        assert!(number.band(1).unwrap().categories.is_empty() && number.lost.is_empty(), "{number:?}");
+    }
+
+    #[test]
+    fn a_table_without_a_value_column_numbers_its_rows() {
+        let fields = [("Class_Name", 2, 2), ("Count", 0, 1)];
+        let rows: [&[&str]; 3] = [&["zero", "1"], &["", "2"], &["two", "3"]];
+        let plain = parse(&table("", &fields, &rows)).unwrap();
+        assert_eq!(plain.band(1).unwrap().categories, ["zero", "", "two"]);
+        let binned = parse(&table(r#"Row0Min="10" BinSize="1""#, &fields, &rows)).unwrap();
+        let c = &binned.band(1).unwrap().categories;
+        assert_eq!((c.len(), c[10].as_str(), c[12].as_str()), (13, "zero", "two"));
+        assert!(binned.lost.is_empty(), "{:?}", binned.lost);
+    }
+
+    #[test]
+    fn category_names_win_over_a_table() {
+        let xml = r#"<PAMDataset><PAMRasterBand band="1">
+<CategoryNames><Category>a</Category><Category>b</Category></CategoryNames>
+<GDALRasterAttributeTable><FieldDefn index="0"><Name>Name</Name><Type>2</Type><Usage>2</Usage></FieldDefn>
+<Row index="0"><F>x</F></Row><Row index="1"><F>y</F></Row><Row index="2"><F>z</F></Row></GDALRasterAttributeTable>
+</PAMRasterBand></PAMDataset>"#;
+        let pam = parse(xml).unwrap();
+        assert_eq!(pam.band(1).unwrap().categories, ["a", "b"]);
+        assert!(!pam.band(1).unwrap().from_table && pam.lost.is_empty(), "{:?}", pam.lost);
+    }
+
+    #[test]
+    fn what_a_table_leaves_out_is_said() {
+        let ranges = parse(&table("", &[("Min", 0, 3), ("Max", 0, 4), ("Name", 2, 2)], &[&["0", "10", "low"]])).unwrap();
+        assert!(ranges.band(1).unwrap().categories.is_empty());
+        assert_eq!(ranges.lost, ["1 attribute table(s) of value ranges not read as class names"]);
+        let wide = parse(&table(r#"Row0Min="0" BinSize="10""#, &[("Name", 2, 2)], &[&["low"]])).unwrap();
+        assert_eq!(wide.lost, ["1 attribute table(s) of value ranges not read as class names"]);
+        let odd = parse(&table(
+            "",
+            &[("Value", 0, 5), ("Name", 2, 2)],
+            &[
+                &["-1", "neg"],
+                &["1.5", "frac"],
+                &["65536", "big"],
+                &["x", "text"],
+                &["", "blank"],
+                &["65535", "last"],
+                &["4", "four"],
+                &["4", "again"],
+            ],
+        ))
+        .unwrap();
+        let c = &odd.band(1).unwrap().categories;
+        assert_eq!((c.len(), c[4].as_str(), c[65_535].as_str()), (65_536, "four", "last"));
+        assert_eq!(
+            odd.lost,
+            [
+                format!(
+                    "5 class name(s) of an attribute table for a value that isn't a whole number from 0 to {} left out",
+                    MAX_CATEGORIES - 1
+                ),
+                "1 class name(s) of an attribute table given again for a value left out (the first is kept)".to_string(),
+            ]
+        );
+        let long = parse(&table("", &[("Name", 2, 2)], &[&[&"x".repeat(300)]])).unwrap();
+        assert_eq!((long.band(1).unwrap().categories[0].len(), long.lost.len()), (256, 1));
+        let many = vec![&["n"][..]; MAX_RAT_ROWS + 3];
+        let many = parse(&table("", &[("Name", 2, 2)], &many)).unwrap();
+        assert!(
+            many.lost.iter().any(|l| l == &format!("3 attribute table row(s) past the first {MAX_RAT_ROWS} left out")),
+            "{:?}",
+            many.lost
         );
     }
 

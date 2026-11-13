@@ -844,7 +844,8 @@ impl Raster {
             if let Some(d) = p.and_then(|p| p.description.as_ref()) {
                 band.name = d.clone();
             }
-            if let Some(p) = p.filter(|p| !p.categories.is_empty()) {
+            // A table's names don't replace those the file's own metadata gave.
+            if let Some(p) = p.filter(|p| !p.categories.is_empty() && !(p.from_table && !band.classes.is_empty())) {
                 band.classes = p.categories.clone();
             }
             if let Some(w) = p.and_then(|p| p.wavelength) {
@@ -1635,6 +1636,28 @@ pub(crate) mod tests {
         std::fs::write(dir.join("dem.tif.aux.xml"), "<PAMDataset><PAMRasterBand").unwrap();
         assert_eq!(read_path(&tif).unwrap().bands[0].name, "Band 1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gdal_sidecars_name_classes_from_an_attribute_table() {
+        let dir = std::env::temp_dir().join(format!("rustgis-pam-rat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 50.0, pixel_width: 0.5, pixel_height: -0.5 };
+        let r = Raster::new("lc", 2, 2, vec![vec![1.0, 3.0, 3.0, 1.0]], gt, Crs::LonLat, None, ColorHint::Gray, "UInt8").unwrap();
+        let tif = dir.join("lc.tif");
+        std::fs::write(&tif, geotiff::write(&r, 0).unwrap()).unwrap();
+        let xml = r#"<PAMDataset><PAMRasterBand band="1"><GDALRasterAttributeTable Row0Min="0" BinSize="1">
+<FieldDefn index="0"><Name>Value</Name><Type>0</Type><Usage>5</Usage></FieldDefn>
+<FieldDefn index="1"><Name>Class_Name</Name><Type>2</Type><Usage>2</Usage></FieldDefn>
+<Row index="0"><F>1</F><F>Water</F></Row><Row index="1"><F>3</F><F>Forest</F></Row>
+</GDALRasterAttributeTable></PAMRasterBand></PAMDataset>"#;
+        std::fs::write(dir.join("lc.tif.aux.xml"), xml).unwrap();
+        let back = read_path(&tif).unwrap();
+        let b = &back.bands[0];
+        assert_eq!(b.classes, ["", "Water", "", "Forest"]);
+        assert_eq!((b.class_name(1.0), b.class_name(3.0), b.class_name(2.0)), (Some("Water"), Some("Forest"), None));
+        assert!(back.lost.is_empty(), "{:?}", back.lost);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
