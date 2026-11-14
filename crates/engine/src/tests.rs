@@ -12455,6 +12455,11 @@ fn plugin_host_features_refuses_what_it_can_not_place_with_crs_errors() {
     let layers = forward(&mut s, "eng-crs-no", "host.layers", json!({})).unwrap();
     let sinu = layers.as_array().unwrap().iter().find(|l| l["name"] == "Sinu").unwrap();
     assert!(sinu["crs"].as_str().is_some_and(|t| t.contains("Sinusoidal")), "{sinu}");
+    // "map" on a projection with no EPSG code is refused, and nothing is registered for it.
+    s.run("map.projection", &json!({"type": "robinson"})).unwrap();
+    let e = ask(&mut s, "P", "map").unwrap_err();
+    assert!(e.contains("crs:") && e.contains("no EPSG code"), "{e}");
+    s.run("map.projection", &json!({"type": "EPSG:3857"})).unwrap();
     // Geocentric targets can't carry a third coordinate.
     let e = ask(&mut s, "P", "EPSG:4978").unwrap_err();
     assert!(e.contains("crs:") && e.contains("geocentric"), "{e}");

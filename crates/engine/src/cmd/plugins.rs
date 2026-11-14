@@ -465,21 +465,20 @@ fn crs_name(crs: rustgis_data::raster::Crs) -> String {
 }
 
 /// The map's flat coordinate system, for `"crs": "map"`: Web Mercator for the globe too (as a
-/// pick's map coordinates), the projection's EPSG system, or a custom one. Not for another
-/// body's map.
+/// pick's map coordinates), or the projection's EPSG system. A projection with no EPSG code is
+/// refused before anything is registered: a plugin can set a `local:lon,lat` view per point, and
+/// each would otherwise add a system to the process-wide table. Not for another body's map.
 fn map_crs(m: &rustgis_map::Map) -> Result<rustgis_data::raster::Crs, String> {
-    use rustgis_data::raster::{Crs, crs::CustomCrs};
+    use rustgis_data::raster::Crs;
     if !m.body().is_earth() {
         return Err(format!("the map of {} has no coordinate system a plugin can be given", m.body().name));
     }
     match &m.projection {
         rustgis_map::Projection::Globe | rustgis_map::Projection::WebMercator => Ok(Crs::WebMercator),
         rustgis_map::Projection::Custom(code) => {
-            let (proj4, label) = rustgis_map::projection::lookup(code)?;
-            if let Some(crs) = label.strip_prefix("EPSG:").and_then(|n| n.parse::<u32>().ok()).and_then(Crs::from_epsg) {
-                return Ok(crs);
-            }
-            Crs::custom(CustomCrs { proj4, label, geokeys: Vec::new(), doubles: Vec::new(), ascii: String::new() })
+            let (_, label) = rustgis_map::projection::lookup(code)?;
+            let epsg = label.strip_prefix("EPSG:").and_then(|n| n.parse::<u32>().ok()).and_then(Crs::from_epsg);
+            epsg.ok_or_else(|| format!("{label} has no EPSG code, so GeoJSON can't name it; use an EPSG code"))
         }
     }
 }
