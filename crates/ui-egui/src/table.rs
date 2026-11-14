@@ -809,7 +809,7 @@ fn stats_lines(answer: &Value) -> Vec<(String, String, String)> {
         _ => String::new(),
     };
     let line = |name: &str, shown: String, exact: String| (name.to_string(), shown, exact);
-    let mut out = vec![line(tl!("Count"), count("count"), count("count")), line(tl!("Empty"), count("nulls"), count("nulls"))];
+    let mut out = vec![line(tl!("Count"), count("count"), full("count")), line(tl!("Empty"), count("nulls"), full("nulls"))];
     if number {
         out.push(line(tl!("Sum"), value("sum"), full("sum")));
         out.push(line(tl!("Mean"), value("mean"), full("mean")));
@@ -817,15 +817,13 @@ fn stats_lines(answer: &Value) -> Vec<(String, String, String)> {
         out.push(line(tl!("Maximum"), value("max"), full("max")));
         out.push(line(tl!("Standard deviation"), value("stdDev"), full("stdDev")));
         if answer.get("skipped").and_then(Value::as_u64).unwrap_or(0) > 0 {
-            out.push(line(tl!("Not numbers"), count("skipped"), count("skipped")));
+            out.push(line(tl!("Not numbers"), count("skipped"), full("skipped")));
         }
     } else {
-        let distinct = if answer.get("distinctCapped").and_then(Value::as_bool).unwrap_or(false) {
-            crate::i18n::fmt("more than {n}", &[("n", &count("distinct"))])
-        } else {
-            count("distinct")
-        };
-        out.push(line(tl!("Distinct"), distinct.clone(), distinct));
+        // The copy keeps "more than" for a capped count, with the digits plain.
+        let capped = answer.get("distinctCapped").and_then(Value::as_bool).unwrap_or(false);
+        let more = |v: String| if capped { crate::i18n::fmt("more than {n}", &[("n", &v)]) } else { v };
+        out.push(line(tl!("Distinct"), more(count("distinct")), more(full("distinct"))));
         out.push(line(tl!("Minimum"), value("min"), full("min")));
         out.push(line(tl!("Maximum"), value("max"), full("max")));
     }
@@ -1460,6 +1458,23 @@ mod tests {
         assert_eq!(lines.iter().find(|l| l.0 == "Minimum").map(|l| l.1.as_str()), Some("12345"));
         let exact = json!({"kind": "text", "count": 1, "nulls": 0, "distinct": 5, "min": "a", "max": "b"});
         assert_eq!(stats_lines(&exact).iter().find(|l| l.0 == "Distinct").map(|l| l.1.as_str()), Some("5"));
+    }
+
+    /// The copy holds the counts as plain digits (a comma would read as a decimal in a spreadsheet),
+    /// and a capped distinct count keeps "more than" with the digits plain.
+    #[test]
+    fn copied_counts_are_plain_digits() {
+        let numbers = json!({"kind": "number", "count": 1234, "nulls": 1234, "skipped": 1234, "sum": 1.0, "mean": 1.0,
+            "min": 1.0, "max": 1.0, "stdDev": 0.0});
+        let lines = stats_lines(&numbers);
+        let of = |n: &str| lines.iter().find(|l| l.0 == n).map(|l| (l.1.clone(), l.2.clone()));
+        assert_eq!(of("Count"), Some(("1,234".to_string(), "1234".to_string())));
+        assert_eq!(of("Empty"), Some(("1,234".to_string(), "1234".to_string())));
+        assert_eq!(of("Not numbers"), Some(("1,234".to_string(), "1234".to_string())));
+        let text = json!({"kind": "text", "count": 1, "nulls": 0, "distinct": 100000, "distinctCapped": true, "min": "a", "max": "b"});
+        let lines = stats_lines(&text);
+        let of = |n: &str| lines.iter().find(|l| l.0 == n).map(|l| (l.1.clone(), l.2.clone()));
+        assert_eq!(of("Distinct"), Some(("more than 100,000".to_string(), "more than 100000".to_string())));
     }
 
     /// Statistics left from another project, map or layer instance are not shown.

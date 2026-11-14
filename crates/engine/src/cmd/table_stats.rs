@@ -30,7 +30,8 @@ pub const MAX_DISTINCT: usize = 100_000;
 /// Whole numbers past this (2^53) are not all held by a decimal.
 const EXACT_IN_F64: u64 = 1 << 53;
 
-/// Welford's running mean and sum of squares, so one pass gives the variance.
+/// Welford's running mean and sum of squares (B. P. Welford, "Note on a method for calculating
+/// corrected sums of squares and products", Technometrics 4(3), 1962), so one pass gives the variance.
 #[derive(Default)]
 struct Welford {
     n: usize,
