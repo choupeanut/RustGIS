@@ -12384,6 +12384,23 @@ fn plugin_host_gives_layer_crs_and_features_in_it() {
     assert_eq!(m["crs"]["properties"]["name"], "EPSG:32617");
     let w = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "EPSG:4326"})).unwrap();
     assert!(w.get("crs").is_none(), "{w}");
+    // Null, empty, explicit WGS 84 and a WGS 84 layer retain the default response shape.
+    let plain = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Cities"})).unwrap();
+    for asked in [Value::Null, json!(""), json!("EPSG:4326"), json!("4326"), json!("layer")] {
+        let got = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Cities", "crs": asked})).unwrap();
+        assert_eq!(got, plain, "{asked}");
+        assert!(got.get("crs").is_none());
+    }
+    // Default VN-2000 map presets have named EPSG systems despite their human labels.
+    let (vn, _) = rustgis_data::io::read_geojson(r#"{"type":"Point","coordinates":[105,21]}"#, "VN").unwrap();
+    s.map_mut().add_dataset(vn);
+    for (preset, epsg) in [("vn2000Utm48", 3405), ("vn2000Utm49", 3406), ("vn2000tm3", 5897)] {
+        s.run("map.projection", &json!({"type": preset})).unwrap();
+        let got = forward(&mut s, "eng-crs", "host.features", json!({"layer": "VN", "crs": "map"})).unwrap();
+        assert_eq!(got["crs"]["properties"]["name"], format!("EPSG:{epsg}"));
+        let direct = forward(&mut s, "eng-crs", "host.features", json!({"layer": "VN", "crs": format!("EPSG:{epsg}")})).unwrap();
+        assert_eq!(got, direct);
+    }
     // A bare code reads as EPSG; refused: unknown, unparseable, not text. All say `crs:`.
     let bare = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "32637"})).unwrap();
     assert_eq!(bare["crs"]["properties"]["name"], "EPSG:32637");
@@ -12470,6 +12487,14 @@ fn plugin_host_features_refuses_what_it_can_not_place_with_crs_errors() {
     s.map_mut().add_dataset(mars);
     let e = ask(&mut s, "Mars", "EPSG:32637").unwrap_err();
     assert!(e.contains("crs:") && e.contains("another body"), "{e}");
+    // Legacy/default degrees are the source body's, also for explicit WGS 84 requests.
+    let plain = forward(&mut s, "eng-crs-no", "host.features", json!({"layer": "Mars"})).unwrap();
+    assert_eq!(plain["features"][0]["geometry"]["coordinates"], json!([10.0, 10.0]));
+    for asked in [Value::Null, json!(""), json!("EPSG:4326"), json!("4326")] {
+        let got = forward(&mut s, "eng-crs-no", "host.features", json!({"layer": "Mars", "crs": asked})).unwrap();
+        assert_eq!(got, plain);
+        assert!(got.get("crs").is_none());
+    }
     // The map of another body has none either.
     s.run("map.body", &json!({"name": "Mars", "basemap": false})).unwrap();
     let e = ask(&mut s, "P", "map").unwrap_err();

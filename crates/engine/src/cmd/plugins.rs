@@ -477,7 +477,11 @@ fn map_crs(m: &rustgis_map::Map) -> Result<rustgis_data::raster::Crs, String> {
         rustgis_map::Projection::Globe | rustgis_map::Projection::WebMercator => Ok(Crs::WebMercator),
         rustgis_map::Projection::Custom(code) => {
             let (_, label) = rustgis_map::projection::lookup(code)?;
-            let epsg = label.strip_prefix("EPSG:").and_then(|n| n.parse::<u32>().ok()).and_then(Crs::from_epsg);
+            let epsg = label
+                .strip_prefix("EPSG:")
+                .and_then(|n| n.parse::<u32>().ok())
+                .or_else(|| rustgis_data::raster::crs::vn2000_epsg(&label).map(u32::from))
+                .and_then(Crs::from_epsg);
             epsg.ok_or_else(|| format!("{label} has no EPSG code, so GeoJSON can't name it; use an EPSG code"))
         }
     }
