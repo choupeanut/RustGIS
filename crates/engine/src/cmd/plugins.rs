@@ -558,11 +558,13 @@ impl Bridge<'_> {
     /// system) when given, with a GeoJSON `crs` member naming it, as `host.addLayer` reads.
     /// Features that can't be placed in it are refused, not dropped.
     ///
-    /// Runs on the calling thread, like every host request: a plugin command is on the window's
-    /// thread on the desktop, bounded by the plugin's run-time cap, and a request answers in one
-    /// piece (there is nothing to hand a background run's result back to). The work is one cheap
-    /// transform per vertex, and the loop looks at a run's Cancel ([`rustgis_data::progress`])
-    /// every [`CANCEL_EVERY`] features for the runs that have one.
+    /// Runs on the calling thread, like every host request: a request answers in one piece
+    /// (there is nothing to hand a background run's result back to). On the desktop a plugin
+    /// command runs on the window's thread with no progress probe or Cancel, and a host request
+    /// already running runs to its end: the plugin's run-time cap does not bound this work.
+    /// Large layers can therefore hold the window; there is no feature or vertex size cap.
+    /// The loop checks a run's Cancel ([`rustgis_data::progress`]) every [`CANCEL_EVERY`] features
+    /// only when the caller carries a progress probe; on the window thread that check is a no-op.
     fn features(&self, p: &Value) -> CmdResult {
         let id = self.s.layer_id(p)?;
         let l = self.s.map().layer(id).ok_or("no such layer")?;
