@@ -54,12 +54,12 @@ pub fn commands() -> Vec<C> {
         C::new("script.run", "Run Script", "Analyze › Geoprocessing", run_script).roles(&[crate::ParamRole { key: "script", role: crate::Role::Script }]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Automation))
             .params(r#"{"script": "one command per line: id {json}; # comments"}"#),
         C::new("raster.function", "Raster Functions", "Analyze › Raster", raster_function).inputs(function_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample", "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]], "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
+            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample" (slope returns degrees, not percent), "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]] (lo inclusive, hi exclusive; [21, 22, 1] maps integer class 21 to 1), "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
         C::new("raster.functionChain", "Function Editor", "Analyze › Raster", function_chain).inputs(chain_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"layer": raster, "steps": [{"function", …}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
+            .params(r#"{"layer": raster, "steps": [{"function", … (as raster.function; slope returns degrees, not percent)}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
         C::new("analysis.suitability", "Suitability Modeler", "Analyze › Workflows", suitability).inputs(suitability_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"criteria": [{"layer": raster, "band"?: 1-based, "ranges": [[lo, hi, score]], "weight": number}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
+            r#"{"criteria": [{"layer": raster, "band"?: 1-based, "ranges": [[lo, hi, score]] (lo inclusive, hi exclusive; [21, 22, 1] scores integer class 21 as 1), "weight": number}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
         C::new("analysis.viewshed", "Visibility Analysis", "Analyze › Workflows", viewshed).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"layer": elevation raster, "lon", "lat", "band"?: 1-based, "height"?: observer metres, 0 to 10,000 (default 1.7), "radius"?: metres (default: the whole raster), "heights"?: "nearest" (default) | "bilinear" (the ground along each ray), "name"?: output, "ran"?: (internal: a viewshed the app has worked out)}"#),
@@ -180,6 +180,34 @@ pub(crate) fn add_made(s: &mut Session, m: Made) -> CmdResult {
         then(s, &mut v);
     }
     Ok(v)
+}
+
+/// What the remaps of a raster function, a chain or a suitability met: their ranges that match
+/// nothing, with the raster each was given for, and the first raster a remap left without a
+/// cell with a value.
+#[derive(Default)]
+struct Remaps {
+    empty: Vec<(String, f64, f64)>,
+    emptied: Option<String>,
+}
+
+impl Remaps {
+    /// Their notices, one of each kind, said when the result is added (after a background run
+    /// too).
+    fn then(self) -> Then {
+        let mut notes: Vec<String> = rasterops::empty_ranges_note(&self.empty).into_iter().collect();
+        notes.extend(self.emptied.map(|name| format!("{name}: the remap left no cells with values")));
+        notices(notes)
+    }
+}
+
+/// Says `notes` when the result is added.
+fn notices(notes: Vec<String>) -> Then {
+    Box::new(move |s, _| {
+        for note in notes {
+            s.notify(note, false);
+        }
+    })
 }
 
 /// What a command that makes its raster on another thread reads of the session, and the work
@@ -496,7 +524,11 @@ pub fn gallery_list(kind: &str) -> CmdResult {
         .collect();
     if kind == "raster" {
         for (id, name, summary) in [
-            ("raster.function", "Raster Functions", "Slope, aspect, hillshade, NDVI, band math, remap, threshold and resampling."),
+            (
+                "raster.function",
+                "Raster Functions",
+                "Slope (degrees), aspect, hillshade, NDVI, band math, remap, threshold and resampling.",
+            ),
             ("analysis.suitability", "Suitability Modeler", "Weighted overlay of scored rasters."),
             ("analysis.viewshed", "Viewshed", "The cells visible from an observer on a DEM."),
             ("analysis.interpolate", "Interpolate (IDW)", "A raster surface from point values."),
@@ -1125,8 +1157,9 @@ pub fn script_commands(script: &str) -> Result<Vec<(usize, String, Value)>, Stri
 }
 
 /// One raster function's output pixels on `r`'s grid, or a resample's on `target`'s (from
-/// [`resample_target`]).
-fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>) -> Result<Vec<f32>, String> {
+/// [`resample_target`]). A remap adds its ranges that match nothing to `remaps`, and whether it
+/// left any cell with a value.
+fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>, remaps: &mut Remaps) -> Result<Vec<f32>, String> {
     let band = band_of(p, r)?;
     let zf = f(p, "zFactor").unwrap_or(1.0).clamp(0.0001, 100_000.0);
     match ps(p, "function").ok_or("function is required")? {
@@ -1159,7 +1192,12 @@ fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>) -> Result<Vec<
                     })
                     .collect::<Result<_, _>>()?
             };
-            rasterops::remap(r, band, &ranges, b(p, "keep").unwrap_or(false))
+            let remap = rasterops::remap(r, band, &ranges, b(p, "keep").unwrap_or(false))?;
+            remaps.empty.extend(remap.empty.into_iter().map(|(lo, hi)| (r.name.clone(), lo, hi)));
+            if !rasterops::has_values(&remap.cells, r.width as usize)? {
+                remaps.emptied.get_or_insert_with(|| r.name.clone());
+            }
+            Ok(remap.cells)
         }
         "resample" => rasterops::resample_to(r, band, target.ok_or("target (a raster to match) is required")?),
         other => Err(format!("unknown raster function '{other}'")),
@@ -1195,13 +1233,27 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
         super::settle_bool(&mut p, "keep");
     }
     Ok(Box::new(move || {
-        let pixels = apply_function(&src, &p, target.as_deref())?;
-        if is_hillshade(&p) {
-            return made_hillshade(rasterops::derive_hillshade(&src, &name, pixels)?, &defaults);
-        }
+        let mut remaps = Remaps::default();
+        let pixels = apply_function(&src, &p, target.as_deref(), &mut remaps)?;
         // Only a resample takes another raster's grid.
-        made(rasterops::derive(target.as_deref().unwrap_or(&src), &name, vec![pixels])?, None)
+        let raster = derive_function(target.as_deref().unwrap_or(&src), &name, &p, pixels)?;
+        if is_hillshade(&p) { made_hillshade(raster, &defaults) } else { made_then(raster, None, Some(remaps.then())) }
     }))
+}
+
+/// Wraps a function's pixels on its output grid, keeping a slope's unit in its band description
+/// and a hillshade's byte storage. A later function starts with its own description.
+fn derive_function(r: &Raster, name: &str, p: &Value, pixels: Vec<f32>) -> Result<Raster, String> {
+    if is_hillshade(p) {
+        return rasterops::derive_hillshade(r, name, pixels);
+    }
+    let mut out = rasterops::derive(r, name, vec![pixels])?;
+    if ps(p, "function") == Some("slope")
+        && let Some(band) = out.bands.first_mut()
+    {
+        band.name = "Slope (degrees)".into();
+    }
+    Ok(out)
 }
 
 /// Whether raster function step `p` is a hillshade, whose pixels are bytes
@@ -1250,23 +1302,22 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
     Ok(Box::new(move || {
         let mut cur: Raster = (*src).clone();
         let mut names = Vec::new();
+        let mut remaps = Remaps::default();
         for (i, (st, target)) in steps.iter().zip(&targets).enumerate() {
             let f = func(st);
-            let pixels = apply_function(&cur, st, target.as_deref()).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
+            let pixels = apply_function(&cur, st, target.as_deref(), &mut remaps).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
             // Only a resample takes another raster's grid; otherwise the grid is the current one.
-            cur = if is_hillshade(st) {
-                rasterops::derive_hillshade(&cur, &cur.name, pixels)?
-            } else {
-                rasterops::derive(target.as_deref().unwrap_or(&cur), &cur.name, vec![pixels])?
-            };
+            cur = derive_function(target.as_deref().unwrap_or(&cur), &cur.name, st, pixels)?;
             names.push(f);
         }
         cur.name = named.unwrap_or_else(|| format!("{}_{}", cur.name, names.join("_")));
         // A chain that ends in a hillshade is drawn as one.
-        match steps.last() {
-            Some(last) if is_hillshade(last) => made_hillshade(cur, &defaults),
-            _ => made(cur, None),
-        }
+        let mut m = match steps.last() {
+            Some(last) if is_hillshade(last) => made_hillshade(cur, &defaults)?,
+            _ => made(cur, None)?,
+        };
+        m.then = Some(remaps.then());
+        Ok(m)
     }))
 }
 
@@ -1304,13 +1355,21 @@ fn suitability_work(s: &Session, p: &Value) -> Result<Work, String> {
     let name = out_name(p, "Suitability".into());
     Ok(Box::new(move || {
         let mut scored = Vec::new();
+        let mut empty = Vec::new();
         for (r, band, ranges, weight) in &criteria {
             let on_grid = rasterops::resample_to(r, *band, &first)?;
-            let grid = rasterops::derive(&first, "c", vec![on_grid])?;
-            scored.push((rasterops::remap(&grid, 0, ranges, false)?, *weight));
+            let remap = rasterops::remap(&rasterops::derive(&first, &r.name, vec![on_grid])?, 0, ranges, false)?;
+            empty.extend(remap.empty.into_iter().map(|(lo, hi)| (r.name.clone(), lo, hi)));
+            scored.push((remap.cells, *weight));
         }
         let out = rasterops::weighted_overlay(&scored)?;
-        made(rasterops::derive(&first, &name, vec![out])?, None)
+        // A cell is scored only where every criterion scores it.
+        let none = !rasterops::has_values(&out, first.width as usize)?;
+        let mut notes: Vec<String> = rasterops::empty_ranges_note(&empty).into_iter().collect();
+        if none {
+            notes.push(format!("{name}: no cell is scored by every criterion, so the result has no cells with values"));
+        }
+        made_then(rasterops::derive(&first, &name, vec![out])?, None, Some(notices(notes)))
     }))
 }
 

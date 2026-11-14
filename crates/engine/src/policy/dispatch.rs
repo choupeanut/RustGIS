@@ -213,7 +213,7 @@ impl Session {
                         if result.is_ok()
                             && let Some(source) = crate::sources::added_by(command, &params)
                         {
-                            s.sources.note(source);
+                            s.note_source(source);
                         }
                         result
                     })?

@@ -1774,7 +1774,7 @@ fn analysis_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 app,
                 "relief",
                 "Raster Functions",
-                "Slope, aspect, hillshade, NDVI, band math, thresholds.",
+                "Slope (degrees), aspect, hillshade, NDVI, band math, thresholds.",
                 "ui.pane.workflows",
                 json!({"section": "rasterFunctions"}),
                 false,
@@ -2127,6 +2127,18 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 "map.displayType",
                 json!({"mode": if v.fast { "quality" } else { "speed" }}),
                 v.fast,
+            );
+            // Drawn and written by the desktop app only: the browser's `ui.dialog` refuses it.
+            #[cfg(not(target_arch = "wasm32"))]
+            small(
+                ui,
+                app,
+                "maneuver_roundabout",
+                "Export Orbit…",
+                "Write a turn of the view about its centre as an animated GIF or PNG frames.",
+                "ui.dialog",
+                json!({"name": "exportOrbit"}),
+                false,
             );
         });
     });
@@ -4265,7 +4277,7 @@ fn imagery_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 app,
                 "relief",
                 "Raster Functions",
-                "Slope, hillshade, NDVI and more.",
+                "Slope (degrees), hillshade, NDVI and more.",
                 "ui.pane.workflows",
                 wf("rasterFunctions"),
                 false,
