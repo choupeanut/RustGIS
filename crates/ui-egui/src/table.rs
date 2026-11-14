@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use egui::{Sense, Stroke, Ui, vec2};
 use egui_extras::{Column, TableBuilder};
-use rustgis_engine::data::{Dataset, Field, Value as V};
+use rustgis_engine::data::{Dataset, Feature, Field, Value as V};
 use serde_json::{Value, json};
 
 use crate::theme::{Tokens, semibold};
@@ -42,17 +42,22 @@ struct ColumnStats {
     /// before the window shows.
     opened: u64,
     map: u64,
+    /// The rows it counted, by their allocation ([`rustgis_engine::data::Features::allocation_key`]):
+    /// an edit to a value, or a row added or deleted, stops it matching, so the window goes rather
+    /// than show a sum the layer no longer has.
+    rows: std::sync::Weak<Vec<Feature>>,
     answer: Value,
 }
 
 impl ColumnStats {
-    /// Whether it is still of the table showing: the same project, map and layer instance.
+    /// Whether it is still of the table showing: the same project, map and layer instance, and the
+    /// rows it counted.
     fn of(&self, app: &RustGisApp, layer: Option<u32>) -> bool {
         let live = layer.and_then(|id| app.session.map().layer(id));
         Some(self.layer) == layer
             && self.opened == app.session.opened
             && self.map == app.session.map().instance_id()
-            && live.is_some_and(|l| l.instance_id() == self.instance)
+            && live.is_some_and(|l| l.instance_id() == self.instance && l.dataset.features.allocation_key().ptr_eq(&self.rows))
     }
 }
 
@@ -70,8 +75,10 @@ pub(crate) fn statistics_landed(app: &mut RustGisApp, landed: crate::Landed) {
     // Said already if it failed or never ran.
     let crate::Landed::Ran(Ok(answer)) = landed else { return };
     let Some(layer) = answer.get("layerId").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) else { return };
-    let Some(instance) = app.session.map().layer(layer).map(|l| l.instance_id()) else { return };
-    app.table.stats = Some(ColumnStats { layer, instance, opened: app.session.opened, map: app.session.map().instance_id(), answer });
+    let Some((instance, rows)) = app.session.map().layer(layer).map(|l| (l.instance_id(), l.dataset.features.allocation_key())) else {
+        return;
+    };
+    app.table.stats = Some(ColumnStats { layer, instance, opened: app.session.opened, map: app.session.map().instance_id(), rows, answer });
 }
 
 /// Asks `table.statistics` for a column and keeps what it gives the window. On the desktop the
@@ -1468,8 +1475,14 @@ mod tests {
         assert!(st.of(&app, Some(id)), "the table it was run on");
         assert!(!st.of(&app, Some(id + 1000)), "another layer");
         assert!(!st.of(&app, None), "no table");
-        let mut other_project =
-            ColumnStats { layer: st.layer, instance: st.instance, opened: st.opened + 1, map: st.map, answer: Value::Null };
+        let mut other_project = ColumnStats {
+            layer: st.layer,
+            instance: st.instance,
+            opened: st.opened + 1,
+            map: st.map,
+            rows: st.rows.clone(),
+            answer: Value::Null,
+        };
         assert!(!other_project.of(&app, Some(id)), "another project");
         other_project.opened = st.opened;
         other_project.map += 1;
@@ -1497,5 +1510,28 @@ mod tests {
         assert_eq!((second["sum"].clone(), second["index"].clone()), (json!(100.0), json!(1)));
         let by_name = app.run("table.statistics", json!({"layer": id, "field": "v"})).unwrap();
         assert_eq!(by_name["sum"], 1.0, "by name alone, the first");
+    }
+
+    /// Statistics kept for a layer stop showing once a value is edited or a row is added: the
+    /// window would otherwise keep a sum the layer no longer has.
+    #[test]
+    fn statistics_stop_showing_once_the_layers_rows_change() {
+        use rustgis_engine::data::{FieldType, GeometryType};
+        let mut app = RustGisApp::with_sample();
+        let mut ds = Dataset::new("counted", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+        ds.push(None, vec![V::Int(1)]);
+        ds.push(None, vec![V::Int(2)]);
+        let id = rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+        let answer = app.run("table.statistics", json!({"layer": id, "field": "n"})).unwrap();
+        statistics_landed(&mut app, crate::Landed::Ran(Ok(answer)));
+        assert!(app.table.stats.as_ref().is_some_and(|s| s.of(&app, Some(id))), "kept while the rows are as counted");
+        app.session.run("edit.setValue", &json!({"layer": id, "row": 0, "field": "n", "value": 7})).unwrap();
+        assert!(app.table.stats.as_ref().is_some_and(|s| !s.of(&app, Some(id))), "an edited value changes the rows counted");
+        let answer = app.run("table.statistics", json!({"layer": id, "field": "n"})).unwrap();
+        statistics_landed(&mut app, crate::Landed::Ran(Ok(answer)));
+        assert_eq!(app.table.stats.as_ref().map(|s| s.answer["sum"].clone()), Some(json!(9.0)), "counted again after the edit");
+        let added = json!({"layer": id, "geometry": {"type": "Point", "coordinates": [1.0, 2.0]}, "attributes": {"n": 5}});
+        app.session.run("edit.addFeature", &added).unwrap();
+        assert!(app.table.stats.as_ref().is_some_and(|s| !s.of(&app, Some(id))), "an added row changes the rows counted");
     }
 }
