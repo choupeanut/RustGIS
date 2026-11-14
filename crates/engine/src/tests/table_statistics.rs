@@ -163,6 +163,7 @@ fn a_sum_too_large_for_a_decimal_is_left_out_with_a_notice_and_the_mean_stays_ri
     let mark = s.notice_mark();
     let v = stats(&mut s, json!({"layer": "w", "field": "x"}));
     assert_eq!(v["sum"], 0.0);
+    assert_eq!(v["mean"], 0.0, "the running mean of opposite extremes is zero, not overflowed: {v}");
     assert!(s.notices_since(mark).iter().any(|n| n.text.contains("standard deviation")), "{v}");
 }
 

@@ -72,6 +72,20 @@ pub(crate) fn statistics_landed(app: &mut RustGisApp, landed: crate::Landed) {
     app.table.stats = Some(ColumnStats { layer, instance, opened: app.session.opened, map: app.session.map().instance_id(), answer });
 }
 
+/// Asks `table.statistics` for a column and keeps what it gives the window. On the desktop the
+/// count runs on a thread of its own and lands through [`statistics_landed`] (its start answers
+/// `started`, which has no layer and is ignored); the browser, or a run not off the frame, gets the
+/// answer back at once, so it is kept here too.
+fn ask_statistics(app: &mut RustGisApp, asked: Value) {
+    // Refused (a layer read in place, not all loaded): said, unless the command said so.
+    let mark = app.session.notice_mark();
+    match app.run("table.statistics", asked) {
+        Ok(answer) => statistics_landed(app, crate::Landed::Ran(Ok(answer))),
+        Err(e) if app.session.notices_since(mark).is_empty() => app.session.notify(e, true),
+        Err(_) => {}
+    }
+}
+
 /// A table's identity for its view: a live layer, by its instance (so a layer that takes a removed
 /// one's id, after an undo or in another project, starts afresh), or a standalone table's id.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -539,16 +553,9 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 && let Some(fd) = ds.fields.get(i)
                 && let Some(layer) = layer_id
             {
-                // Refused (a layer read in place, not all loaded): said, unless the command said so.
-                let mark = app.session.notice_mark();
-                // By the column's place, so a second column of the same name is its own. The count
-                // runs on a thread of its own; `statistics_landed` keeps the answer for the window.
+                // By the column's place, so a second column of the same name is its own.
                 let asked = json!({"layer": layer, "field": fd.name, "index": i, "selected": app.table.selected_only});
-                if let Err(e) = app.run("table.statistics", asked)
-                    && app.session.notices_since(mark).is_empty()
-                {
-                    app.session.notify(e, true);
-                }
+                ask_statistics(app, asked);
             }
             if let Some((i, ty)) = convert
                 && let Some(fd) = ds.fields.get(i)
@@ -1127,6 +1134,19 @@ mod tests {
         let text = json!({"kind": "text", "count": 3, "nulls": 0, "distinct": 2, "min": "a", "max": "b"});
         let names: Vec<String> = stats_lines(&text).into_iter().map(|l| l.0).collect();
         assert_eq!(names, ["Count", "Empty", "Distinct", "Minimum", "Maximum"]);
+    }
+
+    /// A count made here, not off the frame, is kept for the window too: the answer is not dropped.
+    #[test]
+    fn statistics_counted_at_once_are_kept_for_the_window() {
+        let mut app = RustGisApp::with_sample();
+        let id = app.session.map().layers.first().map(|l| l.id).unwrap();
+        let ds = &app.session.map().layer(id).unwrap().dataset;
+        let num = ds.fields.iter().find(|f| f.ty.is_numeric()).map(|f| f.name.clone()).expect("a number field");
+        assert!(app.table_stats_kept().is_none());
+        ask_statistics(&mut app, json!({"layer": id, "field": num}));
+        let kept = app.table_stats_kept().expect("kept at once");
+        assert_eq!(kept["field"], num);
     }
 
     /// Statistics… on a column answers in a window that names the rows it covers and shows the sum.

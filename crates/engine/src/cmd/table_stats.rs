@@ -41,8 +41,11 @@ struct Welford {
 impl Welford {
     fn add(&mut self, x: f64) {
         self.n += 1;
+        let n = self.n as f64;
         let d = x - self.mean;
-        self.mean += d / self.n as f64;
+        // `x - mean` overflows for values of opposite sign near the largest float: then each part is
+        // divided first, which can't.
+        self.mean += if d.is_finite() { d / n } else { x / n - self.mean / n };
         self.m2 += d * (x - self.mean);
     }
     fn std_dev(&self) -> f64 {
