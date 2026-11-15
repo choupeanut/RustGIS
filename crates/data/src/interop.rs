@@ -62,10 +62,19 @@ pub fn to_kml(ds: &Dataset, name_field: Option<usize>) -> crate::Result<String> 
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document><name>{}</name>\n",
         xml(&ds.name)
     );
+    // KML's description is text. Other types and differently-cased columns stay in
+    // ExtendedData, where the reader preserves their values and reports name collisions.
+    let description = ds.fields.iter().position(|f| f.name == "description" && f.ty == crate::FieldType::Text);
     for (r, f) in ds.features.iter().enumerate() {
         crate::progress::step(1)?;
         let Some(g) = &f.geometry else { continue };
         let name = name_field.map(|fi| ds.value(r, fi).to_file_text()).unwrap_or_else(|| f.id.to_string());
+        let description = description
+            .and_then(|fi| match ds.value(r, fi) {
+                crate::Value::Text(text) => Some(format!("<description>{}</description>", xml(text))),
+                _ => None,
+            })
+            .unwrap_or_default();
         let data: String = ds
             .fields
             .iter()
@@ -74,7 +83,7 @@ pub fn to_kml(ds: &Dataset, name_field: Option<usize>) -> crate::Result<String> 
             .map(|(fd, v)| format!("<Data name=\"{}\"><value>{}</value></Data>", xml(&fd.name), xml(&v.to_file_text())))
             .collect();
         out.push_str(&format!(
-            "<Placemark><name>{}</name><ExtendedData>{data}</ExtendedData>{}</Placemark>\n",
+            "<Placemark><name>{}</name>{description}<ExtendedData>{data}</ExtendedData>{}</Placemark>\n",
             xml(&name),
             kml_geometry(g)
         ));

@@ -752,6 +752,68 @@ mod tests {
     }
 
     #[test]
+    fn exported_text_descriptions_keep_their_column_on_repeated_kml_and_kmz_round_trips() {
+        let descriptions = [Some("<b>Café & \"river\"</b>\nSecond line"), Some("]]> <plain> & text"), None];
+        for ext in ["kml", "kmz"] {
+            let mut ds = Dataset::new(
+                "places",
+                GeometryType::Point,
+                vec![Field::new("name", FieldType::Text), Field::new("description", FieldType::Text)],
+            );
+            for (row, description) in descriptions.iter().enumerate() {
+                ds.push(
+                    Some(Geometry::Point(Coord::new(row as f64, 2.0))),
+                    vec![Value::Text(format!("Place {row}")), description.map(|v| Value::Text(v.into())).unwrap_or_default()],
+                );
+            }
+            for _ in 0..3 {
+                let xml = crate::interop::to_kml(&ds, Some(0)).unwrap();
+                let doc = roxmltree::Document::parse(&xml).unwrap();
+                let placemarks: Vec<_> =
+                    doc.descendants().filter(|n| n.has_tag_name(("http://www.opengis.net/kml/2.2", "Placemark"))).collect();
+                for (pm, expected) in placemarks.iter().zip(descriptions) {
+                    assert_eq!(child_text(pm, "description").as_deref(), expected);
+                }
+                let (bytes, skipped) = crate::io::write_bytes(&ds, ext).unwrap();
+                assert_eq!(skipped, 0);
+                let layers = read(&format!("places.{ext}"), &bytes).unwrap();
+                assert_eq!(layers.len(), 1);
+                let layer = &layers[0];
+                assert!(layer.report.messages.is_empty(), "{ext}: {:?}", layer.report.messages);
+                let back = &layer.dataset;
+                assert!(back.field_index("description_1").is_none());
+                let fi = back.field_index("description").unwrap();
+                for (row, expected) in descriptions.iter().enumerate() {
+                    let expected = expected.map(|v| Value::Text(v.into())).unwrap_or_default();
+                    assert_eq!(back.value(row, fi), &expected, "{ext}, row {row}");
+                }
+                ds = back.clone();
+            }
+        }
+    }
+
+    #[test]
+    fn exported_other_reserved_columns_still_report_their_collisions() {
+        for (name, ty, value) in [
+            ("description", FieldType::Double, Value::Float(2.5)),
+            ("Description", FieldType::Text, Value::Text("Keep case".into())),
+            ("folder", FieldType::Text, Value::Text("My folder".into())),
+            ("style", FieldType::Text, Value::Text("My style".into())),
+        ] {
+            let mut ds = Dataset::new("places", GeometryType::Point, vec![Field::new(name, ty)]);
+            ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![value.clone()]);
+            let xml = crate::interop::to_kml(&ds, None).unwrap();
+            assert!(!xml.contains("<description>"), "{xml}");
+            let layers = read("places.kml", xml.as_bytes()).unwrap();
+            let layer = &layers[0];
+            let fi = layer.dataset.field_index(&format!("{name}_1")).unwrap();
+            assert_eq!(layer.dataset.value(0, fi), &value);
+            assert_eq!(layer.report.messages.len(), 1, "{:?}", layer.report.messages);
+            assert!(layer.report.messages[0].contains("renamed"), "{:?}", layer.report.messages);
+        }
+    }
+
+    #[test]
     fn extended_data_named_like_a_fixed_column_is_kept_under_a_free_name() {
         // `name` becomes the placemark's name and, like every field, extended data too; `NAME`
         // clashes with the name column ignoring case but holds something else.
