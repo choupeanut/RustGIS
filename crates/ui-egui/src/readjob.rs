@@ -80,14 +80,19 @@ pub fn run(app: &mut RustGisApp, command: &'static str, p: Value) -> Result<Valu
 /// [`run`], then `then` with what the command answered once it ran, here or as it lands, or why
 /// it never ran.
 pub fn run_then(app: &mut RustGisApp, command: &'static str, p: Value, then: Option<Then>) -> Result<Value, String> {
-    run_presented(app, command, p, then, None)
+    run_presented(app, command, p, then, None, None)
 }
 
 /// Keeps a service layer's title and connection display name outside recorded parameters
 /// until its admitted discovery lands. The ordinary read queue owns progress and Cancel.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn run_service(app: &mut RustGisApp, p: Value, name: &str, origin: Option<&str>) -> Result<Value, String> {
-    run_presented(app, "service.add", p, None, Some((name.to_string(), origin.map(str::to_string))))
+    run_presented(app, "service.add", p, None, Some((name.to_string(), origin.map(str::to_string))), None)
+}
+
+/// Converts only the rows whose date interpretation the user previewed.
+pub(crate) fn run_date_preview(app: &mut RustGisApp, p: Value, dataset: rustgis_engine::data::Dataset) -> Result<Value, String> {
+    run_presented(app, "edit.convertField", p, None, None, Some(dataset))
 }
 
 /// Queues the admitted read with optional presentation supplied by the service dialog/tree.
@@ -97,6 +102,7 @@ fn run_presented(
     mut p: Value,
     then: Option<Then>,
     presentation: Option<(String, Option<String>)>,
+    preview: Option<rustgis_engine::data::Dataset>,
 ) -> Result<Value, String> {
     if !app.reads_off_frame {
         // Read here and now: what its file holds now is what it reads.
@@ -106,9 +112,12 @@ fn run_presented(
         let r = app.run(command, p);
         return answered(app, then, r);
     }
-    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "layer.repairSource" | "labels.convert" | "source.syncState" | "table.statistics")
-        .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
-        .flatten();
+    let layer = matches!(
+        command,
+        "layer.loadAll" | "layer.reloadData" | "layer.repairSource" | "labels.convert" | "source.syncState" | "table.statistics"
+    )
+    .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
+    .flatten();
     let notice_mark = app.session.notice_mark();
     if layer.is_some() {
         let id = app.session.layer_id(&p)?;
@@ -123,7 +132,7 @@ fn run_presented(
         };
         params.insert("layer".into(), json!(id));
     }
-    let ahead = match reads::read_ahead(&mut app.session, command, &p) {
+    let mut ahead = match reads::read_ahead(&mut app.session, command, &p) {
         Ok(ahead) => ahead,
         Err(error) => {
             app.command_failed(command, &error, notice_mark);
@@ -131,6 +140,9 @@ fn run_presented(
             return Err(error);
         }
     };
+    if let Some(dataset) = preview {
+        ahead.keep_preview(dataset);
+    }
     // Load All asked again for a layer it is reading already.
     if command == "layer.loadAll"
         && let Some((instance, _)) = &layer
@@ -197,15 +209,19 @@ fn run_presented(
     }
 }
 
-/// Queues an archive read already admitted by the relay, without dispatching another command.
+/// Queues an archive or statistics read already admitted by the relay, without dispatching another command.
 pub fn admitted(app: &mut RustGisApp, ahead: reads::ReadAhead, relay: rustgis_assistant::relay::Relay) {
     let Some((command, params)) = ahead.command() else {
         finish_relay(app, &relay, Err(tl!("This read was already started").to_string()));
         return;
     };
     let params = params.clone();
-    let archive = reads::archive_target(&app.session, &params);
-    let what = archive.as_ref().map(|(_, tile)| tile.name.clone()).unwrap_or_default();
+    let archive = matches!(command, "map.reloadTiles" | "map.repairTiles").then(|| reads::archive_target(&app.session, &params)).flatten();
+    let layer = (command == "table.statistics")
+        .then(|| app.session.layer_id(&params).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
+        .flatten();
+    let what =
+        layer.as_ref().map(|(_, name)| name.clone()).or_else(|| archive.as_ref().map(|(_, tile)| tile.name.clone())).unwrap_or_default();
     let asked = Asked {
         command,
         params,
@@ -213,7 +229,7 @@ pub fn admitted(app: &mut RustGisApp, ahead: reads::ReadAhead, relay: rustgis_as
         what,
         opened: app.session.opened,
         map: app.session.map().instance_id(),
-        layer: None,
+        layer: layer.map(|(instance, _)| instance),
         archive,
         reload: None,
         origin: None,
@@ -1553,6 +1569,37 @@ mod tests {
         assert!(said.iter().any(|t| t == "places is in step with places.geojson"), "{said:?}");
     }
 
+    #[test]
+    fn relay_statistics_use_a_field_index_not_an_archive_index_while_queued() {
+        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+        use std::io::{BufRead, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let tiles = dir.path().join("context.pmtiles");
+        archive(&tiles, "Context");
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("map.addTiles", json!({"url":tiles,"name":"Context","overlay":true})).unwrap();
+        let mut ds = Dataset::new("numbers", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+        for n in [1, 2, 3] {
+            ds.push(None, vec![V::Int(n)]);
+        }
+        let layer = rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+        app.reads_off_frame = true;
+        app.run("table.statistics", json!({"layer":layer,"index":0})).unwrap();
+        let (relay, _grant, client, ahead) = paused_relay(&mut app, relay_command(1, "table.statistics", json!({"layer":layer,"index":0})));
+        admitted(&mut app, ahead, relay.clone());
+        assert_eq!(app.reads.waiting.len(), 1);
+        // The column index happens to match this unrelated tile archive's index. Removing the
+        // archive while the count waits must not invalidate the column statistics request.
+        app.session.map_mut().tiles.clear();
+        landed(&mut app, 60);
+        let mut text = String::new();
+        BufReader::new(client).read_line(&mut text).unwrap();
+        let answer: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(answer["result"]["isError"], false, "{answer}");
+        assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("\"sum\":6"), "{answer}");
+        relay.stop();
+    }
+
     /// Statistics… counts the column on a thread of its own and keeps the answer for its window
     /// once it lands; a layer changed meanwhile is left, and nothing is kept.
     #[test]
@@ -2010,5 +2057,56 @@ mod tests {
             layer.dataset.features[0].geometry,
             Some(rustgis_engine::data::Geometry::Point(rustgis_engine::data::Coord::new(9.0, 47.0)))
         );
+    }
+    /// Direct layer conversions use the desktop worker too, and stale rows cannot be replaced.
+    #[test]
+    fn date_conversion_runs_off_frame_for_layers() {
+        let mut app = RustGisApp::with_sample();
+        app.run("edit.addField", json!({"layer":"Cities", "name":"opened", "type":"text"})).unwrap();
+        app.run("edit.setValue", json!({"layer":"Cities", "row":0, "field":"opened", "value":"03/05/2026"})).unwrap();
+        app.reads_off_frame = true;
+        let p = json!({"field":"opened", "type":"date", "format":"%d/%m/%Y"});
+        app.session.active_layer = app.session.map().layer_by_name("Cities").map(|l| l.id);
+        let depth = app.session.undo_depth();
+        assert_eq!(app.run_by_user("edit.convertField", p.clone()).unwrap()["started"], "Convert Field");
+        assert_eq!(app.session.undo_depth(), depth);
+        app.session.active_layer = app.session.map().layers.iter().find(|l| l.name != "Cities").map(|l| l.id);
+        landed(&mut app, 60);
+        let ds = &app.session.map().layer_by_name("Cities").unwrap().dataset;
+        assert_eq!(ds.value(0, ds.field_index("opened").unwrap()).to_string(), "2026-05-03");
+        assert_eq!(app.session.undo_depth(), depth + 1);
+        app.run("edit.undo", json!({})).unwrap();
+        app.session.active_layer = app.session.map().layer_by_name("Cities").map(|l| l.id);
+        app.run_by_user("edit.convertField", p).unwrap();
+        app.session.run("edit.setValue", &json!({"layer":"Cities", "row":0, "field":"opened", "value":"new text"})).unwrap();
+        let depth = app.session.undo_depth();
+        landed(&mut app, 60);
+        assert_eq!(app.session.undo_depth(), depth);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("layer changed")));
+    }
+    /// A queued preview cannot silently read rows edited after the user's format choice.
+    #[test]
+    fn date_preview_rejects_changed_queued_rows() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addDataText", json!({"fileName":"dates.csv", "text":"opened\n03/05/2026\n04/06/2026\n"})).unwrap();
+        app.run("edit.enable", json!({"on":true})).unwrap();
+        app.reads_off_frame = true;
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocked.geojson");
+        std::fs::write(&blocker, b"not GeoJSON").unwrap();
+        assert_eq!(run(&mut app, "layer.addData", json!({"path":blocker})).unwrap()["started"], "Add Data");
+        let dataset = app.session.project.tables[0].dataset.clone();
+        assert_eq!(
+            run_date_preview(&mut app, json!({"table":"dates", "field":"opened", "type":"date", "format":"%d/%m/%Y"}), dataset).unwrap()["waiting"],
+            1
+        );
+        app.session.run("edit.setValue", &json!({"table":"dates", "row":1, "field":"opened", "value":"not a date"})).unwrap();
+        let depth = app.session.undo_depth();
+        landed(&mut app, 60);
+        let dataset = &app.session.project.tables[0].dataset;
+        assert_eq!(dataset.fields[0].ty, rustgis_engine::data::FieldType::Text);
+        assert_eq!(dataset.value(1, 0).to_string(), "not a date");
+        assert_eq!(app.session.undo_depth(), depth);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("changed after its date preview")));
     }
 }

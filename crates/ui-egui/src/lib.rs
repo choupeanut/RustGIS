@@ -2592,6 +2592,8 @@ impl RustGisApp {
     /// Runs a command by id: `ui.*` here, everything else in the engine.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         #[cfg(not(target_arch = "wasm32"))]
+        self.session.statistics_need_read_ahead(self.reads_off_frame);
+        #[cfg(not(target_arch = "wasm32"))]
         if self.reads_off_frame {
             if id == "service.layers" {
                 return readjob::run(self, "service.layers", params);
@@ -2610,7 +2612,7 @@ impl RustGisApp {
             if let Some(command) = archive {
                 return readjob::run(self, command, params);
             }
-            if params.get("table").is_some_and(|t| !t.is_null())
+            if (id == "edit.convertField" || params.get("table").is_some_and(|t| !t.is_null()))
                 && let Some((command, _)) = rustgis_engine::cmd::edit::table_edit_in_background(id)
             {
                 return readjob::run(self, command, params);
@@ -5754,6 +5756,8 @@ impl RustGisApp {
 
     /// Per-frame work that doesn't draw (theme, fonts, files that arrived).
     pub fn logic(&mut self, ctx: &egui::Context) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.session.statistics_need_read_ahead(self.reads_off_frame);
         let _diagnostics = self.session.diagnostics.enter();
         // What this thread draws (an image, a print, a page, a preview, an agent's snapshot)
         // never waits for cast shadows still being worked out: it says they were (Never hold the

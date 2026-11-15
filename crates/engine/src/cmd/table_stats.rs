@@ -2,17 +2,19 @@
 //! output table (Summary Statistics writes one).
 //!
 //! One pass over the rows. The sum, mean, minimum and maximum are the ones Summary Statistics
-//! gives, except that a column of whole numbers is added up exactly (an i128 sum, i64 minimum and
+//! defines, except that a column of whole numbers is added up exactly (an i128 sum, i64 minimum and
 //! maximum), so nothing past 2^53 is rounded; the standard deviation is the population one
 //! (divided by n), as its STD is. A text or date column keeps its distinct texts to count them, up
-//! to [`MAX_DISTINCT`]: past that the count stops and says so, so a column of identifiers is not
+//! to [`MAX_DISTINCT`] entries and [`MAX_DISTINCT_BYTES`] of UTF-8 text: past either the count stops and says so, so a column of identifiers is not
 //! copied whole into memory.
 //!
 //! The work grows with the rows, so the desktop app does it on a thread of its own first
 //! ([`stats_ahead`]), with progress and **Cancel**, and the command takes that result as it lands;
 //! a layer changed meanwhile is told to ask again rather than counted again here, which would
-//! hold the window. The assistant, scripts, the command line and the browser (one thread) count
-//! where they ask.
+//! hold the window. Direct desktop MCP relay requests use the same read queue. Synchronous
+//! Session adapters (including scripts and the embedded assistant) count on their caller's thread;
+//! they must arrange a worker when that thread owns a window. A registered window owner refuses
+//! an unprepared inline count instead of holding the window. The browser has one thread.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -27,6 +29,65 @@ use crate::{CmdResult, Session};
 /// answer and a notice say it is "more than" this.
 pub const MAX_DISTINCT: usize = 100_000;
 
+/// Most UTF-8 bytes copied into the distinct-value set (in addition to its entry bound).
+pub const MAX_DISTINCT_BYTES: usize = 8 << 20;
+
+/// Exact binary sum, used only when the ordinary sum overflows. Each bin holds signed
+/// significands at one binary exponent, in units of the smallest subnormal. 2098 bits hold
+/// any finite f64; usize::BITS more hold a whole column's sum. Each i128 bin holds at most
+/// usize::MAX 53-bit significands without overflowing, on either supported word size.
+#[derive(Default)]
+struct WideSum(Vec<i128>);
+
+impl WideSum {
+    fn add(&mut self, x: f64) {
+        if self.0.is_empty() {
+            self.0.resize(2099 + usize::BITS as usize, 0);
+        }
+        let bits = x.to_bits();
+        let exponent = ((bits >> 52) & 0x7ff) as usize;
+        let significand = (bits & ((1u64 << 52) - 1)) | if exponent > 0 { 1u64 << 52 } else { 0 };
+        let signed = if x.is_sign_negative() { -i128::from(significand) } else { i128::from(significand) };
+        if let Some(bin) = self.0.get_mut(exponent.saturating_sub(1)) {
+            *bin += signed;
+        }
+    }
+
+    fn total(&self) -> f64 {
+        let normalize = |digits: &mut [i128]| {
+            let mut carry = 0;
+            for d in digits {
+                let v = *d + carry;
+                *d = v.rem_euclid(2);
+                carry = v.div_euclid(2);
+            }
+            carry
+        };
+        let mut digits = self.0.clone();
+        let negative = normalize(&mut digits) < 0;
+        if negative {
+            digits.clone_from(&self.0);
+            for d in &mut digits {
+                *d = -*d;
+            }
+            normalize(&mut digits);
+        }
+        let Some(high) = digits.iter().rposition(|&d| d != 0) else { return 0.0 };
+        let cut = high.saturating_sub(52);
+        let mut significand = 0u64;
+        for &d in digits.get(cut..=high).unwrap_or(&[]).iter().rev() {
+            significand = (significand << 1) | d as u64;
+        }
+        // Round once, ties to even, before restoring the binary scale.
+        if cut > 0 && digits.get(cut - 1) == Some(&1) && (significand & 1 != 0 || digits.iter().take(cut - 1).any(|&d| d != 0)) {
+            significand += 1;
+        }
+        let scale = if cut < 52 { f64::from_bits(1u64 << cut) } else { 2.0f64.powi(cut as i32 - 1074) };
+        let total = significand as f64 * scale;
+        if negative { -total } else { total }
+    }
+}
+
 /// Whole numbers past this (2^53) are not all held by a decimal.
 const EXACT_IN_F64: u64 = 1 << 53;
 
@@ -37,6 +98,10 @@ struct Welford {
     n: usize,
     mean: f64,
     m2: f64,
+    /// Population deviation updated without squaring a value (the squares may overflow or
+    /// underflow even when the deviation fits). The ordinary result is retained when usable.
+    deviation: f64,
+    max_abs: f64,
 }
 
 impl Welford {
@@ -46,11 +111,16 @@ impl Welford {
         let d = x - self.mean;
         // `x - mean` overflows for values of opposite sign near the largest float: then each part is
         // divided first, which can't.
-        self.mean += if d.is_finite() { d / n } else { x / n - self.mean / n };
+        let step = if d.is_finite() { d / n } else { x / n - self.mean / n };
+        self.mean += step;
         self.m2 += d * (x - self.mean);
+        let previous = (self.n - 1) as f64;
+        self.deviation = (self.deviation * (previous / n).sqrt()).hypot(step * previous.sqrt());
+        self.max_abs = self.max_abs.max(x.abs());
     }
     fn std_dev(&self) -> f64 {
-        (self.m2 / self.n.max(1) as f64).sqrt()
+        let ordinary = (self.m2 / self.n.max(1) as f64).sqrt();
+        if ordinary.is_finite() && ordinary > 0.0 { ordinary } else { self.deviation.min(self.max_abs) }
     }
 }
 
@@ -65,6 +135,7 @@ struct Numbers {
     ints: usize,
     big: usize,
     sum: f64,
+    wide_sum: WideSum,
     all: Welford,
     min: f64,
     max: f64,
@@ -81,6 +152,7 @@ impl Numbers {
     fn add_float(&mut self, x: f64) {
         self.count += 1;
         self.sum += x;
+        self.wide_sum.add(x);
         self.all.add(x);
         if self.count == 1 {
             self.min = x;
@@ -125,6 +197,9 @@ struct Texts {
     distinct: HashSet<String>,
     /// More distinct texts than [`MAX_DISTINCT`]: the set stopped growing.
     capped: bool,
+    distinct_bytes: usize,
+    byte_capped: bool,
+    invalid_dates: usize,
     min: Option<String>,
     max: Option<String>,
     /// For a date column: the earliest and latest by instant.
@@ -150,7 +225,7 @@ fn is_empty_text(v: &Cell) -> bool {
 struct Target {
     id: u32,
     layer: String,
-    /// The column, by its place in the table.
+    /// The field index in dataset order, independent of the table's displayed order.
     column: usize,
     selected: bool,
     /// The selection as the layer had it when asked (empty when all are counted); [`gather`] sorts
@@ -158,12 +233,12 @@ struct Target {
     rows: Vec<usize>,
 }
 
-/// The column of `p`: its `index` (the place in the table, which tells apart columns of the same
+/// The column of `p`: its `index` (dataset field order, which tells apart columns of the same
 /// name, as the attribute table's menu gives it), else its `field` name, looked up as given
 /// before the name without surrounding spaces.
 fn column_of(ds: &Dataset, layer: &str, p: &Value) -> Result<usize, String> {
     if let Some(i) = p.get("index").filter(|i| !i.is_null()) {
-        let i = i.as_u64().and_then(|i| usize::try_from(i).ok()).ok_or("\"index\" must be a column's place in the table, from 0")?;
+        let i = i.as_u64().and_then(|i| usize::try_from(i).ok()).ok_or("\"index\" must be a field index in dataset order, from 0")?;
         return if ds.fields.get(i).is_some() { Ok(i) } else { Err(format!("{layer}: no column {i}")) };
     }
     let field = ps(p, "field").filter(|f| !f.trim().is_empty()).ok_or("give the field to describe (\"field\")")?;
@@ -229,7 +304,13 @@ fn gather(ds: &Dataset, t: &Target) -> Result<Done, String> {
             (true, Some(lo), Some(hi)) => {
                 (exact(n.isum), json!(n.isum as f64 / n.count as f64), exact(i128::from(lo)), exact(i128::from(hi)), n.spread.std_dev())
             }
-            _ => (json!(n.sum), json!(n.all.mean), json!(n.min), json!(n.max), n.all.std_dev()),
+            _ => (
+                json!(if n.sum.is_finite() { n.sum } else { n.wide_sum.total() }),
+                json!(n.all.mean),
+                json!(n.min),
+                json!(n.max),
+                n.all.std_dev(),
+            ),
         };
         // `json!` turns a number past what a decimal holds (infinity) into null: said, not silent.
         let mut overflowed = Vec::new();
@@ -290,12 +371,16 @@ fn gather(ds: &Dataset, t: &Target) -> Result<Done, String> {
             t2.count += 1;
             let text: Cow<str> = match v {
                 Cell::Text(x) => Cow::Borrowed(x.as_str()),
-                other => Cow::Owned(other.to_string()),
+                other => Cow::Owned(other.to_file_text()),
             };
             if !t2.capped && !t2.distinct.contains(text.as_ref()) {
                 if t2.distinct.len() >= MAX_DISTINCT {
                     t2.capped = true;
+                } else if text.len() > MAX_DISTINCT_BYTES.saturating_sub(t2.distinct_bytes) {
+                    t2.capped = true;
+                    t2.byte_capped = true;
                 } else {
+                    t2.distinct_bytes += text.len();
                     t2.distinct.insert(text.to_string());
                 }
             }
@@ -306,6 +391,8 @@ fn gather(ds: &Dataset, t: &Target) -> Result<Done, String> {
                 if t2.latest.as_ref().is_none_or(|(e, _)| k > *e) {
                     t2.latest = Some((k, text.to_string()));
                 }
+            } else if temporal {
+                t2.invalid_dates += 1;
             } else {
                 if t2.min.as_deref().is_none_or(|m| text.as_ref() < m) {
                     t2.min = Some(text.to_string());
@@ -322,9 +409,18 @@ fn gather(ds: &Dataset, t: &Target) -> Result<Done, String> {
         map.insert("distinct".into(), json!(t2.distinct.len()));
         if t2.capped {
             map.insert("distinctCapped".into(), json!(true));
-            notices.push(format!(
+            notices.push(if t2.byte_capped { format!(
+                "{}: '{}' reached the {} MiB distinct-text budget; it has more than {} distinct values and the distinct count stops at {}",
+                t.layer, f.name, MAX_DISTINCT_BYTES >> 20, t2.distinct.len(), t2.distinct.len()
+            ) } else { format!(
                 "{}: '{}' has more than {MAX_DISTINCT} distinct values; the distinct count stops at {MAX_DISTINCT}",
                 t.layer, f.name
+            ) });
+        }
+        if t2.invalid_dates > 0 {
+            notices.push(format!(
+                "{}: {} value(s) in '{}' aren't dates and were left out of the date minimum and maximum",
+                t.layer, t2.invalid_dates, f.name
             ));
         }
         map.insert("min".into(), json!(min));
@@ -365,9 +461,17 @@ pub(crate) fn stats_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWo
     }))
 }
 
+/// Synchronous dispatch cannot move a borrowed Session or its active policy stack to a worker,
+/// nor yield a deferred reply. Desktop UI and direct relay adapters prepare the count before
+/// dispatch; other synchronous adapters must run off their window thread. Spawning and joining
+/// here would still hold that thread and would not provide its progress or Cancel controls.
 pub(super) fn run(s: &mut Session, p: &Value) -> CmdResult {
     let target = resolve(s, p)?;
     let ahead = super::reads::take::<StatsAhead>(s, &ahead_key(target.id));
+    #[cfg(not(target_arch = "wasm32"))]
+    if ahead.is_none() && s.statistics_window_thread == Some(std::thread::current().id()) {
+        return Err("column statistics need the desktop background read queue; use the column's Statistics menu or a direct MCP table.statistics request".into());
+    }
     let l = s.map().layer(target.id).ok_or("no such layer")?;
     let done = match ahead {
         Some(a) if a.of(l, &target) => a.done?,

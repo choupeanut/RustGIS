@@ -158,13 +158,87 @@ fn a_sum_too_large_for_a_decimal_is_left_out_with_a_notice_and_the_mean_stays_ri
     assert_eq!(v["count"], 2);
     let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
     assert_eq!(said, ["w: the sum of 'x' is too large to hold as a decimal number (past about 1.8e308) and is left out"]);
-    // A mean that can't be held either (opposite extremes) is said as well.
+    // Opposite extremes have a representable deviation, despite their squared spread.
     let mut s = layer_of("w", fields, vec![vec![V::Float(1.7e308)], vec![V::Float(-1.7e308)]]);
     let mark = s.notice_mark();
     let v = stats(&mut s, json!({"layer": "w", "field": "x"}));
     assert_eq!(v["sum"], 0.0);
     assert_eq!(v["mean"], 0.0, "the running mean of opposite extremes is zero, not overflowed: {v}");
-    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("standard deviation")), "{v}");
+    assert_eq!(v["stdDev"], 1.7e308);
+    assert!(s.notices_since(mark).is_empty(), "{v}");
+}
+
+#[test]
+fn representable_sums_and_deviations_survive_intermediate_overflow_and_underflow() {
+    for (values, sum, deviation) in [
+        (vec![0.0, 1e200], 1e200, 5e199),
+        (vec![0.0, 1e-200], 1e-200, 5e-201),
+        (vec![1e308, 1e308, -1e308], 1e308, (1e308 / 3.0) * 2.0 * 2.0f64.sqrt()),
+    ] {
+        let mut s = layer_of("w", vec![Field::new("x", FieldType::Double)], values.into_iter().map(|x| vec![V::Float(x)]).collect());
+        let mark = s.notice_mark();
+        let v = stats(&mut s, json!({"layer":"w","field":"x"}));
+        assert_eq!(v["sum"], sum, "{v}");
+        let got = v["stdDev"].as_f64().unwrap();
+        assert!((got / deviation - 1.0).abs() < 1e-14, "{v}, expected {deviation}");
+        assert!(s.notices_since(mark).is_empty(), "{v}");
+    }
+    // Small terms survive cancellation of overflowing prefixes, even at the subnormal limit.
+    for small in [1e-200, f64::from_bits(1), -1e-200] {
+        let mut s = layer_of(
+            "w",
+            vec![Field::new("x", FieldType::Double)],
+            [1e308, 1e308, small, -1e308, -1e308].into_iter().map(|x| vec![V::Float(x)]).collect(),
+        );
+        assert_eq!(stats(&mut s, json!({"layer":"w","field":"x"}))["sum"], small);
+    }
+}
+
+#[test]
+fn distinct_text_bytes_are_bounded_and_mixed_cells_keep_their_full_text() {
+    let chunk = "x".repeat(crate::cmd::table_stats::MAX_DISTINCT_BYTES / 2);
+    let mut s = layer_of(
+        "w",
+        vec![Field::new("text", FieldType::Text)],
+        vec![vec![V::Text(chunk.clone())], vec![V::Text(format!("y{chunk}"))], vec![V::Text("z".into())]],
+    );
+    let mark = s.notice_mark();
+    let v = stats(&mut s, json!({"layer":"w","field":"text"}));
+    assert_eq!(v["count"], 3);
+    assert_eq!(v["distinct"], 1);
+    assert_eq!(v["distinctCapped"], true);
+    assert_eq!(v["max"], "z");
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert_eq!(said.len(), 1);
+    assert!(said[0].contains("8 MiB") && said[0].contains("more than 1"), "{said:?}");
+    let mut s = layer_of("w", vec![Field::new("text", FieldType::Text)], vec![vec![V::Float(1e-7)], vec![V::Float(2e-7)]]);
+    let mark = s.notice_mark();
+    let v = stats(&mut s, json!({"layer":"w","field":"text"}));
+    assert_eq!(v["distinct"], 2);
+    assert_eq!(v["min"], "0.0000001");
+    assert_eq!(v["max"], "0.0000002");
+    assert!(s.notices_since(mark).is_empty());
+}
+
+#[test]
+fn non_date_cells_in_a_date_field_are_counted_and_said() {
+    let mut s = layer_of(
+        "w",
+        vec![Field::new("date", FieldType::Date)],
+        vec![vec![V::Date(Date::parse("2026-01-01").unwrap())], vec![V::Text("not a date".into())]],
+    );
+    let mark = s.notice_mark();
+    let v = stats(&mut s, json!({"layer":"w","field":"date"}));
+    assert_eq!(v["count"], 2);
+    assert_eq!(v["min"], "2026-01-01");
+    assert_eq!(v["max"], "2026-01-01");
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert_eq!(said.len(), 1);
+    assert!(said[0].contains("1 value(s)") && said[0].contains("aren't dates"), "{said:?}");
+    let mut clean = layer_of("w", vec![Field::new("date", FieldType::Date)], vec![vec![V::Date(Date::parse("2026-01-01").unwrap())]]);
+    let mark = clean.notice_mark();
+    assert_eq!(stats(&mut clean, json!({"layer":"w","field":"date"}))["min"], "2026-01-01");
+    assert!(clean.notices_since(mark).is_empty());
 }
 
 #[test]
@@ -239,6 +313,24 @@ fn the_desktops_count_ahead_is_what_the_command_answers_and_a_changed_layer_is_r
     let control = Control::cancelled_once_started();
     let e = read_ahead(&mut s, "table.statistics", &p).unwrap().run(&control).err().unwrap();
     assert!(e.to_lowercase().contains("cancel") && control.looked() > 0, "{e}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn an_unprepared_window_thread_refuses_statistics_but_a_prepared_read_lands() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    let mut s = parcels();
+    let p = json!({"layer":"parcels","field":"area"});
+    let expected = stats(&mut s, p.clone());
+    s.statistics_need_read_ahead(true);
+    let error = s.run("table.statistics", &p).unwrap_err();
+    assert!(error.contains("background read queue"), "{error}");
+    let ahead = read_ahead(&mut s, "table.statistics", &p).unwrap();
+    let read = std::thread::spawn(move || ahead.run(&Control::stoppable())).join().unwrap().unwrap();
+    assert_eq!(read_land(&mut s, read).unwrap(), expected);
+    s.statistics_need_read_ahead(false);
+    assert_eq!(stats(&mut s, p), expected, "headless synchronous adapters still work");
 }
 
 /// The count made ahead reports every row as done, the last block of fewer than 1,024 included,
