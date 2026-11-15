@@ -985,6 +985,7 @@ fn save_model(s: &mut Session, p: &Value) -> CmdResult {
 
 /// A model as a `*.model.json` file: written to `path`, or its text returned.
 fn export_model(s: &mut Session, p: &Value) -> CmdResult {
+    let written = s.notice_mark();
     let (name, g, _) = model_graph(s, p)?;
     let (text, report) =
         crate::durable::output_owned(g, |g| serde_json::to_string_pretty(&crate::model::to_file(&name, g)).map_err(|e| e.to_string()))?;
@@ -993,6 +994,7 @@ fn export_model(s: &mut Session, p: &Value) -> CmdResult {
     match ps(p, "path") {
         Some(path) => {
             rustgis_data::io::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
+            s.retain_written_notices(written);
             note_passed_graph(s, p);
             Ok(json!({"model": name, "path": path}))
         }

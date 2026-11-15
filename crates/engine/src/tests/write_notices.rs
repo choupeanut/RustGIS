@@ -1,0 +1,192 @@
+//! Committed files and their losses remain visible after a workflow rolls its project back.
+
+use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Cell};
+use serde_json::{Value, json};
+
+use crate::{Project, Session};
+
+struct Files(std::path::PathBuf);
+
+impl Files {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("rustgis-write-notices-{}-{time}-{serial}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Files {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn places() -> Session {
+    let mut s = Session::new(Project::default());
+    let mut ds = Dataset::new("Places", GeometryType::Point, vec![Field::new("long_attribute_name", FieldType::Text)]);
+    ds.crs = rustgis_data::raster::Crs::from_epsg(4326);
+    ds.push(Some(Geometry::Point(rustgis_data::Coord::new(1.0, 2.0))), vec![Cell::Text("kept".into())]);
+    s.map_mut().add_dataset(ds);
+    s.map_mut().editing.settings.enabled = true;
+    s
+}
+
+#[test]
+fn write_notices_survive_nested_script_task_errors_and_panics() {
+    for mode in ["success", "script", "nested", "task", "panic"] {
+        let dir = Files::new();
+        let path = dir.path().join("export.shp");
+        let mut s = places();
+        let export = json!({"layer":"Places","path":path});
+        let edit = json!({"layer":"Places","field":"long_attribute_name"});
+        let fail = json!({"layer":"not-here"});
+        let body = format!("share.exportLayer {export}\nedit.deleteField {edit}\nlayer.remove {fail}");
+        if matches!(mode, "task" | "nested") {
+            let steps = if mode == "nested" {
+                json!([{"title":"Script","command":"script.run","params":{"script":body}}])
+            } else {
+                json!([
+                    {"title":"Write","command":"share.exportLayer","params":export},
+                    {"title":"Edit","command":"edit.deleteField","params":edit},
+                    {"title":"Fail","command":"layer.remove","params":fail}
+                ])
+            };
+            s.run("task.new", &json!({"name":"Write then fail","steps":steps})).unwrap();
+        }
+        let mark = s.notice_mark();
+        let depth = s.undo_depth();
+        let result = match mode {
+            "success" => s.run("share.exportLayer", &export),
+            "task" | "nested" => s.run("task.run", &json!({"task":"Write then fail"})),
+            "panic" => s.guarded("Panic after write", true, |s| {
+                s.run_part("share.exportLayer", &export)?;
+                s.run_part("edit.deleteField", &edit)?;
+                panic!("after write");
+            }),
+            _ => s.run("script.run", &json!({"script":body})),
+        };
+        assert_eq!(result.is_ok(), mode == "success", "{mode}: {result:?}");
+        assert!(path.is_file(), "{mode}: {result:?}");
+        let (back, _) = rustgis_data::io::read_path(&path).unwrap();
+        assert_eq!(back.fields[0].name, "long_attri");
+        assert_eq!(back.features.len(), 1);
+        let notices = s.notices_since(mark);
+        let loss: Vec<_> = notices.iter().filter(|n| n.text.contains("1 field name was changed")).collect();
+        assert_eq!(loss.len(), 1, "{mode}: {notices:?}");
+        assert!(loss[0].text.contains("long_attribute_name") && loss[0].text.contains("long_attri"));
+        assert_eq!(notices.iter().filter(|n| n.text == format!("Exported {}", path.display())).count(), 1, "{mode}: {notices:?}");
+        if mode != "success" {
+            assert!(s.map().layer_by_name("Places").unwrap().dataset.field_index("long_attribute_name").is_some());
+            assert!(notices.iter().filter(|n| !n.error).all(|n| !n.text.contains("Deleted")), "rolled-back edit: {notices:?}");
+            assert_eq!(notices.iter().filter(|n| !n.error).count(), 2, "{mode}: {notices:?}");
+            assert_eq!(s.undo_depth(), depth);
+        }
+    }
+}
+
+#[test]
+fn write_notices_keep_tool_losses_from_a_failed_model() {
+    let dir = Files::new();
+    let path = dir.path().join("places.pmtiles");
+    let mut s = places();
+    s.map_mut().layers.iter_mut().find(|l| l.name == "Places").unwrap().dataset.features[0].geometry =
+        Some(Geometry::Point(rustgis_data::Coord::new(1.0, 89.0)));
+    let params = json!({"input":"Places","minZoom":0,"maxZoom":0,"output":path});
+    s.run(
+        "model.new",
+        &json!({"name":"Write then fail","steps":[
+            {"tool":"vectorToPmtiles","params":params},
+            {"tool":"buffer","params":{"input":"missing","distance":1}}
+        ]}),
+    )
+    .unwrap();
+    let mark = s.notice_mark();
+    let result = s.run("model.run", &json!({"name":"Write then fail"}));
+    assert!(result.is_err(), "{result:?}");
+    assert!(path.is_file(), "{result:?}");
+    assert!(std::fs::read(&path).unwrap().starts_with(b"PMTiles\x03"));
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert_eq!(said.iter().filter(|n| n.contains("Clamped 1 coordinates")).count(), 1, "{said:?}");
+}
+
+#[test]
+fn write_notices_keep_clean_exports_free_of_loss_warnings() {
+    let dir = Files::new();
+    let path = dir.path().join("clean.shp");
+    let mut s = places();
+    s.map_mut().layers.iter_mut().find(|l| l.name == "Places").unwrap().dataset.fields[0].name = "name".into();
+    let mark = s.notice_mark();
+    s.run("share.exportLayer", &json!({"layer":"Places","path":path})).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert_eq!(said, [format!("Exported {}", path.display())]);
+}
+
+#[test]
+fn write_notices_keep_geopackage_date_losses_after_a_failed_script() {
+    let dir = Files::new();
+    let path = dir.path().join("places.gpkg");
+    let mut s = places();
+    s.run("edit.addField", &json!({"layer":"Places","name":"at","type":"datetime"})).unwrap();
+    s.run("edit.setValue", &json!({"layer":"Places","row":0,"field":"at","value":"2026-01-01T00:00:00Z"})).unwrap();
+    s.run("share.exportLayer", &json!({"layer":"Places","path":path,"table":"places"})).unwrap();
+    s.run("gpkg.addLayer", &json!({"path":path,"table":"places","name":"Editable"})).unwrap();
+    s.run("edit.setValue", &json!({"layer":"Editable","row":0,"field":"at","value":"2026-01-01T00:00:00.123456+02:00"})).unwrap();
+    let mark = s.notice_mark();
+    assert!(
+        s.run("script.run", &json!({"script":"gpkg.saveEdits {\"layer\":\"Editable\"}\nlayer.remove {\"layer\":\"missing\"}"})).is_err()
+    );
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let at: String = db.query_row("SELECT at FROM places", [], |r| r.get(0)).unwrap();
+    assert_eq!(at, "2025-12-31T22:00:00.123Z");
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert_eq!(said.iter().filter(|t| t.contains("rounded to the millisecond")).count(), 1, "{said:?}");
+    assert_eq!(said.iter().filter(|t| t.contains("written in UTC")).count(), 1, "{said:?}");
+}
+
+#[test]
+fn write_notices_do_not_retain_a_failed_exports_preparation_or_prior_edits() {
+    let dir = Files::new();
+    let path = dir.path().join("missing").join("export.shp");
+    let mut s = places();
+    let before = s.notice_mark();
+    let body = format!(
+        "edit.deleteField {{\"layer\":\"Places\",\"field\":\"long_attribute_name\"}}\nshare.exportLayer {}",
+        json!({"layer":"Places","path":path})
+    );
+    assert!(s.run("script.run", &json!({"script":body})).is_err());
+    assert!(!path.exists());
+    assert!(s.notices_since(before).iter().all(|n| n.error));
+    assert!(s.map().layer_by_name("Places").unwrap().dataset.field_index("long_attribute_name").is_some());
+}
+
+#[test]
+fn write_notices_keep_the_ordinary_queue_bounded_and_marks_consistent() {
+    let mut s = places();
+    let mark = s.notice_mark();
+    assert!(
+        s.guarded("Outer", true, |s| {
+            s.notify("rolled-back edit", false);
+            s.guarded("Inner", true, |s| {
+                for i in 0..250 {
+                    s.notify_written(format!("committed {i}"), false);
+                }
+                Err("inner failed".into())
+            })?;
+            Ok(Value::Null)
+        })
+        .is_err()
+    );
+    assert_eq!(s.notices.len(), 200);
+    assert!(s.notices_since(mark).iter().filter(|n| !n.error).all(|n| n.text.starts_with("committed ")));
+    let mark = s.notice_mark();
+    s.notify("next", false);
+    assert_eq!(s.notices_since(mark).len(), 1);
+    assert_eq!(s.notices_since(mark)[0].text, "next");
+}

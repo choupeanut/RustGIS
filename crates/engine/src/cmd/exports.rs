@@ -114,12 +114,23 @@ fn written_under(name: &str, control: &std::sync::Arc<rustgis_analysis::control:
 
 /// Says what an export wrote, and gives its answer (or the failure its `then` says).
 fn said(s: &mut Session, wrote: Wrote) -> CmdResult {
-    let Wrote { mut answer, notes, then, .. } = wrote;
+    let Wrote { mut answer, notes, then, written_path, .. } = wrote;
     for note in notes {
-        s.notify(note, false);
+        if written_path.is_some() {
+            s.notify_written(note, false);
+        } else {
+            s.notify(note, false);
+        }
     }
     if let Some(then) = then {
-        then(s, &mut answer)?;
+        let mark = s.notice_mark();
+        let result = then(s, &mut answer);
+        // Finalizers describe the file (drawing losses, a replaced table, its source record),
+        // even when refreshing the session fails after the physical write.
+        if written_path.is_some() {
+            s.retain_written_notices(mark);
+        }
+        result?;
     }
     Ok(answer)
 }
