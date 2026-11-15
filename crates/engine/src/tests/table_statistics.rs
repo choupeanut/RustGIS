@@ -173,6 +173,8 @@ fn representable_sums_and_deviations_survive_intermediate_overflow_and_underflow
     for (values, sum, deviation) in [
         (vec![0.0, 1e200], 1e200, 5e199),
         (vec![0.0, 1e-200], 1e-200, 5e-201),
+        (vec![0.0, 5e-162], 5e-162, 2.5e-162),
+        (vec![0.0, 1e-160], 1e-160, 5e-161),
         (vec![1e308, 1e308, -1e308], 1e308, (1e308 / 3.0) * 2.0 * 2.0f64.sqrt()),
     ] {
         let mut s = layer_of("w", vec![Field::new("x", FieldType::Double)], values.into_iter().map(|x| vec![V::Float(x)]).collect());
@@ -282,7 +284,9 @@ fn a_column_is_told_apart_by_its_place_when_names_repeat() {
     assert_eq!(stats(&mut s, json!({"layer": "w", "field": "v"}))["sum"], 1.0, "by name: the first");
     let second = stats(&mut s, json!({"layer": "w", "field": "v", "index": 1}));
     assert_eq!((second["sum"].clone(), second["index"].clone()), (json!(100.0), json!(1)));
+    let mark = s.notice_mark();
     assert_eq!(stats(&mut s, json!({"layer": "w", "index": 1}))["sum"], 100.0, "no name needed");
+    assert!(s.notices_since(mark).is_empty(), "index is a recognized parameter");
     assert!(s.run("table.statistics", &json!({"layer": "w", "index": 2})).unwrap_err().contains("no column 2"));
     assert!(s.run("table.statistics", &json!({"layer": "w", "index": "x"})).is_err());
 }

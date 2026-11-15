@@ -49,7 +49,10 @@ sum or mean too large for a decimal number is left out, with a notice. A text or
 its count, distinct values (up to 100,000 entries or 8 MiB of distinct text; beyond either bound, a notice gives the lower bound), and
 first and last in order. The count runs in the background in the desktop app, with progress and
 Cancel. Scripts run `table.statistics` (`"layer"`, `"field"` or `"index"` (the field's zero-based position in dataset order, for columns of the same name; Move Left/Right does not change it), and `"selected"` for the selected rows only), which
-answers the same numbers as JSON. It changes nothing in the project, so there is nothing to undo.
+answers the same numbers as JSON. Headless scripts can call it synchronously. In a desktop
+window, use the column menu or a direct attached-MCP command; synchronous script and embedded
+assistant calls are refused rather than holding the window. It changes nothing in the project,
+so there is nothing to undo. Selected-only results close when the selection changes.
 
 A text column's menu also has **Convert to Date** and **Convert to Date and Time**
 (`edit.convertField`, `"type"`: `date` or `datetime`). A dialog lists only presets that read

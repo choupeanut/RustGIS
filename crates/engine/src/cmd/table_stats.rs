@@ -119,8 +119,10 @@ impl Welford {
         self.max_abs = self.max_abs.max(x.abs());
     }
     fn std_dev(&self) -> f64 {
-        let ordinary = (self.m2 / self.n.max(1) as f64).sqrt();
-        if ordinary.is_finite() && ordinary > 0.0 { ordinary } else { self.deviation.min(self.max_abs) }
+        let variance = self.m2 / self.n.max(1) as f64;
+        // Even a positive subnormal square has lost significant bits: taking its square root
+        // cannot recover them. Use the square-free result for partial underflow too.
+        if variance.is_normal() && variance > 0.0 { variance.sqrt() } else { self.deviation.min(self.max_abs) }
     }
 }
 

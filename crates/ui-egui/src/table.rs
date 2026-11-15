@@ -50,6 +50,8 @@ struct ColumnStats {
     /// an edit to a value, or a row added or deleted, stops it matching, so the window goes rather
     /// than show a sum the layer no longer has.
     rows: std::sync::Weak<Vec<Feature>>,
+    /// Selected-only answers cease to match when the layer's selection changes.
+    selection: Option<Vec<usize>>,
     answer: Value,
 }
 
@@ -61,7 +63,11 @@ impl ColumnStats {
         Some(self.layer) == layer
             && self.opened == app.session.opened
             && self.map == app.session.map().instance_id()
-            && live.is_some_and(|l| l.instance_id() == self.instance && l.dataset.features.allocation_key().ptr_eq(&self.rows))
+            && live.is_some_and(|l| {
+                l.instance_id() == self.instance
+                    && l.dataset.features.allocation_key().ptr_eq(&self.rows)
+                    && self.selection.as_ref().is_none_or(|s| *s == l.selection)
+            })
     }
 }
 
@@ -79,10 +85,18 @@ pub(crate) fn statistics_landed(app: &mut RustGisApp, landed: crate::Landed) {
     // Said already if it failed or never ran.
     let crate::Landed::Ran(Ok(answer)) = landed else { return };
     let Some(layer) = answer.get("layerId").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) else { return };
-    let Some((instance, rows)) = app.session.map().layer(layer).map(|l| (l.instance_id(), l.dataset.features.allocation_key())) else {
+    let Some(l) = app.session.map().layer(layer) else {
         return;
     };
-    app.table.stats = Some(ColumnStats { layer, instance, opened: app.session.opened, map: app.session.map().instance_id(), rows, answer });
+    app.table.stats = Some(ColumnStats {
+        layer,
+        instance: l.instance_id(),
+        opened: app.session.opened,
+        map: app.session.map().instance_id(),
+        rows: l.dataset.features.allocation_key(),
+        selection: (answer.get("selected").and_then(Value::as_bool) == Some(true)).then(|| l.selection.clone()),
+        answer,
+    });
 }
 
 /// Asks `table.statistics` for a column and keeps what it gives the window. On the desktop the
@@ -1501,6 +1515,7 @@ mod tests {
             opened: st.opened + 1,
             map: st.map,
             rows: st.rows.clone(),
+            selection: st.selection.clone(),
             answer: Value::Null,
         };
         assert!(!other_project.of(&app, Some(id)), "another project");
@@ -1553,5 +1568,26 @@ mod tests {
         let added = json!({"layer": id, "geometry": {"type": "Point", "coordinates": [1.0, 2.0]}, "attributes": {"n": 5}});
         app.session.run("edit.addFeature", &added).unwrap();
         assert!(app.table.stats.as_ref().is_some_and(|s| !s.of(&app, Some(id))), "an added row changes the rows counted");
+    }
+
+    #[test]
+    fn selected_statistics_stop_matching_when_the_selection_changes() {
+        use rustgis_engine::data::{FieldType, GeometryType};
+        for selected in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let mut ds = Dataset::new("counted", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+            ds.push(None, vec![V::Int(1)]);
+            ds.push(None, vec![V::Int(2)]);
+            let id = rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+            app.session.table_layer = Some(id);
+            app.session.map_mut().layer_mut(id).unwrap().selection = vec![0];
+            let answer = app.run("table.statistics", json!({"layer":id,"field":"n","selected":selected})).unwrap();
+            statistics_landed(&mut app, crate::Landed::Ran(Ok(answer)));
+            assert!(app.table.stats.as_ref().unwrap().of(&app, Some(id)));
+            app.session.map_mut().layer_mut(id).unwrap().selection = vec![1];
+            let mut output = egui::Context::default().run_ui(Default::default(), |ui| show(&mut app, ui));
+            output.textures_delta.clear();
+            assert_eq!(app.table.stats.is_some(), !selected, "only the selected-row window closes");
+        }
     }
 }
