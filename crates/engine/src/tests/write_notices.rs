@@ -259,3 +259,56 @@ fn write_notices_keep_the_ordinary_queue_bounded_and_marks_consistent() {
     assert_eq!(s.notices_since(mark).len(), 1);
     assert_eq!(s.notices_since(mark)[0].text, "next");
 }
+
+#[test]
+fn write_notices_keep_drawn_losses_when_background_delivery_is_refused() {
+    use crate::{
+        cmd::exports,
+        policy::{AgentAccess, Effects, Revocation, Scope},
+    };
+    use rustgis_data::diagnostics::Severity;
+    use std::sync::Arc;
+    let dir = Files::new();
+    for refused in [false, true] {
+        let path = dir.path().join(if refused { "refused.png" } else { "delivered.png" });
+        let mut s = super::with_raster();
+        s.run("layer.zoomTo", &json!({"layer":"scene"})).unwrap();
+        s.run("raster.symbology", &json!({"type":"shadedRelief","shadow":1})).unwrap();
+        let rl = s.map_mut().layers.iter_mut().find_map(|l| l.raster.as_mut()).unwrap();
+        rl.in_place = true;
+        let mut raster = (**rl.data.as_ref().unwrap()).clone();
+        raster.overview = Some((800, 600));
+        rl.data = Some(Arc::new(raster));
+        struct Live;
+        impl Revocation for Live {
+            fn allows(&self, _: Effects) -> bool {
+                true
+            }
+        }
+        let scope = Scope::agent(AgentAccess::Allow, false, "write-notices-drawing", None, Arc::new(Live));
+        let run = s
+            .with_scope(scope, |s| exports::export_start(s, "share.exportMap", &json!({"path":path,"width":200,"height":150})))
+            .unwrap()
+            .unwrap();
+        let started = run.started();
+        let wrote = run.run(&crate::analysis::control::Control::stoppable()).unwrap();
+        assert!(path.is_file());
+        assert!(std::fs::read(&path).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
+        if refused {
+            s.run("project.new", &json!({})).unwrap();
+        }
+        let mark = s.notice_mark();
+        let result = exports::export_land(&mut s, started, Ok(wrote));
+        let notices = s.notices_since(mark);
+        let losses: Vec<_> = notices.iter().filter(|n| n.text.contains("scene: its cast shadows aren't drawn")).collect();
+        assert_eq!(losses.len(), 1, "{refused}: {notices:?}");
+        if refused {
+            let error = result.unwrap_err();
+            assert!(error.contains("completion was refused") && error.contains("scene: its cast shadows aren't drawn"), "{error}");
+            assert!(s.map().layers.is_empty());
+        } else {
+            result.unwrap();
+            assert_eq!(losses[0].severity, Severity::Warning);
+        }
+    }
+}

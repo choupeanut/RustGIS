@@ -1944,6 +1944,8 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
         Ok(super::exports::Wrote {
             answer: json!({"path": path, "bytes": bytes}),
             notes,
+            diagnostics: Vec::new(),
+            refused_notes: Vec::new(),
             written_path: Some(path),
             then,
             #[cfg(not(target_arch = "wasm32"))]

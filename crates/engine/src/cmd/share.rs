@@ -813,6 +813,8 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     };
     Ok(Wrote {
         answer,
+        diagnostics: Vec::new(),
+        refused_notes: Vec::new(),
         notes: said,
         written_path,
         then,

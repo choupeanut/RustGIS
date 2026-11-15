@@ -1082,6 +1082,8 @@ fn write_geotiff_with_guidance(r: &Raster, bi: usize, cog: bool, path: &str, ban
     }
     Ok(super::exports::Wrote {
         answer: v,
+        diagnostics: Vec::new(),
+        refused_notes: Vec::new(),
         notes: vec![format!("Exported {path}{note}")],
         written_path: Some(path.to_string()),
         then: None,

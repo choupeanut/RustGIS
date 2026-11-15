@@ -74,6 +74,8 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 }
                 return Ok(Wrote {
                     answer: serde_json::json!({"layer": id, "path": path, "published": false, "features": features}),
+                    diagnostics: Vec::new(),
+                    refused_notes: Vec::new(),
                     notes: vec![format!("{name} has no edits its file lacks, so {path} wasn't written")],
                     written_path: None,
                     then: None,
@@ -141,6 +143,8 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             });
             Ok(Wrote {
                 answer: serde_json::json!({"layer": id, "path": path, "published": true, "features": published.features}),
+                diagnostics: Vec::new(),
+                refused_notes: Vec::new(),
                 notes: published.notes,
                 written_path,
                 then: Some(then),

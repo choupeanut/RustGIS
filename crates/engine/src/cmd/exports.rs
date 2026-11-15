@@ -15,6 +15,10 @@ use crate::{CmdResult, Session};
 pub struct Wrote {
     pub(crate) answer: Value,
     pub(crate) notes: Vec<String>,
+    /// Drawing diagnostics available before the session finalizer, with their original severity.
+    pub(crate) diagnostics: Vec<(rustgis_data::diagnostics::Severity, String)>,
+    /// Source failures to report if delivery cannot update their live layers.
+    pub(crate) refused_notes: Vec<String>,
     /// A physical write completed, even if authority to deliver its result is later refused.
     pub(crate) written_path: Option<String>,
     /// What it does to the session once written, after its notes, and adds to its answer (a
@@ -27,6 +31,12 @@ pub struct Wrote {
     /// say which needed a missing datum grid (`Session::say_grid_notes`).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) crs_used: Vec<(String, String)>,
+}
+
+impl Wrote {
+    fn completion_notes(&self) -> Vec<String> {
+        self.notes.iter().chain(self.diagnostics.iter().map(|(_, text)| text)).chain(&self.refused_notes).cloned().collect()
+    }
 }
 
 /// What an export does to the session once its file is written, and adds to its answer; or the
@@ -71,7 +81,8 @@ pub(crate) fn write_here(s: &mut Session, p: &Value, command: &str) -> CmdResult
         let work = start(s, p)?;
         written_under(name, &control, work)
     })?;
-    s.check_continuation(&owner).map_err(|why| completion_with_notes(command, wrote.written_path.as_deref(), &wrote.notes, why))?;
+    s.check_continuation(&owner)
+        .map_err(|why| completion_with_notes(command, wrote.written_path.as_deref(), &wrote.completion_notes(), why))?;
     said(s, wrote)
 }
 
@@ -112,7 +123,12 @@ fn written_under(name: &str, control: &std::sync::Arc<rustgis_analysis::control:
 
 /// Says what an export wrote, and gives its answer (or the failure its `then` says).
 fn said(s: &mut Session, wrote: Wrote) -> CmdResult {
-    let Wrote { mut answer, notes, then, written_path, .. } = wrote;
+    let Wrote { mut answer, notes, diagnostics, then, written_path, .. } = wrote;
+    let mark = s.notice_mark();
+    say(s, diagnostics);
+    if written_path.is_some() {
+        s.retain_written_notices(mark);
+    }
     for note in notes {
         if written_path.is_some() {
             s.notify_written(note, false);
@@ -157,10 +173,21 @@ pub(crate) fn drawn(
             Some((l.instance_id(), l.name.clone(), src.error.clone()?, src.clone()))
         })
         .collect();
+    let refused_notes = failed
+        .first()
+        .map(|(_, name, error, _)| {
+            let n = failed.len();
+            if n == 1 {
+                format!("{path}: {name} isn't in the file, as its source couldn't be read: {error}")
+            } else {
+                format!("{path}: {n} layers aren't in the file, as their sources couldn't be read; the first, {name}: {error}")
+            }
+        })
+        .into_iter()
+        .collect();
     let written_path = written.is_ok().then(|| path.clone());
     let answer = written.as_ref().map_or(Value::Null, Value::clone);
     let then: Then = Box::new(move |s: &mut Session, _: &mut Value| {
-        say(s, notices);
         let mut missing = Vec::new();
         for (instance, name, error, copied) in failed {
             let live = s.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()).find(|l| l.instance_id() == instance);
@@ -188,6 +215,8 @@ pub(crate) fn drawn(
     Ok(Wrote {
         answer,
         notes: Vec::new(),
+        diagnostics: notices,
+        refused_notes,
         written_path,
         then: Some(then),
         #[cfg(not(target_arch = "wasm32"))]
@@ -322,7 +351,7 @@ pub fn export_land(s: &mut Session, started: Started, done: Result<Wrote, String
         if let Ok(wrote) = &done {
             s.crs_used_elsewhere.extend(wrote.crs_used.iter().cloned());
         }
-        let notes = done.as_ref().ok().map(|wrote| wrote.notes.clone()).unwrap_or_default();
+        let notes = done.as_ref().ok().map(Wrote::completion_notes).unwrap_or_default();
         s.finish_export(&owner, |s| done.and_then(|wrote| said(s, wrote)))
             .map_err(|why| completion_with_notes(command, written_path.as_deref(), &notes, why))?
     })();
@@ -359,6 +388,8 @@ mod tests {
             late.cancel();
             Ok(Wrote {
                 answer: serde_json::json!({"path": "x"}),
+                diagnostics: Vec::new(),
+                refused_notes: Vec::new(),
                 notes: vec!["Exported x".into()],
                 written_path: Some("x".into()),
                 then: None,
