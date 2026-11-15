@@ -33,6 +33,8 @@ pub mod s3_keys;
 #[cfg(test)]
 mod s3_saved_tests;
 pub mod sample;
+#[cfg(feature = "schema")]
+pub mod schema;
 pub mod service_logins;
 pub mod sources;
 #[cfg(test)]
@@ -514,6 +516,7 @@ impl Tool {
 
 /// One geoprocessing history row.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GpRecord {
     /// The tool's name, as shown.
     pub tool: String,
@@ -2167,9 +2170,16 @@ impl Session {
         for map in &mut self.project.maps {
             for layer in &mut map.layers {
                 // Values in date fields that weren't dates, once for a layer read in place.
-                if let Some(note) = layer.source.as_mut().and_then(|source| source.take_unread_dates()) {
+                let (unread, rounded) = layer.source.as_mut().map(|source| source.take_unread_dates()).unwrap_or_default();
+                if let Some(note) = unread {
                     dates.push(format!(
                         "{}: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, {note}",
+                        layer.name
+                    ));
+                }
+                if let Some(note) = rounded {
+                    dates.push(format!(
+                        "{}: some date-times in it have digits past the microsecond and are rounded (Load All Features counts them all); so far, {note}",
                         layer.name
                     ));
                 }
