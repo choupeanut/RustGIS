@@ -117,6 +117,35 @@ fn write_notices_keep_tool_losses_from_a_failed_model() {
 }
 
 #[test]
+fn write_notices_keep_model_graph_repairs_only_after_a_file_commit() {
+    for mode in ["lossy", "clean", "failed", "inline"] {
+        let dir = Files::new();
+        let path = if mode == "failed" { dir.path().join("missing").join("model.json") } else { dir.path().join("model.json") };
+        let mut s = places();
+        let mut nodes = vec![json!({"id":"buffer","kind":"tool","tool":"buffer","params":{"input":"Places","distance":1}})];
+        if mode != "clean" {
+            nodes.push(json!({"kind":"tool","tool":"buffer"}));
+        }
+        let mut params = json!({"graph":{"nodes":nodes,"edges":[]},"path":path});
+        if mode == "inline" {
+            params.as_object_mut().unwrap().remove("path");
+        }
+        let mark = s.notice_mark();
+        let script = format!("model.export {params}\nlayer.remove {{\"layer\":\"missing\"}}");
+        assert!(s.run("script.run", &json!({"script":script})).is_err());
+        let notices = s.notices_since(mark);
+        let losses = notices.iter().filter(|n| n.text.contains("model graph: 1 node(s) left out")).count();
+        assert_eq!(losses, usize::from(mode == "lossy"), "{mode}: {notices:?}");
+        if matches!(mode, "lossy" | "clean") {
+            let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["graph"]["nodes"].as_array().unwrap().len(), 1);
+        } else {
+            assert!(!path.exists(), "{mode}: no committed output");
+        }
+    }
+}
+
+#[test]
 fn write_notices_keep_clean_exports_free_of_loss_warnings() {
     let dir = Files::new();
     let path = dir.path().join("clean.shp");
@@ -126,6 +155,46 @@ fn write_notices_keep_clean_exports_free_of_loss_warnings() {
     s.run("share.exportLayer", &json!({"layer":"Places","path":path})).unwrap();
     let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
     assert_eq!(said, [format!("Exported {}", path.display())]);
+}
+
+#[test]
+fn write_notices_keep_committed_losses_when_background_delivery_is_refused() {
+    use crate::cmd::exports;
+    use crate::policy::{AgentAccess, Effects, Revocation, Scope};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let dir = Files::new();
+    let path = dir.path().join("export.shp");
+    let mut s = places();
+    struct Live;
+    impl Revocation for Live {
+        fn allows(&self, _: Effects) -> bool {
+            true
+        }
+    }
+    let scope = Scope::agent(AgentAccess::Allow, false, "write-notices-export", None, Arc::new(Live));
+    let run =
+        s.with_scope(scope, |s| exports::export_start(s, "share.exportLayer", &json!({"layer":"Places","path":path}))).unwrap().unwrap();
+    let started = run.started();
+    let mut wrote = run.run(&crate::analysis::control::Control::stoppable()).unwrap();
+    let finalized = Arc::new(AtomicBool::new(false));
+    let called = finalized.clone();
+    wrote.then = Some(Box::new(move |_, _| {
+        called.store(true, Ordering::Relaxed);
+        Ok(())
+    }));
+    s.run("project.new", &json!({})).unwrap();
+    let mark = s.notice_mark();
+    let error = exports::export_land(&mut s, started, Ok(wrote)).unwrap_err();
+    assert!(error.contains("completion was refused"), "{error}");
+    assert!(error.contains("1 field name was changed") && error.contains("long_attribute_name"), "{error}");
+    assert!(!finalized.load(Ordering::Relaxed), "refused delivery never runs a finalizer");
+    assert!(s.map().layers.is_empty());
+    assert!(s.notices_since(mark).iter().any(|n| n.error && n.text.contains("1 field name was changed")));
+    let (back, _) = rustgis_data::io::read_path(&path).unwrap();
+    assert_eq!(back.fields[0].name, "long_attri");
 }
 
 #[test]

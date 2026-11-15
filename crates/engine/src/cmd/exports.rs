@@ -83,22 +83,20 @@ pub(crate) fn completion_refused(written_path: Option<&str>, why: String) -> Str
     }
 }
 
-/// A committed publication's format notices remain part of its refusal diagnostic; its
-/// finalizer stays blocked, so reporting the write cannot update a revoked layer's record.
+/// A committed export's format notices remain part of its refusal diagnostic; its finalizer
+/// stays blocked, so reporting the write cannot update a revoked layer's record.
 fn completion_with_notes(command: &str, written_path: Option<&str>, notes: &[String], why: String) -> String {
-    if command == "source.publish"
-        && let Some(path) = written_path
-    {
-        let mut message =
-            format!("Published {path}; completion was refused: {why}; the layer's record wasn't updated; add the file again to compare it");
-        for note in notes {
-            message.push('\n');
-            message.push_str(note);
-        }
-        message
+    let Some(path) = written_path else { return why };
+    let mut message = if command == "source.publish" {
+        format!("Published {path}; completion was refused: {why}; the layer's record wasn't updated; add the file again to compare it")
     } else {
-        completion_refused(written_path, why)
+        completion_refused(Some(path), why)
+    };
+    for note in notes {
+        message.push('\n');
+        message.push_str(note);
     }
+    message
 }
 
 /// `work` under `control`, as [`rustgis_analysis::run_under`] runs it, except that a file once
@@ -324,7 +322,7 @@ pub fn export_land(s: &mut Session, started: Started, done: Result<Wrote, String
         if let Ok(wrote) = &done {
             s.crs_used_elsewhere.extend(wrote.crs_used.iter().cloned());
         }
-        let notes = done.as_ref().ok().filter(|_| command == "source.publish").map(|wrote| wrote.notes.clone()).unwrap_or_default();
+        let notes = done.as_ref().ok().map(|wrote| wrote.notes.clone()).unwrap_or_default();
         s.finish_export(&owner, |s| done.and_then(|wrote| said(s, wrote)))
             .map_err(|why| completion_with_notes(command, written_path.as_deref(), &notes, why))?
     })();

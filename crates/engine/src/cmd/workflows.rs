@@ -994,8 +994,8 @@ fn export_model(s: &mut Session, p: &Value) -> CmdResult {
     match ps(p, "path") {
         Some(path) => {
             rustgis_data::io::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
-            s.retain_written_notices(written);
             note_passed_graph(s, p);
+            s.retain_written_notices(written);
             Ok(json!({"model": name, "path": path}))
         }
         None => {
