@@ -137,14 +137,7 @@ fn said(s: &mut Session, wrote: Wrote) -> CmdResult {
         }
     }
     if let Some(then) = then {
-        let mark = s.notice_mark();
-        let result = then(s, &mut answer);
-        // Finalizers describe the file (drawing losses, a replaced table, its source record),
-        // even when refreshing the session fails after the physical write.
-        if written_path.is_some() {
-            s.retain_written_notices(mark);
-        }
-        result?;
+        then(s, &mut answer)?;
     }
     Ok(answer)
 }
@@ -202,14 +195,18 @@ pub(crate) fn drawn(
         // One notice for them all, with a count, naming the first.
         if let Some((name, error)) = missing.first() {
             let n = missing.len();
+            let mark = s.notice_mark();
             s.warn(if n == 1 {
                 format!("{path}: {name} isn't in the file, as its source couldn't be read: {error}")
             } else {
                 format!("{path}: {n} layers aren't in the file, as their sources couldn't be read; the first, {name}: {error}")
             });
+            if written.is_ok() {
+                s.retain_written_notices(mark);
+            }
         }
         written?;
-        s.notify(format!("Exported {path}"), false);
+        s.notify_written(format!("Exported {path}"), false);
         Ok(())
     });
     Ok(Wrote {

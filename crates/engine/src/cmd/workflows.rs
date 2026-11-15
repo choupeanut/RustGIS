@@ -1935,6 +1935,7 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
         let bytes = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len();
         notes.push(format!("Exported {path}"));
         let target = path.clone();
+        let refused_notes = super::share::null_numbers_note(&target, null_numbers).map(|n| n.english()).into_iter().collect();
         let then = (null_numbers > 0).then(|| {
             Box::new(move |s: &mut Session, _: &mut Value| {
                 super::share::notify_null_numbers(s, &target, null_numbers);
@@ -1945,7 +1946,7 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             answer: json!({"path": path, "bytes": bytes}),
             notes,
             diagnostics: Vec::new(),
-            refused_notes: Vec::new(),
+            refused_notes,
             written_path: Some(path),
             then,
             #[cfg(not(target_arch = "wasm32"))]

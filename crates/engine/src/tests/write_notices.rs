@@ -312,3 +312,101 @@ fn write_notices_keep_drawn_losses_when_background_delivery_is_refused() {
         }
     }
 }
+
+#[test]
+fn write_notices_withdraw_rolled_back_geopackage_layer_refreshes() {
+    for fails in [false, true] {
+        let dir = Files::new();
+        let path = dir.path().join("tables.gpkg");
+        let mut s = super::world();
+        s.run("share.exportLayer", &json!({"layer":"Countries","path":path})).unwrap();
+        s.run("layer.addData", &json!({"path":path,"layer":"Countries","stream":true,"name":"InPlace"})).unwrap();
+        s.map_mut().layers.iter_mut().for_each(|l| {
+            l.sync_source(&rustgis_geom::Extent::new(-20.0, -20.0, 20.0, 20.0), true);
+        });
+        let kind = |s: &Session| s.map().layer_by_name("InPlace").unwrap().source.as_ref().unwrap().info().unwrap().geometry_type;
+        assert_eq!(kind(&s), GeometryType::Polygon);
+        let mark = s.notice_mark();
+        let export = json!({"layer":"Cities","path":path,"mode":"replaceTable","tableName":"Countries"});
+        let result = if fails {
+            s.run("script.run", &json!({"script":format!("share.exportLayer {export}\nlayer.remove {{\"layer\":\"missing\"}}") }))
+        } else {
+            s.run("share.exportLayer", &export)
+        };
+        assert_eq!(result.is_err(), fails, "{result:?}");
+        let notices = s.notices_since(mark);
+        assert_eq!(notices.iter().filter(|n| n.text.contains("replaced its table Countries, dropping")).count(), 1, "{notices:?}");
+        assert_eq!(notices.iter().filter(|n| n.text.contains("in place, now the new table")).count(), usize::from(!fails), "{notices:?}");
+        assert_eq!(kind(&s), if fails { GeometryType::Polygon } else { GeometryType::Point });
+        assert_eq!(rustgis_data::source::open_path(&path, Some("Countries")).unwrap().info().geometry_type, GeometryType::Point);
+    }
+}
+
+#[test]
+fn write_notices_keep_table_and_null_losses_in_refused_receipts() {
+    use crate::{
+        cmd::exports,
+        policy::{AgentAccess, Effects, Revocation, Scope},
+    };
+    use std::sync::Arc;
+    struct Live;
+    impl Revocation for Live {
+        fn allows(&self, _: Effects) -> bool {
+            true
+        }
+    }
+    for mode in ["table", "layer", "convert"] {
+        for refused in [false, true] {
+            let dir = Files::new();
+            let mut s = places();
+            let path = dir.path().join(if mode == "table" { "places.gpkg" } else { "places.geojson" });
+            let (command, params, loss) = if mode == "table" {
+                s.run("share.exportLayer", &json!({"layer":"Places","path":path})).unwrap();
+                let db = rusqlite::Connection::open(&path).unwrap();
+                db.execute("CREATE INDEX old_index ON Places(long_attribute_name)", []).unwrap();
+                (
+                    "share.exportLayer",
+                    json!({"layer":"Places","path":path,"mode":"replaceTable","tableName":"Places"}),
+                    "replaced its table Places, dropping",
+                )
+            } else {
+                let layer = s.map_mut().layers.iter_mut().find(|l| l.name == "Places").unwrap();
+                let field = layer.dataset.ensure_field("number", FieldType::Double);
+                layer.dataset.features[0].attrs[field] = Cell::Float(f64::NAN);
+                (
+                    if mode == "convert" { "data.convert" } else { "share.exportLayer" },
+                    json!({"layer":"Places","path":path,"format":"geojson"}),
+                    "were written as null",
+                )
+            };
+            let scope = Scope::agent(AgentAccess::Allow, false, "write-notices-receipt", None, Arc::new(Live));
+            let run = s.with_scope(scope, |s| exports::export_start(s, command, &params)).unwrap().unwrap();
+            let started = run.started();
+            let wrote = run.run(&crate::analysis::control::Control::stoppable()).unwrap();
+            if refused {
+                s.run("project.new", &json!({})).unwrap();
+            }
+            let mark = s.notice_mark();
+            let result = exports::export_land(&mut s, started, Ok(wrote));
+            assert_eq!(result.is_err(), refused, "{mode}: {result:?}");
+            let notices = s.notices_since(mark);
+            assert_eq!(notices.iter().filter(|n| n.text.contains(loss)).count(), 1, "{mode}/{refused}: {notices:?}");
+            if refused {
+                assert!(result.unwrap_err().contains(loss));
+            }
+            if mode == "table" {
+                let db = rusqlite::Connection::open(&path).unwrap();
+                let indexes: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE name='old_index'", [], |r| r.get(0)).unwrap();
+                assert_eq!(indexes, 0);
+            } else {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let back: Value = serde_json::from_str(&text).unwrap();
+                assert!(back["features"][0]["properties"]["number"].is_null());
+                if !refused {
+                    let n = notices.iter().find(|n| n.text.contains(loss)).unwrap();
+                    assert!(n.translated(|key, _| format!("translated:{key}")).unwrap().starts_with("translated:"));
+                }
+            }
+        }
+    }
+}
