@@ -15,6 +15,7 @@ fn xml(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\r', "&#13;")
 }
 
 fn coords(pts: &[Coord]) -> String {

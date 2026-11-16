@@ -463,7 +463,7 @@ impl Reader {
         let style = self.style_for(pm);
         let folder = folders.iter().filter(|f| !f.is_empty()).cloned().collect::<Vec<_>>().join(" / ");
         let name = child_text(pm, "name");
-        let description = child_text(pm, "description");
+        let description = child(pm, "description").map(|n| text_of(&n));
         // A placemark mixing kinds (a MultiGeometry of a point and a line) gives one feature per
         // kind, each in its layer.
         let mut any = false;
@@ -529,7 +529,7 @@ impl Reader {
                 };
                 r.data.iter().find(|(dk, _)| dk == k).is_none_or(|(_, v)| v == fixed.unwrap_or_default())
             };
-            if self.rows.iter().all(repeats) {
+            if (i != 1 || k == "description") && self.rows.iter().all(repeats) {
                 continue;
             }
             let column = crate::io::free_column_name(&taken, k);
@@ -753,7 +753,8 @@ mod tests {
 
     #[test]
     fn exported_text_descriptions_keep_their_column_on_repeated_kml_and_kmz_round_trips() {
-        let descriptions = [Some("<b>Café & \"river\"</b>\nSecond line"), Some("]]> <plain> & text"), None];
+        let descriptions =
+            [Some("<b>Café & \"river\"</b>\nSecond line"), Some("]]> <plain> & text"), Some("a\rb"), Some("a\r\nb"), Some(""), None];
         for ext in ["kml", "kmz"] {
             let mut ds = Dataset::new(
                 "places",
@@ -772,7 +773,7 @@ mod tests {
                 let placemarks: Vec<_> =
                     doc.descendants().filter(|n| n.has_tag_name(("http://www.opengis.net/kml/2.2", "Placemark"))).collect();
                 for (pm, expected) in placemarks.iter().zip(descriptions) {
-                    assert_eq!(child_text(pm, "description").as_deref(), expected);
+                    assert_eq!(child(pm, "description").map(|n| text_of(&n)).as_deref(), expected);
                 }
                 let (bytes, skipped) = crate::io::write_bytes(&ds, ext).unwrap();
                 assert_eq!(skipped, 0);
@@ -788,6 +789,37 @@ mod tests {
                     assert_eq!(back.value(row, fi), &expected, "{ext}, row {row}");
                 }
                 ds = back.clone();
+            }
+        }
+    }
+
+    #[test]
+    fn exported_case_variant_descriptions_stay_distinct_from_the_canonical_column() {
+        for variant in ["Description", "DESCRIPTION"] {
+            for other in ["Keep case", "Another value"] {
+                for ext in ["kml", "kmz"] {
+                    let mut ds = Dataset::new(
+                        "places",
+                        GeometryType::Point,
+                        vec![
+                            Field::new("name", FieldType::Text),
+                            Field::new("description", FieldType::Text),
+                            Field::new(variant, FieldType::Text),
+                        ],
+                    );
+                    ds.push(
+                        Some(Geometry::Point(Coord::new(1.0, 2.0))),
+                        vec![Value::Text("Place".into()), Value::Text("Keep case".into()), Value::Text(other.into())],
+                    );
+                    let (bytes, _) = crate::io::write_bytes(&ds, ext).unwrap();
+                    let layers = read(&format!("places.{ext}"), &bytes).unwrap();
+                    let layer = &layers[0];
+                    let back = &layer.dataset;
+                    assert_eq!(back.value(0, back.field_index("description").unwrap()), &Value::Text("Keep case".into()));
+                    assert_eq!(back.value(0, back.field_index(&format!("{variant}_1")).unwrap()), &Value::Text(other.into()));
+                    assert_eq!(layer.report.messages.len(), 1, "{:?}", layer.report.messages);
+                    assert!(layer.report.messages[0].contains(&format!("'{variant}' → '{variant}_1'")), "{:?}", layer.report.messages);
+                }
             }
         }
     }
