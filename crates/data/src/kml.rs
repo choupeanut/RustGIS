@@ -769,6 +769,7 @@ mod tests {
             Some("]]> <plain> & text"),
             Some("a\rb"),
             Some("a\r\nb"),
+            Some("a\u{7f}b\u{85}c\u{9f}"),
             Some(" padded \n"),
             Some("\t  \r\n "),
             Some(""),
@@ -808,6 +809,20 @@ mod tests {
                     assert_eq!(back.value(row, fi), &expected, "{ext}, row {row}");
                 }
                 ds = back.clone();
+            }
+        }
+    }
+
+    #[test]
+    fn unrepresentable_description_characters_are_refused_with_their_count_and_location() {
+        for bad in ['\0', '\u{b}', '\u{1b}', '\u{1f}', '\u{fffe}', '\u{ffff}'] {
+            let mut ds = Dataset::new("places", GeometryType::Point, vec![Field::new("description", FieldType::Text)]);
+            ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text(format!("a{bad}b{bad}c"))]);
+            let error = crate::interop::to_kml(&ds, None).unwrap_err().to_string();
+            assert!(error.contains("places") && error.contains(&format!("feature id {}", ds.features[0].id)), "{error}");
+            assert!(error.contains("description: 2 character(s)") && error.contains(&format!("U+{:04X}", bad as u32)), "{error}");
+            for ext in ["kml", "kmz"] {
+                assert_eq!(crate::io::write_bytes(&ds, ext).unwrap_err().to_string(), error);
             }
         }
     }
