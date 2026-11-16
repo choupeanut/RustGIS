@@ -201,9 +201,18 @@ fn child<'a, 'i>(n: &Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
     n.children().find(|c| c.is_element() && local(c) == name)
 }
 
+/// The text and CDATA children joined, keeping description whitespace as data.
+fn raw_text_of(n: &Node) -> String {
+    n.children().filter(|c| c.is_text()).filter_map(|c| c.text()).collect()
+}
+
 /// The text of an element (its text and CDATA children joined), trimmed.
 fn text_of(n: &Node) -> String {
-    n.children().filter(|c| c.is_text()).filter_map(|c| c.text()).collect::<String>().trim().to_string()
+    raw_text_of(n).trim().to_string()
+}
+
+fn data_text(n: &Node, key: &str) -> String {
+    if key == "description" { raw_text_of(n) } else { text_of(n) }
 }
 
 fn child_text(n: &Node, name: &str) -> Option<String> {
@@ -436,8 +445,10 @@ impl Reader {
         if let Some(ext) = child(pm, "ExtendedData") {
             for d in ext.descendants().filter(|d| d.is_element()) {
                 let pair = match local(&d) {
-                    "Data" => d.attribute("name").map(|k| (k.to_string(), child_text(&d, "value").unwrap_or_default())),
-                    "SimpleData" => d.attribute("name").map(|k| (k.to_string(), text_of(&d))),
+                    "Data" => {
+                        d.attribute("name").map(|k| (k.to_string(), child(&d, "value").map(|v| data_text(&v, k)).unwrap_or_default()))
+                    }
+                    "SimpleData" => d.attribute("name").map(|k| (k.to_string(), data_text(&d, k))),
                     _ => None,
                 };
                 if let Some((k, v)) = pair.filter(|(k, _)| !k.trim().is_empty()) {
@@ -463,7 +474,7 @@ impl Reader {
         let style = self.style_for(pm);
         let folder = folders.iter().filter(|f| !f.is_empty()).cloned().collect::<Vec<_>>().join(" / ");
         let name = child_text(pm, "name");
-        let description = child(pm, "description").map(|n| text_of(&n));
+        let description = child(pm, "description").map(|n| raw_text_of(&n));
         // A placemark mixing kinds (a MultiGeometry of a point and a line) gives one feature per
         // kind, each in its layer.
         let mut any = false;
@@ -753,8 +764,16 @@ mod tests {
 
     #[test]
     fn exported_text_descriptions_keep_their_column_on_repeated_kml_and_kmz_round_trips() {
-        let descriptions =
-            [Some("<b>Café & \"river\"</b>\nSecond line"), Some("]]> <plain> & text"), Some("a\rb"), Some("a\r\nb"), Some(""), None];
+        let descriptions = [
+            Some("<b>Café & \"river\"</b>\nSecond line"),
+            Some("]]> <plain> & text"),
+            Some("a\rb"),
+            Some("a\r\nb"),
+            Some(" padded \n"),
+            Some("\t  \r\n "),
+            Some(""),
+            None,
+        ];
         for ext in ["kml", "kmz"] {
             let mut ds = Dataset::new(
                 "places",
@@ -773,7 +792,7 @@ mod tests {
                 let placemarks: Vec<_> =
                     doc.descendants().filter(|n| n.has_tag_name(("http://www.opengis.net/kml/2.2", "Placemark"))).collect();
                 for (pm, expected) in placemarks.iter().zip(descriptions) {
-                    assert_eq!(child(pm, "description").map(|n| text_of(&n)).as_deref(), expected);
+                    assert_eq!(child(pm, "description").map(|n| raw_text_of(&n)).as_deref(), expected);
                 }
                 let (bytes, skipped) = crate::io::write_bytes(&ds, ext).unwrap();
                 assert_eq!(skipped, 0);
@@ -790,6 +809,24 @@ mod tests {
                 }
                 ds = back.clone();
             }
+        }
+    }
+
+    #[test]
+    fn description_copies_keep_whitespace_in_data_and_simple_data() {
+        for copy in [
+            "<Data name=\"description\"><value> padded &#13;\n</value></Data>",
+            "<SchemaData><SimpleData name=\"description\"> padded &#13;\n</SimpleData></SchemaData>",
+        ] {
+            let xml = format!(
+                "<kml><Placemark><description> padded &#13;\n</description><ExtendedData>{copy}</ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark></kml>"
+            );
+            let layers = read("spaces.kml", xml.as_bytes()).unwrap();
+            let layer = &layers[0];
+            assert!(layer.report.messages.is_empty(), "{:?}", layer.report.messages);
+            let ds = &layer.dataset;
+            assert_eq!(ds.value(0, ds.field_index("description").unwrap()), &Value::Text(" padded \r\n".into()));
+            assert!(ds.field_index("description_1").is_none());
         }
     }
 
