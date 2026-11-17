@@ -5,7 +5,8 @@ use std::path::Path;
 use rustgis_data::{GeometryType, photo};
 use rustgis_map::symbology::{ClassRef, ClassStyle, LABEL_SIZE, MAX_STROKES};
 use rustgis_map::{
-    ClassMethod, Glyph, HiddenFills, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, NoFill, Placements, Ramp, Renderer, Rgba,
+    ClassMethod, Glyph, HiddenFills, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, NoFill, Picture, Placements, Ramp,
+    Renderer, Rgba,
 };
 use serde_json::{Value, json};
 
@@ -403,10 +404,22 @@ pub fn commands() -> Vec<C> {
             if shape.is_some() && ch.is_some() {
                 return Err("give a shape or a char, not both".into());
             }
+            // Refused before the image is kept: a call that changes nothing keeps nothing.
+            if p.get("image").is_some_and(|v| !v.is_null()) && (shape.is_some() || ch.is_some()) {
+                return Err("give a shape, a char or an image, only one".into());
+            }
+            let id = s.layer_id(p)?;
+            s.map().layer(id).ok_or("no such layer")?;
+            // Decoded here, on the UI thread, as any command runs: at most 2 MiB of base64, whose
+            // declared size is checked before the decoder, capped in memory, runs.
+            let image = picture(p)?;
             with(s, p, |l| {
                 l.renderer.map_symbols(|sym| {
                     if let Some(m) = shape {
                         sym.marker = m;
+                    }
+                    if let Some(img) = image {
+                        sym.marker = Marker::Picture(img);
                     }
                     let was = match sym.marker {
                         Marker::Char(g) => Some(g),
@@ -425,7 +438,7 @@ pub fn commands() -> Vec<C> {
             })
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_feature_layer)
-        .params(r#"{"layer"?, "shape"?: "circle"|"square"|"triangle"|"diamond"|"star", "char"?: text (a character of a font as the marker, its first; sized by the font's em), "font"?: text (the installed family the character is drawn from; "" or one not installed: the label font), "size"?: number}"#),
+        .params(r#"{"layer"?, "shape"?: "circle"|"square"|"triangle"|"diamond"|"star", "char"?: text (a character of a font as the marker, its first; sized by the font's em), "font"?: text (the installed family the character is drawn from; "" or one not installed: the label font), "image"?: text (a PNG or JPEG image as base64, at most 2 MiB, as the marker: as wide as the size, as tall as its proportions make it; its fill and outline don't show), "size"?: number}"#),
         C::new("layer.transparency", "Transparency", "Style › Effects", |s, p| {
             let t = f(p, "value").ok_or("value (0–100) is required")?.clamp(0.0, 100.0) as f32;
             with(s, p, |l| l.transparency = t)
@@ -1352,6 +1365,27 @@ fn character(p: &Value) -> Result<Option<char>, String> {
         Some(Value::String(c)) => c.chars().next().map(Some).ok_or_else(|| "char is a character".into()),
         Some(_) => Err("char is a character".into()),
     }
+}
+
+/// `layer.marker`'s `image`: a PNG or JPEG image as base64, which must decode.
+fn picture(p: &Value) -> Result<Option<Picture>, String> {
+    const WHAT: &str = "image is a PNG or JPEG image as base64";
+    let b64 = match p.get("image") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(b64)) => b64.trim(),
+        Some(_) => return Err(WHAT.into()),
+    };
+    if b64.len() > rustgis_map::symbology::MAX_PICTURE_BYTES {
+        return Err(format!("image is at most {} MiB of base64", rustgis_map::symbology::MAX_PICTURE_BYTES >> 20));
+    }
+    if !rustgis_render::picture_marker_readable(b64) {
+        return Err(WHAT.into());
+    }
+    let picture = Picture::new(b64);
+    if picture.is_default() {
+        return Err("no more images can be kept this session: restart RustGIS to use another".into());
+    }
+    Ok(Some(picture))
 }
 
 /// A stroke's `markers`: what it draws along the line instead of a line, and where.
@@ -3525,6 +3559,9 @@ pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     }
     for notice in crate::project::label_losses::layer_notices(text, &layer, true) {
         s.notify(notice, false);
+    }
+    for notice in crate::project::picture_notices([&layer], []) {
+        s.notify_text(notice, false);
     }
     // A binding in a file is no authority to use a login here.
     crate::s3_connections::clear_bindings(layer.addresses_mut());
@@ -5788,6 +5825,14 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
     if let Some(walls) = s.map_mut().view.terrain.as_mut().and_then(|t| t.block.as_mut()).and_then(|b| b.walls_layer.as_mut()) {
         replace(walls);
     }
+    // And the lines point labels are turned square to (#2263).
+    for layer in &mut s.map_mut().layers {
+        for class in std::iter::once(&mut layer.labels.default).chain(layer.labels.classes.iter_mut()) {
+            if let Some(to) = &mut class.square_to {
+                replace(&mut to.layer);
+            }
+        }
+    }
     // Elevation and Map Series selectors compare spellings exactly, even though lookup does not.
     if case_only {
         if s.map().layers.iter().filter(|l| l.name.eq_ignore_ascii_case(old)).count() == 1 {
@@ -5928,8 +5973,27 @@ pub(crate) fn drop_layers(s: &mut Session, ids: &[u32]) {
     m.release_tiles(ids);
     m.layers.retain(|l| !ids.contains(&l.id));
     terrain_follows_removal(s, &names);
+    square_labels_follow_removal(s, &names);
     for n in &names {
         legends_follow_layer(s, n, None);
+    }
+}
+
+/// After layers called `names` are removed: point labels turned square to one of them (#2263)
+/// keep its name, so a layer of that name brings their line back, and are placed as auto
+/// meanwhile: said once a layer, as for the terrain's water.
+fn square_labels_follow_removal(s: &mut Session, names: &[String]) {
+    for n in names {
+        let used = s.map().layers.iter().flat_map(|l| l.labels.in_order()).any(|c| {
+            c.placement == rustgis_map::LabelPlacement::Perpendicular
+                && c.square_to.as_ref().is_some_and(|t| t.layer.eq_ignore_ascii_case(n))
+        });
+        if used && named_layers(s, n) == 0 {
+            s.notify(
+                format!("Labels: the perpendicular labels' line layer '{n}' was removed, so they are placed as auto until a layer of that name comes back"),
+                false,
+            );
+        }
     }
 }
 
@@ -5987,6 +6051,7 @@ fn remove(s: &mut Session, p: &Value) -> CmdResult {
     let next = m.layers.get(at.min(m.layers.len().saturating_sub(1))).map(|l| l.id);
     s.set_layer_selection(next.into_iter().collect(), next);
     terrain_follows_removal(s, &names);
+    square_labels_follow_removal(s, &names);
     // A legend that left it out forgets it.
     for name in names {
         legends_follow_layer(s, &name, None);

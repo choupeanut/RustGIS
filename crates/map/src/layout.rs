@@ -841,8 +841,12 @@ fn is_one_column(columns: &usize) -> bool {
     *columns == 1
 }
 
+/// The dark grey a scale bar draws in by default, and a legend, colorbar, table or chart without
+/// an ink of its own ([`ElementKind::ink`]).
+pub const INK: Rgba = Rgba::rgb(0x22, 0x22, 0x22);
+
 fn ink() -> Rgba {
-    Rgba::rgb(0x22, 0x22, 0x22)
+    INK
 }
 
 fn white() -> Rgba {
@@ -973,6 +977,10 @@ pub enum ElementKind {
         /// keeps its name everywhere else. A layer not in it shows its name.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         labels: BTreeMap<String, String>,
+        /// The colour of its text and lines (#2257); none, the dark grey of [`INK`]. Left out
+        /// when none, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Rgba>,
     },
     /// The colour scale of a raster layer in a frame's map: a gradient bar for a stretch, steps
     /// for classes, a block per value for unique values and colour tables (#326).
@@ -997,6 +1005,10 @@ pub enum ElementKind {
         /// the top of a vertical one (the bottom by default).
         #[serde(default)]
         reverse: bool,
+        /// The colour of its text and lines (#2257); none, the dark grey of [`INK`]. Left out
+        /// when none, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Rgba>,
     },
     /// Text; dynamic tokens (`{page}`, `{date}`, `{scale}`…) expand when drawn.
     Text {
@@ -1039,6 +1051,10 @@ pub enum ElementKind {
         layer: String,
         #[serde(default = "rows")]
         rows: usize,
+        /// The colour of its text and lines (#2257); none, the dark grey of [`INK`]. Left out
+        /// when none, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Rgba>,
     },
     /// A bar chart of a numeric field of a layer in a frame's map, one bar per feature.
     Chart {
@@ -1048,6 +1064,10 @@ pub enum ElementKind {
         /// Bars are labelled with this field, if set.
         #[serde(default)]
         label: Option<String>,
+        /// The colour of its labels and title (#2257); none, the dark grey of [`INK`]. Its bars
+        /// keep their own colour. Left out when none, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Rgba>,
     },
     /// A rectangle drawn on the page (a neatline or a backdrop). `width` is the outline's, in
     /// points (0: none).
@@ -1160,6 +1180,40 @@ impl ElementKind {
             ElementKind::Line { .. } => "Line",
         }
     }
+    /// Whether an element of this kind takes a background (#2257): all but a map frame, which
+    /// draws its map and the paper behind it itself.
+    pub fn takes_background(&self) -> bool {
+        !matches!(self, ElementKind::MapFrame { .. })
+    }
+
+    /// Whether an element of this kind takes an ink (#2257): a legend, colorbar, table or chart,
+    /// whose text and lines are otherwise dark grey. The other kinds' colours are their own options.
+    pub fn takes_ink(&self) -> bool {
+        matches!(self, ElementKind::Legend { .. } | ElementKind::Colorbar { .. } | ElementKind::Table { .. } | ElementKind::Chart { .. })
+    }
+
+    /// Its ink, when it [takes one](ElementKind::takes_ink) and has one; `None` draws in [`INK`].
+    pub fn ink(&self) -> Option<Rgba> {
+        match self {
+            ElementKind::Legend { color, .. }
+            | ElementKind::Colorbar { color, .. }
+            | ElementKind::Table { color, .. }
+            | ElementKind::Chart { color, .. } => *color,
+            _ => None,
+        }
+    }
+
+    /// Its ink to change, when it [takes one](ElementKind::takes_ink).
+    pub fn ink_mut(&mut self) -> Option<&mut Option<Rgba>> {
+        match self {
+            ElementKind::Legend { color, .. }
+            | ElementKind::Colorbar { color, .. }
+            | ElementKind::Table { color, .. }
+            | ElementKind::Chart { color, .. } => Some(color),
+            _ => None,
+        }
+    }
+
     /// The map frame this element belongs to.
     pub fn frame(&self) -> Option<u32> {
         match self {
@@ -1189,14 +1243,73 @@ pub struct Element {
     /// Locked, it can be selected but not moved, resized, deleted or edited until unlocked.
     #[serde(default, skip_serializing_if = "is_false")]
     pub locked: bool,
+    /// The box drawn behind its content (#2257); none on a map frame, and none by default, so a
+    /// layout saved before it draws as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<Background>,
     pub kind: ElementKind,
 }
 
+/// The box drawn behind an element's content (#2257): its fill, an outline when it has a width,
+/// rounded corners, and how far it reaches past the element's box on every side. The content is
+/// drawn as without it, in the element's box.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Background {
+    /// White unless given, as `layout.update`'s `{"background": {}}` makes it.
+    #[serde(default = "white")]
+    pub fill: Rgba,
+    #[serde(default = "ink")]
+    pub outline: Rgba,
+    /// The outline's width in points; 0 (the default) draws none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub width: f64,
+    /// The corners' radius, in millimetres.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub radius: f64,
+    /// How far it reaches past the element's box on every side, in millimetres.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub padding: f64,
+}
+
+/// The widest a background's outline may be (points), as a rectangle's.
+pub const MAX_BACKGROUND_WIDTH: f64 = 50.0;
+/// The largest corner radius a background takes (mm), as a rectangle's.
+pub const MAX_BACKGROUND_RADIUS: f64 = 50.0;
+/// The farthest a background reaches past its element's box on each side (mm).
+pub const MAX_BACKGROUND_PADDING: f64 = 50.0;
+
+impl Background {
+    /// Filled with `fill`: no outline, square corners, no padding.
+    pub fn filled(fill: Rgba) -> Background {
+        Background { fill, outline: ink(), width: 0.0, radius: 0.0, padding: 0.0 }
+    }
+
+    /// Its numbers brought into range: finite, 0 or more, at most their limits.
+    pub fn clamped(self) -> Background {
+        let keep = |v: f64, max: f64| finite_or(v, 0.0).clamp(0.0, max);
+        Background {
+            width: keep(self.width, MAX_BACKGROUND_WIDTH),
+            radius: keep(self.radius, MAX_BACKGROUND_RADIUS),
+            padding: keep(self.padding, MAX_BACKGROUND_PADDING),
+            ..self
+        }
+    }
+}
+
 impl Element {
-    /// Whether the point (mm) is on the element, its box turned as it is drawn.
+    /// Whether the point (mm) is on the element, its box turned as it is drawn; with a background,
+    /// on the background, padding included.
     pub fn contains(&self, x: f64, y: f64) -> bool {
         let (x, y) = self.unturned(x, y);
-        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+        let (bx, by, bw, bh) = self.background_box();
+        x >= bx && x <= bx + bw && y >= by && y <= by + bh
+    }
+
+    /// The box its background fills (x, y, w, h in mm, unturned): its own box grown by the
+    /// background's padding, or its own box when it has none.
+    pub fn background_box(&self) -> (f64, f64, f64, f64) {
+        let pad = self.background.map_or(0.0, |b| b.padding);
+        (self.x - pad, self.y - pad, self.w + 2.0 * pad, self.h + 2.0 * pad)
     }
 
     /// How far it is turned about its centre, in degrees clockwise: a text's `rotation`, else 0.
@@ -1319,7 +1432,7 @@ impl Layout {
         self.next_id = id.saturating_add(1);
         // Templates on tiny pages can compute sizes near zero.
         let (w, h) = (finite_or(w, 1.0).clamp(MIN_ELEMENT_MM, 5000.0), finite_or(h, 1.0).clamp(MIN_ELEMENT_MM, 5000.0));
-        self.elements.push(Element { id, name: name.into(), x, y, w, h, visible: true, locked: false, kind });
+        self.elements.push(Element { id, name: name.into(), x, y, w, h, visible: true, locked: false, background: None, kind });
         id
     }
 
@@ -1523,9 +1636,13 @@ impl Layout {
                 ElementKind::Line { width, .. } => *width = finite_or(*width, 1.0).clamp(0.1, 50.0),
                 _ => {}
             }
+            // A map frame draws its map and its paper itself: a background on one (a hand-edited
+            // file) is dropped.
+            e.background = e.background.filter(|_| e.kind.takes_background()).map(Background::clamped);
             let kind_changed = !matches!(e.kind, ElementKind::Picture { .. }) && e.kind != before.kind;
             changed.push((
                 kind_changed
+                    || e.background != before.background
                     || (e.id, &e.name, e.x, e.y, e.w, e.h, e.visible, e.locked)
                         != (before.id, &before.name, before.x, before.y, before.w, before.h, before.visible, before.locked),
                 cut,
@@ -1720,7 +1837,15 @@ pub fn color_scale(rl: &RasterLayer) -> Option<ColorScale> {
     let band = style.renderer.bands().first().copied().unwrap_or(0);
     let stats = view_stats.and_then(|s| s.first()).or_else(|| r.bands.get(band).map(|b| &b.stats))?;
     let colorizer = Colorizer::new(&style, r, view_stats);
-    let shade = matches!(style.renderer, RasterRenderer::ShadedRelief { .. }).then_some(255);
+    // A relief's bar is the colour of its flat ground: under the balanced light (#1977), flat
+    // ground's own hillshade, which keeps the ramp's colour; under the plain light, full light.
+    let shade = match style.renderer {
+        RasterRenderer::ShadedRelief { altitude, balanced: true, .. } => {
+            Some(crate::raster::hillshade(&[0.0; 9], 1.0, 1.0, 0.0, altitude, 1.0))
+        }
+        RasterRenderer::ShadedRelief { .. } => Some(255),
+        _ => None,
+    };
     let at = |v: f64| colorizer.color(&[v as f32], shade).map(Rgba);
     match &style.renderer {
         RasterRenderer::Stretch { .. } | RasterRenderer::ShadedRelief { ramp: Some(_), .. } => {
@@ -1773,6 +1898,42 @@ pub fn color_scale(rl: &RasterLayer) -> Option<ColorScale> {
 mod tests {
     use super::*;
     use crate::symbology::MAX_DASH_STEP;
+
+    /// Under the balanced light (#1977) flat ground is drawn in the ramp's own colour, so a relief's
+    /// colour bar is that colour, whatever the sun's height; under the plain light, the ramp.
+    #[test]
+    fn a_balanced_reliefs_colour_bar_is_its_flat_ground() {
+        use crate::Ramp;
+        use crate::raster::{Colorizer, RasterLayer, hillshade};
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let r =
+            Raster::new("dem", 10, 10, vec![(0..100).map(|v| v as f32).collect()], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32")
+                .unwrap();
+        for (altitude, balanced) in [(45.0, true), (20.0, true), (45.0, false)] {
+            let mut rl = RasterLayer::from_path(r.clone(), "dem.tif");
+            rl.style.renderer = RasterRenderer::ShadedRelief {
+                band: 0,
+                ramp: Some(Ramp::Terrain),
+                azimuth: 315.0,
+                altitude,
+                z_factor: 1.0,
+                shadow: 0.0,
+                sky: 0.0,
+                fill: 0.0,
+                rock: None,
+                ambient: None,
+                balanced,
+            };
+            let Some(ColorScale::Ramp { lo, hi, colors }) = color_scale(&rl) else { panic!("a ramp") };
+            let colorizer = Colorizer::new(&rl.style, &r, None);
+            let flat = if balanced { hillshade(&[0.0; 9], 1.0, 1.0, 315.0, altitude, 1.0) } else { 255 };
+            for (i, c) in colors.iter().enumerate() {
+                let v = lo + (hi - lo) * i as f64 / (colors.len() - 1) as f64;
+                assert_eq!(Some(c.0), colorizer.color(&[v as f32], Some(flat)), "{altitude}° balanced {balanced}: sample {i}");
+            }
+        }
+    }
 
     #[test]
     fn elements_are_arranged_in_the_drawing_order() {
@@ -2277,5 +2438,77 @@ mod tests {
             (1000.0, MAX_MEASURED_STEP, MIN_MEASURED_STEP)
         );
         assert_eq!(step("measured", 0.0), 0.0, "Auto");
+    }
+
+    /// A background (#2257) is left out of a saved element that has none, so older layouts read and
+    /// write as before; read back, it keeps its fill, outline, corners and padding, and a hand-edited
+    /// one is brought into range, a map frame's dropped.
+    #[test]
+    fn element_backgrounds_are_saved_read_back_and_repaired() {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let t = l.add("T", (40.0, 40.0, 20.0, 10.0), ElementKind::text("t", 12.0, Rgba::rgb(0, 0, 0), false));
+        let saved = serde_json::to_value(&l).unwrap();
+        assert!(saved["elements"][0].get("background").is_none(), "none, not written: {saved}");
+        let b = Background { fill: Rgba::new(255, 255, 255, 204), outline: Rgba::rgb(0, 0, 0), width: 0.5, radius: 1.0, padding: 1.5 };
+        l.element_mut(t).unwrap().background = Some(b);
+        let back: Layout = serde_json::from_value(serde_json::to_value(&l).unwrap()).unwrap();
+        assert_eq!(back.element(t).unwrap().background, Some(b));
+        // Only a fill given: no outline, square corners, no padding.
+        let fill: Background = serde_json::from_str(r#"{"fill":[1,2,3,255]}"#).unwrap();
+        assert_eq!(fill, Background::filled(Rgba::rgb(1, 2, 3)));
+        // An empty one is white, as `layout.update` makes `{"background": {}}`, not a file that fails to open.
+        let empty: Background = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, Background::filled(Rgba::rgb(255, 255, 255)));
+
+        let text = r#"{"name":"x","width":100,"height":100,"elements":[
+            {"id":1,"name":"f","x":0,"y":0,"w":50,"h":50,"background":{"fill":[255,0,0,255]},"kind":{"MapFrame":{"map":"M","center":{"x":0,"y":0},"scale":1000000}}},
+            {"id":2,"name":"t","x":0,"y":0,"w":10,"h":10,"background":{"fill":[255,0,0,255],"width":1e9,"radius":-3,"padding":1e300},"kind":{"Text":{"text":"t","size":12,"color":[0,0,0,255]}}},
+            {"id":3,"name":"u","x":0,"y":0,"w":10,"h":10,"background":{"fill":[255,0,0,255],"padding":2},"kind":{"Text":{"text":"u","size":12,"color":[0,0,0,255]}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}"));
+        let repairs = l.clamp();
+        assert_eq!(repairs.elements_adjusted, 2, "the frame's background and the text's numbers: {repairs:?}");
+        assert_eq!(l.element(1).unwrap().background, None, "a map frame has none");
+        let b = l.element(2).unwrap().background.unwrap();
+        assert_eq!((b.width, b.radius, b.padding), (MAX_BACKGROUND_WIDTH, 0.0, MAX_BACKGROUND_PADDING));
+        assert_eq!(l.element(3).unwrap().background.unwrap().padding, 2.0, "in range, kept");
+        assert!(l.clamp().is_empty(), "a repaired layout needs nothing more");
+    }
+
+    /// A click on an element's background picks it, padding included; without one, its box only.
+    #[test]
+    fn a_background_is_part_of_what_a_click_picks() {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let t = l.add("T", (40.0, 40.0, 20.0, 10.0), ElementKind::text("t", 12.0, Rgba::rgb(0, 0, 0), false));
+        assert_eq!(l.hit(38.0, 45.0), None);
+        l.element_mut(t).unwrap().background = Some(Background { padding: 3.0, ..Background::filled(Rgba::rgb(255, 255, 255)) });
+        assert_eq!(l.hit(38.0, 45.0), Some(t));
+        assert_eq!(l.hit(36.0, 45.0), None, "past the padding");
+        assert_eq!(l.element(t).unwrap().background_box(), (37.0, 37.0, 26.0, 16.0));
+    }
+
+    /// A legend's, colorbar's, table's or chart's ink (#2257): none in a layout saved before it,
+    /// not written when none, and read back when set. Other kinds have none to set.
+    #[test]
+    fn inks_are_saved_and_read_back() {
+        let text = r#"{"name":"x","width":100,"height":100,"elements":[
+            {"id":1,"name":"f","x":0,"y":0,"w":50,"h":50,"kind":{"MapFrame":{"map":"M","center":{"x":0,"y":0},"scale":1000000}}},
+            {"id":2,"name":"l","x":0,"y":0,"w":10,"h":10,"kind":{"Legend":{"frame":1,"title":"L"}}},
+            {"id":3,"name":"c","x":0,"y":0,"w":10,"h":10,"kind":{"Colorbar":{"frame":1}}},
+            {"id":4,"name":"t","x":0,"y":0,"w":10,"h":10,"kind":{"Table":{"frame":1,"layer":"A"}}},
+            {"id":5,"name":"g","x":0,"y":0,"w":10,"h":10,"kind":{"Chart":{"frame":1,"layer":"A","field":"n"}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}"));
+        assert!(l.elements[1..].iter().all(|e| e.kind.takes_ink() && e.kind.ink().is_none()), "the default ink in an older layout");
+        assert!(!l.elements[0].kind.takes_ink(), "a map frame has no ink");
+        let saved = serde_json::to_string(&l).unwrap();
+        assert!(!saved.contains("\"color\""), "none is not written: {saved}");
+        let white = Rgba::new(255, 255, 255, 230);
+        for e in &mut l.elements[1..] {
+            *e.kind.ink_mut().unwrap() = Some(white);
+        }
+        let back: Layout = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert!(back.elements[1..].iter().all(|e| e.kind.ink() == Some(white)), "{back:?}");
+        assert_eq!(back, l);
+        let mut text = ElementKind::text("t", 12.0, Rgba::rgb(0, 0, 0), false);
+        assert!(!text.takes_ink() && text.ink_mut().is_none(), "a text's colour is its own option");
     }
 }

@@ -433,6 +433,39 @@ fn geopackage_provenance_skips_a_replaced_path() {
     assert!(captured.inputs().is_empty());
 }
 
+/// A GeoPackage reached through a linked folder is recorded at the path opened, as macOS's
+/// temporary folder (`/var` → `/private/var`) is, its SQLite companions too; through a link to the
+/// file itself, the companions are found where SQLite puts them, beside the target.
+#[cfg(unix)]
+#[test]
+fn geopackage_provenance_keeps_a_linked_path() {
+    let folder = tempfile::tempdir().unwrap();
+    let real = folder.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let target = real.join("original.gpkg");
+    write_gpkg(&target, true);
+    std::fs::write(real.join("original.gpkg-wal"), b"wal").unwrap();
+    let inputs = |path: &Path| {
+        let source = open_path(path, None).unwrap();
+        let captured = crate::provenance::Capture::start();
+        assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
+        captured.inputs().into_iter().map(|i| i.path).collect::<Vec<String>>()
+    };
+    let resolved = std::fs::canonicalize(&target).unwrap();
+    let link = folder.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let path = link.join("original.gpkg");
+    let paths = inputs(&path);
+    assert!(paths.contains(&path.display().to_string()), "{paths:?}");
+    assert!(paths.contains(&format!("{}-wal", path.display())), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.starts_with(&resolved.display().to_string())), "{paths:?}");
+    let alias = folder.path().join("alias.gpkg");
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let paths = inputs(&alias);
+    assert!(paths.contains(&alias.display().to_string()), "{paths:?}");
+    assert!(paths.contains(&format!("{}-wal", resolved.display())), "{paths:?}");
+}
+
 /// 30 × 20 points over the world, named and numbered.
 fn points() -> Vec<(Coord, String, i64)> {
     let mut v = Vec::new();
@@ -2361,6 +2394,37 @@ fn shapefile_in_place_matches_one_read_whole() {
     }
 }
 
+/// A `.dbf`'s text read in place and whole alike: spaces before the text kept, the padding after it
+/// dropped, and `<Null>` read as null and counted (#2059).
+#[test]
+fn shapefile_text_keeps_its_leading_spaces_and_counts_null_markers() {
+    let d = dir().join("shp-text");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut ds = Dataset::new("codes", GeometryType::Point, vec![Field::new("code", FieldType::Text)]);
+    for (i, t) in [" 2535", "<Null>", "plain  ", "<null>"].into_iter().enumerate() {
+        ds.push(Some(Geometry::Point(Coord::new(i as f64, 0.0))), vec![Value::Text(t.into())]);
+    }
+    let p = d.join("codes.shp");
+    write_shapefile(&ds, &p);
+    let (whole, whole_report) = crate::io::read_path(&p).unwrap();
+    let (inplace, report) = materialize(open_path(&p, None).unwrap().as_ref()).unwrap();
+    let values: Vec<Value> = whole.features.iter().map(|f| f.attrs[0].clone()).collect();
+    assert_eq!(values, [Value::Text(" 2535".into()), Value::Null, Value::Text("plain".into()), Value::Null]);
+    assert_eq!(inplace.features, whole.features);
+    let said = "codes: 2 values written as Null were read as empty, in 'code'";
+    assert!(whole_report.messages.iter().any(|m| m == said), "{:?}", whole_report.messages);
+    assert!(report.messages.iter().any(|m| m == said), "{:?}", report.messages);
+
+    // Text without the marker says nothing.
+    let mut clean = Dataset::new("clean", GeometryType::Point, vec![Field::new("code", FieldType::Text)]);
+    clean.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text(" 2535".into())]);
+    let p = d.join("clean.shp");
+    write_shapefile(&clean, &p);
+    let (_, whole_report) = crate::io::read_path(&p).unwrap();
+    let (_, report) = materialize(open_path(&p, None).unwrap().as_ref()).unwrap();
+    assert!(whole_report.messages.iter().chain(&report.messages).all(|m| !m.contains("written as Null")), "{:?}", report.messages);
+}
+
 #[test]
 fn shapefile_in_place_reprojects_from_its_prj() {
     let d = dir().join("shp-utm");
@@ -3687,8 +3751,21 @@ fn geopackage_export_adds_and_replaces_tables_and_keeps_the_others() {
     rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE VIEW recent_permits AS SELECT * FROM permits").unwrap();
     let mut fewer = permits.clone();
     fewer.features.truncate(1);
+    // The replaced table's `last_change` (here later than now, as a pinned time can be) is moved
+    // past, so saving edits loaded before can't take the new table for the old one.
+    let stamp = |p: &Path| {
+        rusqlite::Connection::open(p)
+            .unwrap()
+            .query_row("SELECT last_change FROM gpkg_contents WHERE table_name = 'permits'", [], |r| r.get::<_, String>(0))
+            .unwrap()
+    };
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE gpkg_contents SET last_change = '2999-01-01T00:00:00.000Z' WHERE table_name = 'permits'", [])
+        .unwrap();
     let replaced = write_path_to(&fewer, &path, Crs::WebMercator, &to(GpkgMode::ReplaceTable, None)).unwrap();
     assert_eq!(replaced.1, Some(GpkgWritten { table: "permits".into(), replaced: true, dependents: vec!["recent_permits".into()] }));
+    assert_eq!(stamp(&path), "2999-01-01T00:00:00.001Z");
     assert_eq!(gpkg_tables(&path), ["owners", "parcels", "permits"]);
     let s = open_path(&path, Some("permits")).unwrap();
     assert_eq!(s.info().count, Some(1));

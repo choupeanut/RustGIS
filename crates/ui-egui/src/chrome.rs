@@ -919,6 +919,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
     Some(match id {
         "project.open" => Command("ui.open"),
         "project.save" => Command("ui.save"),
+        "edit.previewShapeConversion" => Command("ui.convertShape"),
         "project.saveAs" => Command("ui.saveAs"),
         "project.addFolder" => Command("ui.addFolder"),
         "project.fromTemplate" => OpenItem("template"),
@@ -1046,6 +1047,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "cube.catalog" | "cube.open" => Dialog("dataCubes"),
         "nationalMap.add" => Dialog("nationalMap"),
         "fieldsOfTheWorld.add" => Dialog("fieldsOfTheWorld"),
+        "copernicus.login" | "copernicus.logout" | "copernicus.status" => Dialog("copernicus"),
         "portal.add" | "portal.search" => Command("ui.searchOpenData"),
         "stac.addAsset" | "stac.addFootprints" | "stac.search" => Command("ui.stac"),
         _ => return None,
