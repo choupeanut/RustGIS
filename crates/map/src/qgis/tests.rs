@@ -3009,6 +3009,8 @@ fn text_matched_ignoring_case_is_noted_where_qgis_tells_case_apart() {
         ("./a.shp", r#"&quot;kind&quot; = 'x'"#, false),
         ("./a.shp", r#"&quot;kind&quot; LIKE 'x%'"#, true),
         ("./a.shp", r#"&quot;kind&quot; ILIKE 'x%'"#, false),
+        ("./a.shp", r#"&quot;kind&quot; &gt; 'M'"#, false),
+        ("./a.shp", r#"&quot;kind&quot; &gt; 'É'"#, true),
         ("./a.gpkg", r#"&quot;kind&quot; = '12' AND &quot;pop&quot; &gt; 5"#, false),
         ("./a.gpkg", r#"&quot;kind&quot; = 'é'"#, false),
     ] {
@@ -3022,7 +3024,7 @@ fn text_matched_ignoring_case_is_noted_where_qgis_tells_case_apart() {
     for (file, subset, noted) in [
         ("./a.gpkg", "&quot;pop&quot; NOT IN (1, NULL)", true),
         ("./a.gpkg", "&quot;pop&quot; NOT IN (1, 2)", false),
-        ("./a.shp", "&quot;pop&quot; NOT IN (1, NULL)", false),
+        ("./a.shp", "&quot;pop&quot; NOT IN (1, NULL)", true),
     ] {
         let project = format!(
             r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>{file}|layername=a|subset={subset}</datasource><layername>A</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#

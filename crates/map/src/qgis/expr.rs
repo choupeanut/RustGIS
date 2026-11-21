@@ -141,8 +141,8 @@ pub(super) enum Dialect {
     /// letters only); the rest matches exactly.
     // ponytail: a virtual layer's `LIKE` on non-ASCII letters isn't noted (read as GDAL's); add a dialect if that matters.
     Sqlite,
-    /// OGR SQL's (any other file's filter): `=`, `<>` and `IN` ignore case; `LIKE` and `<`, `>`
-    /// match exactly (GDAL 3.1 on).
+    /// OGR SQL's (any other file's filter): `=`, `<>`, `IN`, `<`, `>` and `BETWEEN` ignore the case
+    /// of ASCII letters; `LIKE` matches case exactly (GDAL 3.1 on).
     Ogr,
 }
 
@@ -161,13 +161,14 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
     let Some(tokens) = tokenize(expr) else {
         // ponytail: a filter beyond a clause is read only for its texts and which operators it has outside them, so format_date("d", 'yyyy') = 'x' is noted too; walk the parsed expression if that proves noisy.
         let chars: Vec<char> = expr.chars().collect();
-        let (mut i, mut texts, mut ascii, mut outer) = (0, false, false, String::new());
+        let (mut i, mut texts, mut ascii, mut wide, mut outer) = (0, false, false, false, String::new());
         while let Some(&c) = chars.get(i) {
             match c {
                 '"' | '\'' => match quoted(&chars, i, c) {
                     Some((text, next)) => {
                         texts |= c == '\'' && text.chars().any(cased);
                         ascii |= c == '\'' && text.chars().any(|c| c.is_ascii_alphabetic());
+                        wide |= c == '\'' && text.chars().any(|c| !c.is_ascii() && cased(c));
                         outer.push(' ');
                         i = next;
                     }
@@ -197,7 +198,7 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
         return match d {
             Dialect::Qgis => order || like || eq,
             Dialect::Sqlite => order || eq,
-            Dialect::Ogr => order || like,
+            Dialect::Ogr => (order && wide) || like,
         };
     };
     const OPS: [&str; 9] = ["=", "<>", "!=", "<", "<=", ">", ">=", "LIKE", "ILIKE"];
@@ -211,6 +212,8 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
         let ascii = s.chars().any(|c| c.is_ascii_alphabetic());
         match op.as_str() {
             "=" | "<>" | "!=" | "IN" => ascii && d != Dialect::Ogr,
+            // (OGR SQL orders text ignoring ASCII case: only other letters differ.)
+            "<" | "<=" | ">" | ">=" if d == Dialect::Ogr => s.chars().any(|c| !c.is_ascii() && cased(c)),
             "<" | "<=" | ">" | ">=" => s.chars().any(cased),
             "LIKE" if d == Dialect::Sqlite => false,
             "LIKE" => s.chars().any(cased),
@@ -375,7 +378,8 @@ mod tests {
             ("\"k\" = 'x'", true, true, false),
             ("'x' = \"k\"", true, true, false),
             ("\"k\" IN ('a', 'B')", true, true, false),
-            ("\"k\" > 'M'", true, true, true),
+            ("\"k\" > 'M'", true, true, false),
+            ("\"k\" > 'É'", true, true, true),
             ("\"k\" LIKE 'x%'", true, false, true),
             ("\"k\" LIKE 'é%'", true, false, true),
             ("\"k\" ILIKE 'x%'", false, false, false),
@@ -385,8 +389,8 @@ mod tests {
             ("format_date(\"d\", 'yyyy') = 'x'", true, true, false),
             ("\"a\" + 1 = 'x'", true, true, false),
             ("\"a\" + 1 LIKE 'x'", true, false, true),
-            ("\"k\" BETWEEN 'A' AND 'M'", true, true, true),
-            ("\"k\" NOT BETWEEN 'a' AND 'm'", true, true, true),
+            ("\"k\" BETWEEN 'A' AND 'M'", true, true, false),
+            ("\"k\" NOT BETWEEN 'a' AND 'm'", true, true, false),
             ("\"p\" BETWEEN 1 AND 5", false, false, false),
             ("left(\"n\", 1) = 'É'", false, false, false),
             ("left(\"n\", 1) > 'É'", true, true, true),

@@ -682,7 +682,7 @@ fn note_matching(layer: &str, what: &str, filters: &[(&str, expr::Dialect)], rep
     if filters.iter().any(|(f, d)| expr::case_differs(f, *d)) {
         report.approximated(layer, format!("{what}, matching text ignoring letter case where QGIS tells case apart"));
     }
-    if filters.iter().any(|(f, d)| *d != expr::Dialect::Ogr && expr::null_in_not_in(f)) {
+    if filters.iter().any(|(f, _)| expr::null_in_not_in(f)) {
         report.approximated(
             layer,
             format!("{what}, whose NOT IN list holds NULL: RustGIS skips the NULL, so it matches the features QGIS takes as unknown"),

@@ -397,11 +397,12 @@ before, the rest (functions, arithmetic, `CASE`, `@map_scale`) as they are, for 
 (see below), in filters and in data-defined symbol and label settings. One it can't read on the layer (a function or variable it
 lacks, a field the layer hasn't) is noted and left out, as is one measuring with `$area`,
 `$perimeter` or `$length`, which QGIS gives in the project's units. RustGIS matches text ignoring
-letter case (`=`, `IN`, `LIKE`, `<`, `>`, `BETWEEN`), where QGIS's rules, and `=`, `IN`, `<` and `>` in a
-GeoPackage's or virtual layer's filter, tell case apart (GDAL's `LIKE` ignores case in a GeoPackage's filter too, SQLite's in a virtual layer's ignores it for ASCII letters, and a
-Shapefile's filter, read by OGR SQL, ignores it in `=` and `IN` too); a
-layer whose filter or rules compare text that way is noted, as is a `NOT IN` list holding `NULL`,
-which QGIS takes as unknown and RustGIS skips. What RustGIS doesn't draw as QGIS does is drawn as
+letter case (`=`, `IN`, `LIKE`, `<`, `>`, `BETWEEN`), where QGIS's rules, and `=`, `IN`, `<`, `>` and
+`BETWEEN` in a GeoPackage's or virtual layer's filter, tell case apart (GDAL's `LIKE` ignores case in
+a GeoPackage's filter too, SQLite's in a virtual layer's ignores it for ASCII letters). A Shapefile's
+filter, read by OGR SQL, ignores ASCII case in `=`, `IN`, `<`, `>` and `BETWEEN` too, and tells it
+apart in `LIKE`. A layer whose filter or rules compare text that way is noted, as is a `NOT IN` list
+holding `NULL`, which QGIS takes as unknown and RustGIS skips. What RustGIS doesn't draw as QGIS does is drawn as
 near as it can, or left out, and said: the import's notes list, layer by layer, what was
 approximated (vector tile styles, text matched ignoring letter case, a memory layer's fields of kinds RustGIS hasn't as text, gradient and shapeburst fills' offsets left out and colour ramps other than gradients drawn from their first colour to their last, SVG, raster and random fills and dense brushes as a tint of their colour, SVG markers as circles,
 dashed polygon outlines solid, label halos with sharp corners drawn round and blended ones drawn
