@@ -136,9 +136,10 @@ pub(super) fn equality(expr: &str) -> Option<(String, Vec<String>)> {
 pub(super) enum Dialect {
     /// QGIS's expressions (renderer and label rules): text matches exactly, but for `ILIKE`.
     Qgis,
-    /// SQLite's as GDAL runs it (a GeoPackage's or SpatiaLite's filter, a virtual layer's): GDAL
-    /// installs a `LIKE` that ignores the case of every letter (`OGR_SQLITE_USE_CUSTOM_LIKE`);
-    /// the rest matches exactly.
+    /// SQLite's (a GeoPackage's or SpatiaLite's filter through GDAL, whose `LIKE` ignores the case
+    /// of every letter; a virtual layer's `WHERE`, plain SQLite, whose `LIKE` ignores that of ASCII
+    /// letters only); the rest matches exactly.
+    // ponytail: a virtual layer's `LIKE` on non-ASCII letters isn't noted (read as GDAL's); add a dialect if that matters.
     Sqlite,
     /// OGR SQL's (any other file's filter): `=`, `<>` and `IN` ignore case; `LIKE` and `<`, `>`
     /// match exactly (GDAL 3.1 on).
@@ -179,8 +180,12 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
         }
         // Folding the case by hand (`lower("n") = 'x'`) is how QGIS ignores it.
         let words: Vec<&str> = outer.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
-        let called =
-            |f: &str| outer.match_indices(f).any(|(at, _)| outer.get(at + f.len()..).is_some_and(|r| r.trim_start().starts_with('(')));
+        let called = |f: &str| {
+            outer.match_indices(f).any(|(at, _)| {
+                let start = outer.get(..at).is_some_and(|b| !b.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+                start && outer.get(at + f.len()..).is_some_and(|r| r.trim_start().starts_with('('))
+            })
+        };
         if !texts || called("lower") || called("upper") {
             return false;
         }
@@ -380,6 +385,7 @@ mod tests {
             ("\"a\" + 1 = 'x'", true, true, false),
             ("\"a\" + 1 LIKE 'x'", true, false, true),
             ("lower(\"n\") = 'x'", false, false, false),
+            ("flower(\"n\") = 'x'", true, true, false),
             ("upper(\"n\") LIKE '%PARK%'", false, false, false),
             ("format_date(\"d\", 'yyyy')", false, false, false),
             ("\"a\" + 1 > 2", false, false, false),
