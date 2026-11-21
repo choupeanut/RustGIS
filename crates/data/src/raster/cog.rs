@@ -531,15 +531,17 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             let bytes = tile_bytes(tw, th, per_chunk, level_bits);
             if bytes > MAX_TILE_BYTES as u64 {
                 let (mib, max) = (bytes.div_ceil(1 << 20), MAX_TILE_BYTES >> 20);
-                return Err(err(if per_chunk > 1 {
-                    format!(
-                        "tiles of {tw} × {th} pixels of {per_chunk} interleaved bands take {mib} MiB each once read, more than the {max} MiB one tile may take: write the file with smaller tiles or its bands stored apart (GDAL's BLOCKSIZE or INTERLEAVE=BAND creation options)"
-                    )
+                // Bands stored apart help only when one band's tile then fits.
+                let apart = per_chunk > 1 && tile_bytes(tw, th, 1, level_bits) <= MAX_TILE_BYTES as u64;
+                let of_bands = if per_chunk > 1 { format!(" of {per_chunk} interleaved bands") } else { String::new() };
+                let fix = if apart {
+                    "smaller tiles or its bands stored apart (GDAL's BLOCKSIZE or INTERLEAVE=BAND creation options)"
                 } else {
-                    format!(
-                        "tiles of {tw} × {th} pixels take {mib} MiB each once read, more than the {max} MiB one tile may take: write the file with smaller tiles (GDAL's BLOCKSIZE creation option)"
-                    )
-                }));
+                    "smaller tiles (GDAL's BLOCKSIZE creation option)"
+                };
+                return Err(err(format!(
+                    "tiles of {tw} × {th} pixels{of_bands} take {mib} MiB each once read, more than the {max} MiB one tile may take: write the file with {fix}"
+                )));
             }
             // Every band plane's tiles, when the bands are stored apart.
             let n = (w.div_ceil(tw) as usize).saturating_mul(h.div_ceil(th) as usize).saturating_mul(planes);
@@ -732,7 +734,7 @@ pub fn example(size: u32, tile: u32) -> Vec<u8> {
 pub struct Example {
     /// Pixels a side (at most 4096).
     pub size: u32,
-    /// Pixels a tile side (16 to 1024).
+    /// Pixels a tile side (16 to 4096).
     pub tile: u32,
     /// Bands (1 to 64): band `b` of pixel (x, y) is `(x + y + 10 b) % 256` (`% 100 − 50` in
     /// signed bytes).
@@ -807,7 +809,7 @@ impl Default for Example {
 /// A small cloud-optimised GeoTIFF as [`Example`] says, laid out as [`example`] lays it out.
 #[doc(hidden)]
 pub fn example_with(e: &Example) -> Vec<u8> {
-    let (size, tile) = (e.size.clamp(1, 4096), e.tile.clamp(16, 1024));
+    let (size, tile) = (e.size.clamp(1, 4096), e.tile.clamp(16, 4096));
     let nb = u32::from(e.bands.clamp(1, 64));
     let planes = if e.planar { nb } else { 1 };
     let per_chunk = nb / planes;
@@ -1054,6 +1056,13 @@ pub(crate) mod tests {
         assert_eq!(
             e,
             "GeoTIFF: tiles of 1024 × 1024 pixels of 9 interleaved bands take 36 MiB each once read, more than the 32 MiB one tile may take: write the file with smaller tiles or its bands stored apart (GDAL's BLOCKSIZE or INTERLEAVE=BAND creation options)"
+        );
+        // One band's tile is too large alone: storing the bands apart wouldn't help.
+        let huge = example_with(&Example { size: 4096, tile: 4096, bands: 2, no_overviews: true, ..Example::default() });
+        let e = layout(&Sparse::default().with(0, huge)).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "GeoTIFF: tiles of 4096 × 4096 pixels of 2 interleaved bands take 128 MiB each once read, more than the 32 MiB one tile may take: write the file with smaller tiles (GDAL's BLOCKSIZE creation option)"
         );
     }
 
