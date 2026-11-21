@@ -3082,6 +3082,12 @@ fn rules_matching_text_ignoring_case_are_noted_and_unique_values_are_not() {
         + label;
     read_project(&rules_layer("", &many), "/m", &mut report).unwrap();
     assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
+    // A label else rule takes what its sibling labels, and that sibling's filter counts with it
+    // even where the sibling makes no class (no text style).
+    let mut report = Report::default();
+    let siblings = r#"<rule key="1" filter="&quot;kind&quot; LIKE 'x%'"><settings/></rule><rule key="2" filter="ELSE"><settings><text-style fieldName="name"/></settings></rule>"#;
+    read_project(&rules_layer("", siblings), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 1, "{:?}", report.notes);
 }
 
 #[test]

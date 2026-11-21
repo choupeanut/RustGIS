@@ -162,46 +162,9 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
     let Some(tokens) = tokenize(expr) else {
         // Past a clause, a filter is read only for its texts and the operators outside them, so
         // `format_date("d", 'yyyy') = 'x'` is noted too; walking the parsed expression would not.
-        let chars: Vec<char> = expr.chars().collect();
-        let (mut i, mut texts, mut ascii, mut wide, mut outer) = (0, false, false, false, String::new());
-        while let Some(&c) = chars.get(i) {
-            match c {
-                '"' | '\'' => match quoted(&chars, i, c) {
-                    Some((text, next)) => {
-                        texts |= c == '\'' && text.chars().any(cased);
-                        ascii |= c == '\'' && text.chars().any(|c| c.is_ascii_alphabetic());
-                        wide |= c == '\'' && text.chars().any(|c| !c.is_ascii() && cased(c));
-                        outer.push(' ');
-                        i = next;
-                    }
-                    None => return false,
-                },
-                _ => {
-                    outer.push(c.to_ascii_lowercase());
-                    i += 1;
-                }
-            }
-        }
-        // Folding the case by hand (`lower("n") = 'x'`) is how QGIS ignores it.
-        let words: Vec<&str> = outer.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
-        let called = |f: &str| {
-            outer.match_indices(f).any(|(at, _)| {
-                let start = outer.get(..at).is_some_and(|b| !b.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
-                start && outer.get(at + f.len()..).is_some_and(|r| r.trim_start().starts_with('('))
-            })
-        };
-        if !texts || called("lower") || called("upper") {
-            return false;
-        }
-        let cmp = outer.replace("<>", " ").replace("!=", " ");
-        let order = cmp.contains(['<', '>']) || words.contains(&"between");
-        let like = words.contains(&"like");
-        let eq = (outer.contains('=') || outer.contains("<>") || words.contains(&"in")) && ascii;
-        return match d {
-            Dialect::Qgis => order || like || eq,
-            Dialect::Sqlite => order || eq,
-            Dialect::Ogr => (order && wide) || like,
-        };
+        // Each part between its `AND`s and `OR`s is read on its own, so a `lower(…)` in one of
+        // them doesn't excuse the texts in another.
+        return cut_at_joins(expr).iter().any(|part| unreadable_differs(part, d));
     };
     const OPS: [&str; 9] = ["=", "<>", "!=", "<", "<=", ">", ">=", "LIKE", "ILIKE"];
     let is_op = |t: &Token| matches!(t, Token::Word(w) if OPS.contains(&w.as_str()) || w == "IN");
@@ -224,6 +187,86 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
     })
 }
 
+/// [`case_differs`] for a filter [`tokenize`] doesn't read: its texts and the operators outside
+/// them, read by hand.
+fn unreadable_differs(expr: &str, d: Dialect) -> bool {
+    let chars: Vec<char> = expr.chars().collect();
+    let (mut i, mut texts, mut ascii, mut wide, mut outer) = (0, false, false, false, String::new());
+    while let Some(&c) = chars.get(i) {
+        match c {
+            '"' | '\'' => match quoted(&chars, i, c) {
+                Some((text, next)) => {
+                    texts |= c == '\'' && text.chars().any(cased);
+                    ascii |= c == '\'' && text.chars().any(|c| c.is_ascii_alphabetic());
+                    wide |= c == '\'' && text.chars().any(|c| !c.is_ascii() && cased(c));
+                    outer.push(' ');
+                    i = next;
+                }
+                None => return false,
+            },
+            _ => {
+                outer.push(c.to_ascii_lowercase());
+                i += 1;
+            }
+        }
+    }
+    // Folding the case by hand (`lower("n") = 'x'`) is how QGIS ignores it.
+    let words: Vec<&str> = outer.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
+    let called = |f: &str| {
+        outer.match_indices(f).any(|(at, _)| {
+            let start = outer.get(..at).is_some_and(|b| !b.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+            start && outer.get(at + f.len()..).is_some_and(|r| r.trim_start().starts_with('('))
+        })
+    };
+    if !texts || called("lower") || called("upper") {
+        return false;
+    }
+    let cmp = outer.replace("<>", " ").replace("!=", " ");
+    let order = cmp.contains(['<', '>']) || words.contains(&"between");
+    let like = words.contains(&"like");
+    let eq = (outer.contains('=') || outer.contains("<>") || words.contains(&"in")) && ascii;
+    match d {
+        Dialect::Qgis => order || like || eq,
+        Dialect::Sqlite => order || eq,
+        Dialect::Ogr => (order && wide) || like,
+    }
+}
+
+/// `expr` cut at its `AND`s and `OR`s outside quotes, each part a filter of its own; an `AND` of
+/// a `BETWEEN` stays with it. An unclosed quote leaves `expr` whole.
+fn cut_at_joins(expr: &str) -> Vec<String> {
+    let chars: Vec<char> = expr.chars().collect();
+    let (mut parts, mut part, mut between, mut i) = (Vec::new(), String::new(), false, 0);
+    while let Some(&c) = chars.get(i) {
+        if c == '"' || c == '\'' {
+            let Some((_, next)) = quoted(&chars, i, c) else { return vec![expr.to_string()] };
+            part.extend(chars.get(i..next).unwrap_or_default());
+            i = next;
+        } else if c.is_alphanumeric() || c == '_' {
+            let start = i;
+            while chars.get(i).is_some_and(|d| d.is_alphanumeric() || *d == '_') {
+                i += 1;
+            }
+            let word: String = chars.get(start..i).unwrap_or_default().iter().collect();
+            match word.to_ascii_lowercase().as_str() {
+                "between" => between = true,
+                "and" if between => between = false,
+                "and" | "or" => {
+                    parts.push(std::mem::take(&mut part));
+                    continue;
+                }
+                _ => {}
+            }
+            part.push_str(&word);
+        } else {
+            part.push(c);
+            i += 1;
+        }
+    }
+    parts.push(part);
+    parts
+}
+
 /// Whether `expr` has `NOT IN` with NULL in its list: RustGIS skips the NULL, so a value in none
 /// of the rest is kept, where SQL (QGIS's expressions, SQLite) takes it as unknown.
 pub(super) fn null_in_not_in(expr: &str) -> bool {
@@ -231,18 +274,28 @@ pub(super) fn null_in_not_in(expr: &str) -> bool {
     if expr.chars().count() > MAX_LEN {
         return false;
     }
-    let Some(tokens) = tokenize(expr) else { return false };
-    let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(x)) if x == w);
-    (0..tokens.len()).any(|i| {
-        word(tokens.get(i), "NOT")
-            && word(tokens.get(i + 1), "IN")
-            && word(tokens.get(i + 2), "(")
-            && tokens
-                .get(i + 3..)
-                .unwrap_or_default()
-                .iter()
-                .take_while(|t| !matches!(t, Token::Word(w) if w == ")"))
-                .any(|t| matches!(t, Token::Word(w) if w == "NULL"))
+    // Read by its words outside quotes, so a filter that doesn't tokenize (a function, `BETWEEN`,
+    // arithmetic) is read as well.
+    let chars: Vec<char> = expr.chars().collect();
+    let mut outer = String::with_capacity(expr.len());
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        if c == '"' || c == '\'' {
+            let Some((_, next)) = quoted(&chars, i, c) else { return false };
+            outer.push(' ');
+            i = next;
+        } else {
+            outer.push(c.to_ascii_lowercase());
+            i += 1;
+        }
+    }
+    let spaced = outer.replace('(', " ( ").replace(')', " ) ").replace(',', " ");
+    let words: Vec<&str> = spaced.split_whitespace().collect();
+    (0..words.len()).any(|i| {
+        words.get(i) == Some(&"not")
+            && words.get(i + 1) == Some(&"in")
+            && words.get(i + 2) == Some(&"(")
+            && words.get(i + 3..).unwrap_or_default().iter().take_while(|w| **w != ")").any(|w| *w == "null")
     })
 }
 
@@ -401,6 +454,11 @@ mod tests {
             ("lower(\"n\") = 'x'", false, false, false),
             ("flower(\"n\") = 'x'", true, true, false),
             ("upper(\"n\") LIKE '%PARK%'", false, false, false),
+            // A folded field in one part doesn't excuse the texts of the others.
+            ("\"k\" = 'x' AND lower(\"n\") = 'x'", true, true, false),
+            ("lower(\"n\") = 'x' OR \"k\" = 'x'", true, true, false),
+            ("\"k\" BETWEEN 'A' AND 'M' AND upper(\"n\") = 'X'", true, true, false),
+            ("upper(\"n\") = 'X' OR \"k\" LIKE 'x%'", true, false, true),
             ("format_date(\"d\", 'yyyy')", false, false, false),
             ("\"a\" + 1 > 2", false, false, false),
             ("@map_scale < 5000", false, false, false),
@@ -410,8 +468,18 @@ mod tests {
         }
         assert!(!case_differs(&format!("k = 'x' AND {}", "a".repeat(MAX_LEN)), Qgis));
         assert!(null_in_not_in("\"p\" NOT IN (1, NULL)") && null_in_not_in("p not in (null)"));
+        // A filter that doesn't tokenize (a function, arithmetic, `BETWEEN`) is read the same way.
+        assert!(null_in_not_in("\"a\" + 1 > 2 AND \"p\" NOT IN (1, NULL)"));
+        assert!(null_in_not_in("upper(\"n\") = 'x' OR p NOT IN ('a', NULL)"));
         assert!(
             !null_in_not_in("\"p\" NOT IN (1, 2)") && !null_in_not_in("\"p\" IN (1, NULL)") && !null_in_not_in("p IN (1) AND q IS NULL")
+        );
+        // Text 'NULL', a field named NULL, and a NULL outside the list don't count.
+        assert!(
+            !null_in_not_in("\"p\" NOT IN ('NULL', 2)")
+                && !null_in_not_in("\"NULL\" NOT IN (1, 2)")
+                && !null_in_not_in("p NOT IN (1) OR q IS NULL")
+                && !null_in_not_in("a + 1 > 2 AND p NOT IN (1, 2)")
         );
     }
 

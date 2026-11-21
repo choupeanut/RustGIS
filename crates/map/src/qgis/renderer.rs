@@ -549,7 +549,7 @@ fn by_expression<'r>(drawn: &[&'r Rule], style: &mut Style, report: &mut Report,
 
 /// The filters of `siblings` and the rules under them (nested at most 32 deep, as
 /// `super::siblings` reads them).
-fn sibling_filters<'s>(siblings: &'s [super::Sibling], out: &mut Vec<&'s str>) {
+pub(super) fn sibling_filters<'s>(siblings: &'s [super::Sibling], out: &mut Vec<&'s str>) {
     for s in siblings {
         out.extend(s.filter.as_deref());
         sibling_filters(s.under.as_deref().unwrap_or_default(), out);
