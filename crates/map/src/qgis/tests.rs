@@ -3064,6 +3064,11 @@ fn rules_matching_text_ignoring_case_are_noted_and_unique_values_are_not() {
     let rules = r#"<rule key="1" filter="&quot;value&quot; &gt; 1" symbol="0"/><rule key="2" filter="&quot;value&quot; &gt; 2" symbol="1"/><rule key="3" filter="&quot;kind&quot; LIKE 'x%'" symbol="9"/>"#;
     read_project(&rules_layer(rules, ""), "/m", &mut report).unwrap();
     assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
+    // But an else rule takes what its siblings don't draw, so their filters count with it.
+    let mut report = Report::default();
+    let rules = r#"<rule key="1" filter="&quot;value&quot; &gt; 1" symbol="0"/><rule key="3" filter="&quot;kind&quot; LIKE 'x%'" symbol="9"/><rule key="4" filter="ELSE" symbol="1" scalemaxdenom="50000"/>"#;
+    read_project(&rules_layer(rules, ""), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 1, "{:?}", report.notes);
     // Label rules likewise: one without settings isn't imported.
     let mut report = Report::default();
     let bare = r#"<rule key="1" filter="&quot;kind&quot; = 'x'"/>"#;

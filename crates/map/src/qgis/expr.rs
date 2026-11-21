@@ -196,7 +196,7 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
         let cmp = outer.replace("<>", " ").replace("!=", " ");
         let order = cmp.contains(['<', '>']) || words.contains(&"between");
         let like = words.contains(&"like");
-        let eq = (cmp.contains('=') || words.contains(&"in")) && ascii;
+        let eq = (outer.contains('=') || outer.contains("<>") || words.contains(&"in")) && ascii;
         return match d {
             Dialect::Qgis => order || like || eq,
             Dialect::Sqlite => order || eq,
@@ -391,6 +391,8 @@ mod tests {
             ("format_date(\"d\", 'yyyy') = 'x'", true, true, false),
             ("\"a\" + 1 = 'x'", true, true, false),
             ("\"a\" + 1 LIKE 'x'", true, false, true),
+            ("\"a\" + 1 <> 'x'", true, true, false),
+            ("(\"n\" || '') != 'x'", true, true, false),
             ("\"k\" BETWEEN 'A' AND 'M'", true, true, false),
             ("\"k\" NOT BETWEEN 'a' AND 'm'", true, true, false),
             ("\"p\" BETWEEN 1 AND 5", false, false, false),
