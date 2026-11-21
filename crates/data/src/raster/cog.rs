@@ -526,7 +526,9 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             if tw == 0 || th == 0 {
                 return Err(err(format!("tiles of {tw} × {th} pixels")));
             }
-            let bytes = tile_bytes(tw, th, per_chunk, bits);
+            let level_bits =
+                dec.find_tag_unsigned_vec::<u16>(Tag::BitsPerSample).ok().flatten().and_then(|v| v.first().copied()).unwrap_or(bits);
+            let bytes = tile_bytes(tw, th, per_chunk, level_bits);
             if bytes > MAX_TILE_BYTES as u64 {
                 let (mib, max) = (bytes.div_ceil(1 << 20), MAX_TILE_BYTES >> 20);
                 return Err(err(if per_chunk > 1 {
@@ -756,6 +758,8 @@ pub struct Example {
     pub wide: bool,
     /// 64-bit float samples of the byte value, but 1e39 (past `f32`'s range) for 255.
     pub huge: bool,
+    /// The overviews' samples tagged 64-bit floats (their tags only: the tiles stay bytes).
+    pub huge_overviews: bool,
     /// With `classes`: the full image grey (PhotometricInterpretation 1) with the colour table
     /// anyway, which isn't a palette; its overviews stay palette images.
     pub stray: bool,
@@ -789,6 +793,7 @@ impl Default for Example {
             lossy: false,
             wide: false,
             huge: false,
+            huge_overviews: false,
             stray: false,
             no_table: false,
             sparse: false,
@@ -876,6 +881,7 @@ pub fn example_with(e: &Example) -> Vec<u8> {
     let mut ifds: Vec<Vec<(u16, V)>> = Vec::new();
     for (i, &s) in sizes.iter().enumerate() {
         let n = (s.div_ceil(tile) * s.div_ceil(tile) * planes) as usize;
+        let tagged_huge = e.huge || (e.huge_overviews && i > 0);
         let mut t = vec![
             (254u16, V::L(vec![if i == 0 { 0 } else { 1 }])),
             (256, V::L(vec![s])),
@@ -883,7 +889,7 @@ pub fn example_with(e: &Example) -> Vec<u8> {
             (
                 258,
                 V::S(vec![
-                    if e.huge {
+                    if tagged_huge {
                         64
                     } else if e.wide {
                         32
@@ -915,7 +921,7 @@ pub fn example_with(e: &Example) -> Vec<u8> {
         if e.int8 || e.wide {
             t.push((339, V::S(vec![2; nb as usize])));
         }
-        if e.huge {
+        if tagged_huge {
             t.push((339, V::S(vec![3; nb as usize])));
         }
         if i == 0 {
@@ -1049,6 +1055,16 @@ pub(crate) mod tests {
             e,
             "GeoTIFF: tiles of 1024 × 1024 pixels of 9 interleaved bands take 36 MiB each once read, more than the 32 MiB one tile may take: write the file with smaller tiles or its bands stored apart (GDAL's BLOCKSIZE or INTERLEAVE=BAND creation options)"
         );
+    }
+
+    /// Each level's tiles count at its own bit depth: a 64-bit overview of a byte image is refused.
+    #[test]
+    fn an_overview_counts_its_own_bit_depth() {
+        let base = Example { size: 1024, tile: 512, bands: 18, ..Example::default() };
+        let (_, l) = layout_of(&example_with(&base));
+        assert_eq!(l.levels.len(), 2);
+        let e = layout(&Sparse::default().with(0, example_with(&Example { huge_overviews: true, ..base }))).unwrap_err().to_string();
+        assert!(e.contains("tiles of 512 × 512 pixels of 18 interleaved bands take 36 MiB each once read"), "{e}");
     }
 
     /// A tile's bytes once read: values as `f32`, 64-bit ones as 8 bytes; a hostile header saturates.
