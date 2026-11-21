@@ -696,6 +696,8 @@ fn note_matching(layer: &str, what: &str, filters: &[(&str, expr::Dialect)], rep
 /// one is, whatever their order, up to [`MAX_VIRTUAL_CHAIN`] deep. The rest are left as they are,
 /// for the import to note.
 fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
+    // The parts (filter, dialect) of each virtual layer read so far, by id, for one on it to carry.
+    let mut chained: std::collections::HashMap<String, Vec<(String, expr::Dialect)>> = std::collections::HashMap::new();
     for _ in 0..MAX_VIRTUAL_CHAIN {
         let mut changed = false;
         for i in 0..layers.len() {
@@ -725,11 +727,17 @@ fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
                 q => (q.clone(), false),
             };
             let filter = filter.clone();
-            let base_provider = match from {
+            // The parts of the layer below, when it is a virtual one read before; else its filter.
+            let below = match from {
+                source::VirtualFrom::Layer(id) => chained.get(id).cloned(),
+                _ => None,
+            };
+            let provider = match from {
                 source::VirtualFrom::Layer(id) => layers.iter().find(|l| &l.id == id).map(|l| l.provider.clone()),
                 _ => None,
             }
             .unwrap_or_default();
+            let base_parts = |a: &String| below.clone().unwrap_or_else(|| vec![(a.clone(), dialect(&path, &provider))]);
             let Some(l) = layers.get_mut(i) else { continue };
             if base_too_long {
                 report.skipped(&l.name, "the filter of the layer its virtual layer selects from, which is too long to read");
@@ -747,16 +755,16 @@ fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
             let subset = match (subset, filter) {
                 (Some(a), Some(b)) if a.len() + b.len() + 11 > max => {
                     report.skipped(&l.name, "its filter (from its virtual layer's query) with that of the layer it selects from, too long to read together: the latter alone kept");
-                    parts.push((a.clone(), dialect(&path, &base_provider)));
+                    parts.extend(base_parts(&a));
                     Some(a)
                 }
                 (Some(a), Some(b)) => {
-                    parts.push((a.clone(), dialect(&path, &base_provider)));
+                    parts.extend(base_parts(&a));
                     parts.push((b.clone(), expr::Dialect::Sqlite));
                     Some(format!("({a}) AND ({b})"))
                 }
                 (Some(a), None) => {
-                    parts.push((a.clone(), dialect(&path, &base_provider)));
+                    parts.extend(base_parts(&a));
                     Some(a)
                 }
                 (None, b) => {
@@ -768,9 +776,10 @@ fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
             l.definition_query =
                 definition_query(&resolved, &l.name, "from its virtual layer's query and the layer it selects from", report);
             if l.definition_query.is_some() {
-                let parts: Vec<(&str, expr::Dialect)> = parts.iter().map(|(q, d)| (q.as_str(), *d)).collect();
-                note_matching(&l.name, "its filter (from its virtual layer's query and the layer it selects from)", &parts, report);
+                let seen: Vec<(&str, expr::Dialect)> = parts.iter().map(|(q, d)| (q.as_str(), *d)).collect();
+                note_matching(&l.name, "its filter (from its virtual layer's query and the layer it selects from)", &seen, report);
             }
+            chained.insert(l.id.clone(), parts);
             l.source = resolved;
             changed = true;
         }

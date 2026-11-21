@@ -3057,6 +3057,24 @@ fn rules_matching_text_ignoring_case_are_noted_and_unique_values_are_not() {
     let rules = r#"<rule key="1" filter="&quot;kind&quot; = 'x'" symbol="0"/><rule key="2" filter="&quot;kind&quot; = 'y'" symbol="1"/>"#;
     read_project(&rules_layer(rules, ""), "/m", &mut report).unwrap();
     assert!(!report.notes.iter().any(|n| n.text.contains("its rules,")), "{:?}", report.notes);
+    // Only rules the import keeps are noted: one whose symbol can't be read isn't kept.
+    let mut report = Report::default();
+    let rules = r#"<rule key="1" filter="&quot;value&quot; &gt; 1" symbol="0"/><rule key="2" filter="&quot;value&quot; &gt; 2" symbol="1"/><rule key="3" filter="&quot;kind&quot; LIKE 'x%'" symbol="9"/>"#;
+    read_project(&rules_layer(rules, ""), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
+    // Label rules likewise: one without settings isn't imported.
+    let mut report = Report::default();
+    let bare = r#"<rule key="1" filter="&quot;kind&quot; = 'x'"/>"#;
+    read_project(&rules_layer("", bare), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
+    // Nor one past the 64 classes read.
+    let mut report = Report::default();
+    let many: String = (0..64)
+        .map(|k| format!(r#"<rule key="n{k}" filter="&quot;n&quot; = 1"><settings><text-style fieldName="name"/></settings></rule>"#))
+        .collect::<String>()
+        + label;
+    read_project(&rules_layer("", &many), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
 }
 
 #[test]
@@ -3078,6 +3096,22 @@ fn a_virtual_layer_filter_matching_text_ignoring_case_is_noted() {
         let mut report = Report::default();
         read_project(&qgs, "/d", &mut report).unwrap();
         assert_eq!(letter_case_notes(&report, "v"), usize::from(noted), "{base}: {:?}", report.notes);
+    }
+    // A virtual layer on a virtual layer reads the parts of the one below under their dialects.
+    for (base, v1, noted) in [
+        ("./a.shp|layername=a", "SELECT%20*%20FROM%20b%20WHERE%20kind%20%3D%20'x'", true),
+        ("./a.gpkg|layername=a|subset=kind LIKE 'x%'", "SELECT%20*%20FROM%20b", false),
+        ("./a.shp|layername=a|subset=kind = 'x'", "SELECT%20*%20FROM%20b", false),
+    ] {
+        let qgs = format!(
+            "<qgis><projectlayers>{}{}{}</projectlayers></qgis>",
+            layer("v2", "virtual", "?layer_ref=v1:b&amp;query=SELECT%20*%20FROM%20b"),
+            layer("v1", "virtual", &format!("?layer_ref=base:b&amp;query={v1}")),
+            layer("base", "ogr", base),
+        );
+        let mut report = Report::default();
+        read_project(&qgs, "/d", &mut report).unwrap();
+        assert_eq!(letter_case_notes(&report, "v2"), usize::from(noted), "{base}: {:?}", report.notes);
     }
 }
 

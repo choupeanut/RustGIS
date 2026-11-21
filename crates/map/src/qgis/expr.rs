@@ -161,12 +161,13 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
     let Some(tokens) = tokenize(expr) else {
         // ponytail: a filter beyond a clause is read only for its texts and which operators it has outside them, so format_date("d", 'yyyy') = 'x' is noted too; walk the parsed expression if that proves noisy.
         let chars: Vec<char> = expr.chars().collect();
-        let (mut i, mut texts, mut outer) = (0, false, String::new());
+        let (mut i, mut texts, mut ascii, mut outer) = (0, false, false, String::new());
         while let Some(&c) = chars.get(i) {
             match c {
                 '"' | '\'' => match quoted(&chars, i, c) {
                     Some((text, next)) => {
                         texts |= c == '\'' && text.chars().any(cased);
+                        ascii |= c == '\'' && text.chars().any(|c| c.is_ascii_alphabetic());
                         outer.push(' ');
                         i = next;
                     }
@@ -190,9 +191,9 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
             return false;
         }
         let cmp = outer.replace("<>", " ").replace("!=", " ");
-        let order = cmp.contains(['<', '>']);
+        let order = cmp.contains(['<', '>']) || words.contains(&"between");
         let like = words.contains(&"like");
-        let eq = cmp.contains('=') || words.contains(&"in");
+        let eq = (cmp.contains('=') || words.contains(&"in")) && ascii;
         return match d {
             Dialect::Qgis => order || like || eq,
             Dialect::Sqlite => order || eq,
@@ -384,6 +385,11 @@ mod tests {
             ("format_date(\"d\", 'yyyy') = 'x'", true, true, false),
             ("\"a\" + 1 = 'x'", true, true, false),
             ("\"a\" + 1 LIKE 'x'", true, false, true),
+            ("\"k\" BETWEEN 'A' AND 'M'", true, true, true),
+            ("\"k\" NOT BETWEEN 'a' AND 'm'", true, true, true),
+            ("\"p\" BETWEEN 1 AND 5", false, false, false),
+            ("left(\"n\", 1) = 'É'", false, false, false),
+            ("left(\"n\", 1) > 'É'", true, true, true),
             ("lower(\"n\") = 'x'", false, false, false),
             ("flower(\"n\") = 'x'", true, true, false),
             ("upper(\"n\") LIKE '%PARK%'", false, false, false),
