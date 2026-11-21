@@ -139,7 +139,8 @@ pub(super) enum Dialect {
     /// SQLite's (a GeoPackage's or SpatiaLite's filter through GDAL, whose `LIKE` ignores the case
     /// of every letter; a virtual layer's `WHERE`, plain SQLite, whose `LIKE` ignores that of ASCII
     /// letters only); the rest matches exactly.
-    // ponytail: a virtual layer's `LIKE` on non-ASCII letters isn't noted (read as GDAL's); add a dialect if that matters.
+    // A virtual layer's `LIKE` on non-ASCII letters isn't noted (it is read as GDAL's): a dialect
+    // of its own would tell the two apart.
     Sqlite,
     /// OGR SQL's (any other file's filter): `=`, `<>`, `IN`, `<`, `>` and `BETWEEN` ignore the case
     /// of ASCII letters; `LIKE` matches case exactly (GDAL 3.1 on).
@@ -159,7 +160,8 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
         return false;
     }
     let Some(tokens) = tokenize(expr) else {
-        // ponytail: a filter beyond a clause is read only for its texts and which operators it has outside them, so format_date("d", 'yyyy') = 'x' is noted too; walk the parsed expression if that proves noisy.
+        // Past a clause, a filter is read only for its texts and the operators outside them, so
+        // `format_date("d", 'yyyy') = 'x'` is noted too; walking the parsed expression would not.
         let chars: Vec<char> = expr.chars().collect();
         let (mut i, mut texts, mut ascii, mut wide, mut outer) = (0, false, false, false, String::new());
         while let Some(&c) = chars.get(i) {

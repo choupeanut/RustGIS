@@ -667,7 +667,7 @@ fn definition_query(source: &Source, name: &str, what: &str, report: &mut Report
 /// The dialect of a file's filter: SQLite's for the `spatialite` provider, a GeoPackage or a
 /// SQLite database, OGR SQL's for the rest.
 fn dialect(path: &str, provider: &str) -> expr::Dialect {
-    // ponytail: an `ogr` SpatiaLite file is told by its extension; one named otherwise reads as OGR SQL's.
+    // An `ogr` SpatiaLite file is told by its extension; one named otherwise reads as OGR SQL's.
     let ext = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
     if provider == "spatialite" || matches!(ext.as_str(), "gpkg" | "sqlite" | "sqlite3" | "db" | "spatialite") {
         expr::Dialect::Sqlite
