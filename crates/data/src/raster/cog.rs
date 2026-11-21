@@ -26,8 +26,8 @@ const MAX_TILES: usize = 4 << 20;
 /// How many tiles all the levels hold together (their offsets and lengths are kept, 16 bytes a
 /// tile): about 128 MB at most.
 const MAX_TOTAL_TILES: usize = 8 << 20;
-/// The largest tile, in bytes once read: each value as the `f32` it is kept as (8 bytes for
-/// 64-bit data, decoded so first).
+/// The largest tile, in bytes once read: each value as the `f32` it is kept as, a 64-bit one as
+/// the 8 bytes it is decoded to before that.
 const MAX_TILE_BYTES: usize = 32 << 20;
 /// The most bytes held from a file's header (its IFDs and their tag arrays).
 pub const MAX_HEADER: u64 = 32 << 20;
