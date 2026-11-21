@@ -38,7 +38,8 @@ const HEAD: u64 = 64 << 10;
 const STEP: u64 = 256 << 10;
 /// The most header reads before giving up.
 const MAX_ROUNDS: usize = 12;
-/// The last byte position a range request can name: servers read positions as signed 64-bit.
+/// The last byte position a header read may start at: far past any real file, and far enough from
+/// `u64::MAX` that a position plus a read's length never overflows.
 const MAX_AT: u64 = u64::MAX >> 1;
 /// The most COG tiles one map tile may need (past that, a coarser overview is read).
 const MAX_PER_TILE: usize = 16;
@@ -2068,11 +2069,11 @@ mod tests {
     /// Positions stay `u64`, as they are on wasm32.
     fn layout_by_parts(parts: &[(u64, &[u8])]) -> Result<(Box<Layout>, usize, u64), usize> {
         let part = |a: u64, len: u64| -> Vec<u8> {
-            let Some((at, bytes)) = parts.iter().find(|(at, bytes)| *at <= a && a - *at < bytes.len() as u64) else {
+            let Some((at, bytes)) = parts.iter().find(|(at, bytes)| *at <= a && a.saturating_sub(*at) < bytes.len() as u64) else {
                 return Vec::new();
             };
-            let from = usize::try_from(a - *at).unwrap_or(usize::MAX);
-            let to = usize::try_from(a - *at + len).unwrap_or(usize::MAX).min(bytes.len());
+            let from = usize::try_from(a.saturating_sub(*at)).unwrap_or(usize::MAX);
+            let to = usize::try_from(a.saturating_sub(*at).saturating_add(len)).unwrap_or(usize::MAX).min(bytes.len());
             bytes.get(from..to).unwrap_or_default().to_vec()
         };
         let mut have = Sparse::default().with(0, part(0, HEAD));
@@ -2193,7 +2194,7 @@ mod tests {
         assert_eq!(layout.levels.len(), 1);
         assert_eq!(layout.levels[0].offsets.len(), 160_000);
         assert_eq!(layout.levels[0].width, 102_400);
-        // The IFD and its tile index, then nothing more: 4 reads measured, well under the 12 allowed.
+        // The IFD and its tile index, then nothing more: 4 reads after the first measured, well under the 12 allowed.
         assert!(rounds <= 6, "{rounds} reads");
         // Only what the header holds is read, not the 3 GiB before it.
         assert!(held <= file.len() as u64, "{held} bytes held of a {}-byte header", file.len());
@@ -2213,7 +2214,7 @@ mod tests {
         assert_eq!(header_read(&have, MAX_AT + 1, MAX_AT + 513, 0), None);
         assert_eq!(header_read(&have, u64::MAX - 8, u64::MAX, 0), None);
         assert_eq!(header_read(&have, far, far + 512, MAX_ROUNDS), None, "the rounds are still counted");
-        let full = Sparse::default().with(0, vec![0; cog::MAX_HEADER as usize]);
+        let full = Sparse::default().with(0, vec![0; usize::try_from(cog::MAX_HEADER).unwrap_or_default()]);
         assert_eq!(header_read(&full, far, far + 512, 0), None, "so are the bytes held");
         // A read stops where a part already read starts.
         assert_eq!(header_read(&have.with(far + 1000, vec![0; 8]), far, far + 512, 0), Some(1000));
