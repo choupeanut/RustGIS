@@ -13922,8 +13922,16 @@ fn a_projects_water_fields_its_layer_lost_are_cleared_as_it_opens() {
             f.name = "cota".into();
         }
     }
+    for m in p.maps.iter_mut() {
+        if let Some(f) = m.layers.iter_mut().find(|l| l.name == lagos).and_then(|l| l.dataset.fields.iter_mut().find(|x| x.name == "prof"))
+        {
+            f.ty = FieldType::Text;
+        }
+    }
     let o = open(&p);
     assert_eq!(said(&o, "2 maps have a terrain water level field"), 1, "{:?}", o.notices);
+    let list = "2 maps have a block water depth field that isn't a numeric field of their water layer: Map ('prof' of 'lagos', its walls showing no water), Map 2 ('prof' of 'lagos', its walls showing no water)";
+    assert_eq!(said(&o, list), 1, "{:?}", o.notices);
     // Water layer missing: left alone.
     let mut p = s.project.clone();
     p.maps[0].layers.retain(|l| l.name != lagos);
