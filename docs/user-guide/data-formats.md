@@ -172,7 +172,10 @@ stores, files read through GDAL): four or more bands open as the first in grey, 
 or more used to open as red, green and blue. A palette image without its colour table is drawn in
 grey, and says so. Planar files (bands stored
 apart), 8- to 64-bit integer and floating-point data, signed-byte data and bottom-up images work
-too. A dated series of GeoTIFFs (an address with date placeholders), a data cube's files and
+too. A tile may take up to 32 MiB once read, each value as 4 bytes (8 for 64-bit data): a
+512-pixel tile holds up to 32 bands stored together (16 of 64-bit data). A file with larger tiles
+is refused, saying so; written with smaller tiles or its bands stored apart, it opens. A dated
+series of GeoTIFFs (an address with date placeholders), a data cube's files and
 AlphaEarth's embeddings are tile layers that follow the time slider or dequantise their values;
 see [Satellite embeddings](web-data.md#satellite-embeddings).
 A GeoTIFF in strips, a rotated image or an unsupported tiled image downloads whole, as does a
