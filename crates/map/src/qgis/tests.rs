@@ -1663,6 +1663,7 @@ fn a_rule_based_renderer_classes_each_feature_by_the_first_rule_it_meets() {
     assert!(e.contains("(length(\"name\") > 3) THEN 'fn'"), "kept as QGIS wrote it: {e}");
     assert!(e.contains("(\"value\" < 50) AND (\"kind\" = 'c') THEN 'inner'"), "the parent's filter too: {e}");
     assert!(!report.notes.iter().any(|n| n.text.contains("rules") && !n.text.contains("letter case")), "{:?}", report.notes);
+    assert_eq!(letter_case_notes(&report, "points"), 1, "{:?}", report.notes);
     assert_eq!(s.rules.len(), 4);
 
     let mut l = rule_points(&[("a", 10, "ab"), ("b", 60, "xy"), ("c", 20, "abcd"), ("c", 20, "ab"), ("z", 99, "ab")]);
@@ -3001,7 +3002,10 @@ fn text_matched_ignoring_case_is_noted_where_qgis_tells_case_apart() {
         ("./a.gpkg", r#"&quot;kind&quot; IN ('a', 'B')"#, true),
         ("./a.gpkg", r#"&quot;name&quot; &gt; 'M'"#, true),
         ("./a.gpkg", r#"&quot;kind&quot; LIKE 'x%'"#, false),
-        ("./a.gpkg", r#"&quot;kind&quot; LIKE 'é%'"#, true),
+        ("./a.gpkg", r#"&quot;kind&quot; LIKE 'é%'"#, false),
+        ("./a.gpkg", r#"lower(&quot;kind&quot;) = 'x'"#, false),
+        ("./a.gpkg", r#"upper(&quot;kind&quot;) LIKE '%PARK%'"#, false),
+        ("./a.gpkg", r#"format_date(&quot;d&quot;, 'yyyy') IS NULL"#, false),
         ("./a.shp", r#"&quot;kind&quot; = 'x'"#, false),
         ("./a.shp", r#"&quot;kind&quot; LIKE 'x%'"#, true),
         ("./a.shp", r#"&quot;kind&quot; ILIKE 'x%'"#, false),
@@ -3015,9 +3019,13 @@ fn text_matched_ignoring_case_is_noted_where_qgis_tells_case_apart() {
         read_project(&project, "/maps", &mut report).unwrap();
         assert_eq!(letter_case_notes(&report, "A"), usize::from(noted), "{file} {subset}: {:?}", report.notes);
     }
-    for (subset, noted) in [("&quot;pop&quot; NOT IN (1, NULL)", true), ("&quot;pop&quot; NOT IN (1, 2)", false)] {
+    for (file, subset, noted) in [
+        ("./a.gpkg", "&quot;pop&quot; NOT IN (1, NULL)", true),
+        ("./a.gpkg", "&quot;pop&quot; NOT IN (1, 2)", false),
+        ("./a.shp", "&quot;pop&quot; NOT IN (1, NULL)", false),
+    ] {
         let project = format!(
-            r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>./a.gpkg|layername=a|subset={subset}</datasource><layername>A</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+            r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>{file}|layername=a|subset={subset}</datasource><layername>A</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
         );
         let mut report = Report::default();
         read_project(&project, "/maps", &mut report).unwrap();
@@ -3071,4 +3079,21 @@ fn a_virtual_layer_filter_matching_text_ignoring_case_is_noted() {
         read_project(&qgs, "/d", &mut report).unwrap();
         assert_eq!(letter_case_notes(&report, "v"), usize::from(noted), "{base}: {:?}", report.notes);
     }
+}
+
+/// A virtual layer's filter dropped for being too long to read together with its base's isn't
+/// noted for.
+#[test]
+fn a_dropped_virtual_filter_is_not_noted_for_letter_case() {
+    let max = rustgis_data::query::MAX_LEN;
+    let base = format!("value &gt; {}", "9".repeat(max - 60));
+    let qgs = format!(
+        r#"<qgis><projectlayers><maplayer type="vector"><id>v</id><datasource>?layer_ref=base:b&amp;query=SELECT%20*%20FROM%20b%20WHERE%20kind%20%3D%20'{}x'</datasource><layername>v</layername><provider>virtual</provider></maplayer>
+        <maplayer type="vector"><id>base</id><datasource>./a.shp|subset={base}</datasource><layername>base</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#,
+        "y".repeat(100)
+    );
+    let mut report = Report::default();
+    read_project(&qgs, "/d", &mut report).unwrap();
+    assert!(report.notes.iter().any(|n| n.layer == "v" && n.text.contains("too long to read together")), "{:?}", report.notes);
+    assert_eq!(letter_case_notes(&report, "v"), 0, "{:?}", report.notes);
 }

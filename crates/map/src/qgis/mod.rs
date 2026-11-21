@@ -605,7 +605,7 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
         if definition_query.is_some()
             && let Source::File { path, subset: Some(q), .. } = &source
         {
-            note_matching(&name, "its filter (subset string)", &[(q, dialect(path))], report);
+            note_matching(&name, "its filter (subset string)", &[(q, dialect(path, &provider))], report);
         }
         let style = read_style_node(ml, &name, report);
         let annotations = if kind == "annotation" { annotation::read(ml, dir, &name, report) } else { Vec::new() };
@@ -664,12 +664,16 @@ fn definition_query(source: &Source, name: &str, what: &str, report: &mut Report
     }
 }
 
-/// The dialect of an `ogr` file's filter: SQLite's for a GeoPackage or SQLite database, OGR SQL's
-/// for the rest.
-fn dialect(path: &str) -> expr::Dialect {
-    // ponytail: by extension; a SpatiaLite file named otherwise reads as OGR SQL's.
+/// The dialect of a file's filter: SQLite's for the `spatialite` provider, a GeoPackage or a
+/// SQLite database, OGR SQL's for the rest.
+fn dialect(path: &str, provider: &str) -> expr::Dialect {
+    // ponytail: an `ogr` SpatiaLite file is told by its extension; one named otherwise reads as OGR SQL's.
     let ext = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
-    if matches!(ext.as_str(), "gpkg" | "sqlite" | "sqlite3" | "db" | "spatialite") { expr::Dialect::Sqlite } else { expr::Dialect::Ogr }
+    if provider == "spatialite" || matches!(ext.as_str(), "gpkg" | "sqlite" | "sqlite3" | "db" | "spatialite") {
+        expr::Dialect::Sqlite
+    } else {
+        expr::Dialect::Ogr
+    }
 }
 
 /// Notes, once for `layer`, where `filters` (each read under its dialect) match otherwise in
@@ -679,8 +683,10 @@ fn note_matching(layer: &str, what: &str, filters: &[(&str, expr::Dialect)], rep
         report.approximated(layer, format!("{what}, matching text ignoring letter case where QGIS tells case apart"));
     }
     if filters.iter().any(|(f, d)| *d != expr::Dialect::Ogr && expr::null_in_not_in(f)) {
-        report
-            .approximated(layer, format!("{what}, whose NOT IN list holds NULL: RustGIS skips the NULL, keeping features QGIS leaves out"));
+        report.approximated(
+            layer,
+            format!("{what}, whose NOT IN list holds NULL: RustGIS skips the NULL, so it matches the features QGIS takes as unknown"),
+        );
     }
 }
 
@@ -719,13 +725,11 @@ fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
                 q => (q.clone(), false),
             };
             let filter = filter.clone();
-            let mut parts: Vec<(String, expr::Dialect)> = Vec::new();
-            if let Some(q) = subset.as_ref().filter(|q| q.len() <= max) {
-                parts.push((q.clone(), dialect(&path)));
+            let base_provider = match from {
+                source::VirtualFrom::Layer(id) => layers.iter().find(|l| &l.id == id).map(|l| l.provider.clone()),
+                _ => None,
             }
-            if let Some(f) = filter.as_ref().filter(|f| f.len() <= max) {
-                parts.push((f.clone(), expr::Dialect::Sqlite));
-            }
+            .unwrap_or_default();
             let Some(l) = layers.get_mut(i) else { continue };
             if base_too_long {
                 report.skipped(&l.name, "the filter of the layer its virtual layer selects from, which is too long to read");
@@ -738,13 +742,27 @@ fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
                 }
                 f => f,
             };
+            // What the combined filter holds, each part under its own dialect.
+            let mut parts: Vec<(String, expr::Dialect)> = Vec::new();
             let subset = match (subset, filter) {
                 (Some(a), Some(b)) if a.len() + b.len() + 11 > max => {
                     report.skipped(&l.name, "its filter (from its virtual layer's query) with that of the layer it selects from, too long to read together: the latter alone kept");
+                    parts.push((a.clone(), dialect(&path, &base_provider)));
                     Some(a)
                 }
-                (Some(a), Some(b)) => Some(format!("({a}) AND ({b})")),
-                (a, b) => a.or(b),
+                (Some(a), Some(b)) => {
+                    parts.push((a.clone(), dialect(&path, &base_provider)));
+                    parts.push((b.clone(), expr::Dialect::Sqlite));
+                    Some(format!("({a}) AND ({b})"))
+                }
+                (Some(a), None) => {
+                    parts.push((a.clone(), dialect(&path, &base_provider)));
+                    Some(a)
+                }
+                (None, b) => {
+                    parts.extend(b.iter().map(|f| (f.clone(), expr::Dialect::Sqlite)));
+                    b
+                }
             };
             let resolved = Source::File { path, layer, subset, ignored };
             l.definition_query =

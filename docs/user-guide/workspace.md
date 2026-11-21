@@ -397,8 +397,9 @@ before, the rest (functions, arithmetic, `CASE`, `@map_scale`) as they are, for 
 (see below), in filters and in data-defined symbol and label settings. One it can't read on the layer (a function or variable it
 lacks, a field the layer hasn't) is noted and left out, as is one measuring with `$area`,
 `$perimeter` or `$length`, which QGIS gives in the project's units. RustGIS matches text ignoring
-letter case (`=`, `IN`, `LIKE`, `<`, `>`), where QGIS's rules and a GeoPackage's or virtual layer's
-filter tell case apart (a Shapefile's filter, read by OGR, ignores case in `=` and `IN` too); a
+letter case (`=`, `IN`, `LIKE`, `<`, `>`), where QGIS's rules, and `=`, `IN`, `<` and `>` in a
+GeoPackage's or virtual layer's filter, tell case apart (GDAL's `LIKE` ignores case there too, and a
+Shapefile's filter, read by OGR SQL, ignores it in `=` and `IN` too); a
 layer whose filter or rules compare text that way is noted, as is a `NOT IN` list holding `NULL`,
 which QGIS takes as unknown and RustGIS skips. What RustGIS doesn't draw as QGIS does is drawn as
 near as it can, or left out, and said: the import's notes list, layer by layer, what was

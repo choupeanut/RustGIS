@@ -136,8 +136,9 @@ pub(super) fn equality(expr: &str) -> Option<(String, Vec<String>)> {
 pub(super) enum Dialect {
     /// QGIS's expressions (renderer and label rules): text matches exactly, but for `ILIKE`.
     Qgis,
-    /// SQLite's (a GeoPackage's or SpatiaLite's filter, a virtual layer's): `LIKE` ignores the case
-    /// of ASCII letters; the rest matches exactly.
+    /// SQLite's as GDAL runs it (a GeoPackage's or SpatiaLite's filter, a virtual layer's): GDAL
+    /// installs a `LIKE` that ignores the case of every letter (`OGR_SQLITE_USE_CUSTOM_LIKE`);
+    /// the rest matches exactly.
     Sqlite,
     /// OGR SQL's (any other file's filter): `=`, `<>` and `IN` ignore case; `LIKE` and `<`, `>`
     /// match exactly (GDAL 3.1 on).
@@ -157,24 +158,41 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
         return false;
     }
     let Some(tokens) = tokenize(expr) else {
-        // ponytail: a filter beyond a clause is read only for its texts, so upper("n") = 'X' is noted too; walk the parsed expression if that proves noisy.
+        // ponytail: a filter beyond a clause is read only for its texts and which operators it has outside them, so format_date("d", 'yyyy') = 'x' is noted too; walk the parsed expression if that proves noisy.
         let chars: Vec<char> = expr.chars().collect();
-        let mut i = 0;
+        let (mut i, mut texts, mut outer) = (0, false, String::new());
         while let Some(&c) = chars.get(i) {
             match c {
                 '"' | '\'' => match quoted(&chars, i, c) {
                     Some((text, next)) => {
-                        if c == '\'' && text.chars().any(cased) {
-                            return true;
-                        }
+                        texts |= c == '\'' && text.chars().any(cased);
+                        outer.push(' ');
                         i = next;
                     }
                     None => return false,
                 },
-                _ => i += 1,
+                _ => {
+                    outer.push(c.to_ascii_lowercase());
+                    i += 1;
+                }
             }
         }
-        return false;
+        // Folding the case by hand (`lower("n") = 'x'`) is how QGIS ignores it.
+        let words: Vec<&str> = outer.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
+        let called =
+            |f: &str| outer.match_indices(f).any(|(at, _)| outer.get(at + f.len()..).is_some_and(|r| r.trim_start().starts_with('(')));
+        if !texts || called("lower") || called("upper") {
+            return false;
+        }
+        let cmp = outer.replace("<>", " ").replace("!=", " ");
+        let order = cmp.contains(['<', '>']);
+        let like = words.contains(&"like");
+        let eq = cmp.contains('=') || words.contains(&"in");
+        return match d {
+            Dialect::Qgis => order || like || eq,
+            Dialect::Sqlite => order || eq,
+            Dialect::Ogr => order || like,
+        };
     };
     const OPS: [&str; 9] = ["=", "<>", "!=", "<", "<=", ">", ">=", "LIKE", "ILIKE"];
     let is_op = |t: &Token| matches!(t, Token::Word(w) if OPS.contains(&w.as_str()) || w == "IN");
@@ -188,7 +206,7 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
         match op.as_str() {
             "=" | "<>" | "!=" | "IN" => ascii && d != Dialect::Ogr,
             "<" | "<=" | ">" | ">=" => s.chars().any(cased),
-            "LIKE" if d == Dialect::Sqlite => s.chars().any(|c| !c.is_ascii() && cased(c)),
+            "LIKE" if d == Dialect::Sqlite => false,
             "LIKE" => s.chars().any(cased),
             _ => false,
         }
@@ -353,12 +371,17 @@ mod tests {
             ("\"k\" IN ('a', 'B')", true, true, false),
             ("\"k\" > 'M'", true, true, true),
             ("\"k\" LIKE 'x%'", true, false, true),
-            ("\"k\" LIKE 'é%'", true, true, true),
+            ("\"k\" LIKE 'é%'", true, false, true),
             ("\"k\" ILIKE 'x%'", false, false, false),
             ("\"k\" = '12' AND \"p\" > 5", false, false, false),
             ("\"k\" = 'é'", false, false, false),
             ("\"p\" > 5 AND \"k\" = 'x'", true, true, false),
-            ("upper(\"n\") = 'X'", true, true, true),
+            ("format_date(\"d\", 'yyyy') = 'x'", true, true, false),
+            ("\"a\" + 1 = 'x'", true, true, false),
+            ("\"a\" + 1 LIKE 'x'", true, false, true),
+            ("lower(\"n\") = 'x'", false, false, false),
+            ("upper(\"n\") LIKE '%PARK%'", false, false, false),
+            ("format_date(\"d\", 'yyyy')", false, false, false),
             ("\"a\" + 1 > 2", false, false, false),
             ("@map_scale < 5000", false, false, false),
             ("\"X\" || '1' = '1'", false, false, false),
