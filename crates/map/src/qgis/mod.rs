@@ -602,6 +602,11 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
         let kind = ml.attribute("type").unwrap_or_default().to_string();
         let vector = kind == "vector";
         let definition_query = definition_query(&source, &name, "subset string", report);
+        if definition_query.is_some()
+            && let Source::File { path, subset: Some(q), .. } = &source
+        {
+            note_matching(&name, "its filter (subset string)", &[(q, dialect(path))], report);
+        }
         let style = read_style_node(ml, &name, report);
         let annotations = if kind == "annotation" { annotation::read(ml, dir, &name, report) } else { Vec::new() };
         layers.push((
@@ -659,6 +664,26 @@ fn definition_query(source: &Source, name: &str, what: &str, report: &mut Report
     }
 }
 
+/// The dialect of an `ogr` file's filter: SQLite's for a GeoPackage or SQLite database, OGR SQL's
+/// for the rest.
+fn dialect(path: &str) -> expr::Dialect {
+    // ponytail: by extension; a SpatiaLite file named otherwise reads as OGR SQL's.
+    let ext = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    if matches!(ext.as_str(), "gpkg" | "sqlite" | "sqlite3" | "db" | "spatialite") { expr::Dialect::Sqlite } else { expr::Dialect::Ogr }
+}
+
+/// Notes, once for `layer`, where `filters` (each read under its dialect) match otherwise in
+/// RustGIS than in QGIS. `what` names them: "its filter (subset string)", "its rules".
+fn note_matching(layer: &str, what: &str, filters: &[(&str, expr::Dialect)], report: &mut Report) {
+    if filters.iter().any(|(f, d)| expr::case_differs(f, *d)) {
+        report.approximated(layer, format!("{what}, matching text ignoring letter case where QGIS tells case apart"));
+    }
+    if filters.iter().any(|(f, d)| *d != expr::Dialect::Ogr && expr::null_in_not_in(f)) {
+        report
+            .approximated(layer, format!("{what}, whose NOT IN list holds NULL: RustGIS skips the NULL, keeping features QGIS leaves out"));
+    }
+}
+
 /// Virtual layers that select every column of one layer, with or without a `WHERE` clause, read
 /// as that layer's file with the clause as its filter (with the layer's own filter too, when it
 /// is another of the project's layers). A virtual layer on another such one is read once that
@@ -694,6 +719,13 @@ fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
                 q => (q.clone(), false),
             };
             let filter = filter.clone();
+            let mut parts: Vec<(String, expr::Dialect)> = Vec::new();
+            if let Some(q) = subset.as_ref().filter(|q| q.len() <= max) {
+                parts.push((q.clone(), dialect(&path)));
+            }
+            if let Some(f) = filter.as_ref().filter(|f| f.len() <= max) {
+                parts.push((f.clone(), expr::Dialect::Sqlite));
+            }
             let Some(l) = layers.get_mut(i) else { continue };
             if base_too_long {
                 report.skipped(&l.name, "the filter of the layer its virtual layer selects from, which is too long to read");
@@ -717,6 +749,10 @@ fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
             let resolved = Source::File { path, layer, subset, ignored };
             l.definition_query =
                 definition_query(&resolved, &l.name, "from its virtual layer's query and the layer it selects from", report);
+            if l.definition_query.is_some() {
+                let parts: Vec<(&str, expr::Dialect)> = parts.iter().map(|(q, d)| (q.as_str(), *d)).collect();
+                note_matching(&l.name, "its filter (from its virtual layer's query and the layer it selects from)", &parts, report);
+            }
             l.source = resolved;
             changed = true;
         }

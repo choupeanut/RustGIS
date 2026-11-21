@@ -416,6 +416,9 @@ fn rules(r: Node, layer: &str, style: &mut Style, report: &mut Report, sym: &Sym
     }
     // Any other rules: Unique Values classed by the first rule a feature meets, each a class.
     if by_expression(&drawn, style, report, &sym) {
+        let f: Vec<(&str, expr::Dialect)> =
+            drawn.iter().flat_map(|r| r.filters.iter()).map(|f| (f.as_str(), expr::Dialect::Qgis)).collect();
+        super::note_matching(layer, "its rules", &f, report);
         return;
     }
     report.approximated(

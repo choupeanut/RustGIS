@@ -79,6 +79,13 @@ pub(super) fn read(l: Node, geometry: Option<&str>, layer: &str, report: &mut Re
                 };
                 classes.extend(class(settings, &name, where_, r.scales, geometry, layer, report));
             }
+            let f: Vec<(&str, expr::Dialect)> = rules
+                .iter()
+                .filter(|r| r.node.attribute("active") != Some("0"))
+                .flat_map(|r| r.filters.iter())
+                .map(|f| (f.as_str(), expr::Dialect::Qgis))
+                .collect();
+            super::note_matching(layer, "its label rules", &f, report);
         }
         Some(other) => {
             report.skipped(layer, format!("its {other} labels"));

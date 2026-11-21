@@ -131,17 +131,104 @@ pub(super) fn equality(expr: &str) -> Option<(String, Vec<String>)> {
     }
 }
 
+/// Whose rules a QGIS filter's text comparisons follow.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Dialect {
+    /// QGIS's expressions (renderer and label rules): text matches exactly, but for `ILIKE`.
+    Qgis,
+    /// SQLite's (a GeoPackage's or SpatiaLite's filter, a virtual layer's): `LIKE` ignores the case
+    /// of ASCII letters; the rest matches exactly.
+    Sqlite,
+    /// OGR SQL's (any other file's filter): `=`, `<>` and `IN` ignore case; `LIKE` and `<`, `>`
+    /// match exactly (GDAL 3.1 on).
+    Ogr,
+}
+
+fn cased(c: char) -> bool {
+    c.is_lowercase() || c.is_uppercase()
+}
+
+/// Whether `expr`, read under `d`'s rules, compares a field with text that RustGIS, ignoring
+/// letter case, can match where QGIS doesn't. A field compared with a field isn't noted (types
+/// aren't known at import).
+pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
+    let expr = expr.trim();
+    if expr.chars().count() > MAX_LEN {
+        return false;
+    }
+    let Some(tokens) = tokenize(expr) else {
+        // ponytail: a filter beyond a clause is read only for its texts, so upper("n") = 'X' is noted too; walk the parsed expression if that proves noisy.
+        let chars: Vec<char> = expr.chars().collect();
+        let mut i = 0;
+        while let Some(&c) = chars.get(i) {
+            match c {
+                '"' | '\'' => match quoted(&chars, i, c) {
+                    Some((text, next)) => {
+                        if c == '\'' && text.chars().any(cased) {
+                            return true;
+                        }
+                        i = next;
+                    }
+                    None => return false,
+                },
+                _ => i += 1,
+            }
+        }
+        return false;
+    };
+    const OPS: [&str; 9] = ["=", "<>", "!=", "<", "<=", ">", ">=", "LIKE", "ILIKE"];
+    let is_op = |t: &Token| matches!(t, Token::Word(w) if OPS.contains(&w.as_str()) || w == "IN");
+    let is_join = |t: &Token| matches!(t, Token::Word(w) if w == "AND" || w == "OR");
+    tokens.iter().enumerate().any(|(i, t)| {
+        let Token::Text(s) = t else { return false };
+        let before = tokens.get(..i).unwrap_or_default().iter().rev().take_while(|t| !is_join(t)).find(|t| is_op(t));
+        let after = tokens.get(i + 1..).unwrap_or_default().iter().take_while(|t| !is_join(t)).find(|t| is_op(t));
+        let Some(Token::Word(op)) = before.or(after) else { return false };
+        let ascii = s.chars().any(|c| c.is_ascii_alphabetic());
+        match op.as_str() {
+            "=" | "<>" | "!=" | "IN" => ascii && d != Dialect::Ogr,
+            "<" | "<=" | ">" | ">=" => s.chars().any(cased),
+            "LIKE" if d == Dialect::Sqlite => s.chars().any(|c| !c.is_ascii() && cased(c)),
+            "LIKE" => s.chars().any(cased),
+            _ => false,
+        }
+    })
+}
+
+/// Whether `expr` has `NOT IN` with NULL in its list: RustGIS skips the NULL, so a value in none
+/// of the rest is kept, where SQL (QGIS's expressions, SQLite) takes it as unknown.
+pub(super) fn null_in_not_in(expr: &str) -> bool {
+    let expr = expr.trim();
+    if expr.chars().count() > MAX_LEN {
+        return false;
+    }
+    let Some(tokens) = tokenize(expr) else { return false };
+    let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(x)) if x == w);
+    (0..tokens.len()).any(|i| {
+        word(tokens.get(i), "NOT")
+            && word(tokens.get(i + 1), "IN")
+            && word(tokens.get(i + 2), "(")
+            && tokens
+                .get(i + 3..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|t| !matches!(t, Token::Word(w) if w == ")"))
+                .any(|t| matches!(t, Token::Word(w) if w == "NULL"))
+    })
+}
+
 /// Words of the expression language beyond a clause's: a bare one is never a field.
 const EXPRESSION_WORDS: [&str; 6] = ["CASE", "WHEN", "THEN", "ELSE", "END", "BETWEEN"];
 
-/// The words RustGIS's SQL has (`ILIKE` is its `LIKE`, which ignores case).
+/// The words RustGIS's SQL has.
 fn keyword(w: &str) -> Option<&'static str> {
     Some(match w.to_ascii_uppercase().as_str() {
         "AND" => "AND",
         "OR" => "OR",
         "NOT" => "NOT",
         "IN" => "IN",
-        "LIKE" | "ILIKE" => "LIKE",
+        "LIKE" => "LIKE",
+        "ILIKE" => "ILIKE",
         "IS" => "IS",
         "NULL" => "NULL",
         _ => return None,
@@ -255,14 +342,42 @@ fn quoted(chars: &[char], start: usize, q: char) -> Option<(String, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LEN, to_sql};
+    use super::{Dialect, MAX_LEN, case_differs, null_in_not_in, to_sql};
+
+    #[test]
+    fn case_differs_by_dialect() {
+        use Dialect::{Ogr, Qgis, Sqlite};
+        for (e, qgis, sqlite, ogr) in [
+            ("\"k\" = 'x'", true, true, false),
+            ("'x' = \"k\"", true, true, false),
+            ("\"k\" IN ('a', 'B')", true, true, false),
+            ("\"k\" > 'M'", true, true, true),
+            ("\"k\" LIKE 'x%'", true, false, true),
+            ("\"k\" LIKE 'é%'", true, true, true),
+            ("\"k\" ILIKE 'x%'", false, false, false),
+            ("\"k\" = '12' AND \"p\" > 5", false, false, false),
+            ("\"k\" = 'é'", false, false, false),
+            ("\"p\" > 5 AND \"k\" = 'x'", true, true, false),
+            ("upper(\"n\") = 'X'", true, true, true),
+            ("\"a\" + 1 > 2", false, false, false),
+            ("@map_scale < 5000", false, false, false),
+            ("\"X\" || '1' = '1'", false, false, false),
+        ] {
+            assert_eq!([case_differs(e, Qgis), case_differs(e, Sqlite), case_differs(e, Ogr)], [qgis, sqlite, ogr], "{e}");
+        }
+        assert!(!case_differs(&format!("k = 'x' AND {}", "a".repeat(MAX_LEN)), Qgis));
+        assert!(null_in_not_in("\"p\" NOT IN (1, NULL)") && null_in_not_in("p not in (null)"));
+        assert!(
+            !null_in_not_in("\"p\" NOT IN (1, 2)") && !null_in_not_in("\"p\" IN (1, NULL)") && !null_in_not_in("p IN (1) AND q IS NULL")
+        );
+    }
 
     #[test]
     fn filters_carry_over_and_the_rest_is_refused() {
         assert_eq!(to_sql(r#""Symbol" = 'Ortsteil_20-49'"#).as_deref(), Some(r#""Symbol" = 'Ortsteil_20-49'"#));
         assert_eq!(
             to_sql(r#"pop >= 1e3 AND ("name" ILIKE 'z%' OR kind IN ('a', 'b''s')) AND note IS NOT NULL"#).as_deref(),
-            Some(r#""pop" >= 1000 AND ( "name" LIKE 'z%' OR "kind" IN ( 'a' , 'b''s' ) ) AND "note" IS NOT NULL"#)
+            Some(r#""pop" >= 1000 AND ( "name" ILIKE 'z%' OR "kind" IN ( 'a' , 'b''s' ) ) AND "note" IS NOT NULL"#)
         );
         assert_eq!(to_sql("a <> -2.5").as_deref(), Some(r#""a" <> -2.5"#));
         // Exponents written out, and TRUE and FALSE as values, as RustGIS SQL reads them.
