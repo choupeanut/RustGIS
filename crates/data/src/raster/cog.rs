@@ -306,7 +306,6 @@ pub fn is_tiff(bytes: &[u8]) -> bool {
     matches!(bytes.get(..4), Some([b'I', b'I', 42 | 43, 0] | [b'M', b'M', 0, 42 | 43]))
 }
 
-/// The layout of a tiled GeoTIFF, from the bytes read so far.
 /// The bytes a tile of `tw × th` pixels and `per_chunk` bands takes once read (see
 /// [`MAX_TILE_BYTES`]).
 fn tile_bytes(tw: u32, th: u32, per_chunk: usize, bits: u16) -> u64 {
@@ -323,6 +322,7 @@ fn take_tiles(allowance: &mut usize, n: usize) -> Result<()> {
     Ok(())
 }
 
+/// The layout of a tiled GeoTIFF, from the bytes read so far.
 pub fn layout(bytes: &Sparse) -> Result<Parse> {
     let r = bytes.reader();
     let watch = r.clone();
