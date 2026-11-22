@@ -32775,6 +32775,7 @@ fn lidar_point_clouds() {
 /// A source that can't say gives null, never 0.
 #[test]
 fn info_project_counts_a_layer_read_in_place_by_its_source() {
+    isolate_plugins();
     let dir = std::env::temp_dir().join(format!("rustgis-count-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let pts: Vec<(f64, f64, f64, u8)> = (0..200).map(|i| (10.0 + f64::from(i) / 200.0, 50.5, 300.0, 2)).collect();
