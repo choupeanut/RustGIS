@@ -1555,6 +1555,17 @@ mod tests {
         assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-paper"));
     }
 
+    /// A frame centred on a pole in a polar projection (#2684) is read as it is written: its
+    /// centre is a range, not a new key, so no capability. Drawn in Web Mercator it moves to the
+    /// limit, which the import and opening notices say.
+    #[test]
+    fn a_frame_centred_on_a_pole_is_read_as_written() {
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_frame_pole.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert!(saved.get("requires").is_none_or(|r| r == &json!([])), "{:?}", saved.get("requires"));
+        assert_eq!(saved["layouts"][0]["elements"][0]["kind"]["MapFrame"]["center"]["y"], json!(-90.0));
+    }
+
     /// A map frame's border other than the default (#2557) is required where it is saved, so an
     /// older reader refuses the project instead of drawing the default line and saving it so. The
     /// default border is not written and needs nothing.

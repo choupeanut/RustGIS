@@ -22,6 +22,9 @@ pub const PAPER_M_PER_PT: f64 = 0.0254 / 96.0;
 /// The largest a map frame's scale can be: 2:1, larger than life for finds drawings (#902). Even
 /// there its camera ([`frame_camera`]) stays above the map's closest zoom
 /// ([`crate::camera::MIN_RES`]) anywhere on Web Mercator.
+/// The farthest north or south a map frame's centre may be (degrees): a pole is a place in a polar
+/// projection (#2684). Web Mercator stops at [`rustgis_geom::MAX_LAT`] (see [`Layout::keep_in_mercator`]).
+pub const MAX_CENTER_LAT: f64 = 90.0;
 pub const MIN_FRAME_SCALE: f64 = 0.5;
 /// The smallest: the whole world many times over.
 pub const MAX_FRAME_SCALE: f64 = 1e10;
@@ -2527,7 +2530,7 @@ impl Layout {
                         *center = Coord::new(0.0, 0.0);
                     }
                     center.x = center.x.clamp(-540.0, 540.0);
-                    center.y = center.y.clamp(-85.0, 85.0);
+                    center.y = center.y.clamp(-MAX_CENTER_LAT, MAX_CENTER_LAT);
                     if let FrameShape::Polygon(p) = shape {
                         let points = p.len();
                         p.retain(|(u, v)| u.is_finite() && v.is_finite());
@@ -2658,7 +2661,31 @@ impl Layout {
             page_adjusted: usize::from(page_adjusted),
             series_removed: usize::from(series_removed),
             mgrs_off,
+            frames_moved: 0,
         }
+    }
+}
+
+impl Layout {
+    /// Moves the centre of each map frame whose map is drawn in Web Mercator (the globe too) from
+    /// beyond its latitude limit, [`rustgis_geom::MAX_LAT`], to it, as the map draws it, and
+    /// counts them. A pole is no place in Web Mercator, but is in a polar projection, so
+    /// [`Layout::clamp`], which knows no map, leaves it. A frame of a map not in `maps` is left.
+    pub fn keep_in_mercator(&mut self, maps: &[Map]) -> usize {
+        let mut moved = 0usize;
+        for e in &mut self.elements {
+            if let ElementKind::MapFrame { map, center, .. } = &mut e.kind
+                && center.y.abs() > rustgis_geom::MAX_LAT
+                && maps
+                    .iter()
+                    .find(|m| m.name.eq_ignore_ascii_case(map))
+                    .is_some_and(|m| matches!(m.flat(), crate::projection::Flat::Mercator))
+            {
+                center.y = rustgis_geom::MAX_LAT.copysign(center.y);
+                moved = moved.saturating_add(1);
+            }
+        }
+        moved
     }
 }
 
@@ -2679,6 +2706,9 @@ pub struct LayoutRepairs {
     /// Map frames whose grid had MGRS labels on a graticule or over a system other than a WGS 84
     /// UTM zone, turned off.
     pub mgrs_off: usize,
+    /// Map frames in a Web Mercator map moved from beyond its latitude limit to it
+    /// ([`Layout::keep_in_mercator`], which the caller runs, as it knows the maps).
+    pub frames_moved: usize,
 }
 
 impl LayoutRepairs {
@@ -3660,6 +3690,72 @@ mod tests {
         assert_eq!(serde_json::from_str::<Layout>(&saved).unwrap(), big);
     }
 
+    /// The centre of the first map frame.
+    fn first_centre(l: &Layout) -> Coord {
+        match l.elements.first().map(|e| &e.kind) {
+            Some(ElementKind::MapFrame { center, .. }) => *center,
+            _ => panic!("frame expected"),
+        }
+    }
+
+    fn frames_at(lats: &[f64]) -> Layout {
+        let frames: Vec<String> = lats
+            .iter()
+            .enumerate()
+            .map(|(i, y)| {
+                format!(
+                    r#"{{"id":{},"name":"f","x":0,"y":0,"w":50,"h":50,"kind":{{"MapFrame":{{"map":"M","center":{{"x":0,"y":{y}}},"scale":1e7}}}}}}"#,
+                    i + 1
+                )
+            })
+            .collect();
+        serde_json::from_str(&format!(r#"{{"name":"x","width":100,"height":100,"elements":[{}]}}"#, frames.join(","))).unwrap()
+    }
+
+    #[test]
+    fn a_frame_centre_keeps_a_pole() {
+        // A pole is a place in a polar projection (#2684): kept, and no repair.
+        let mut l = frames_at(&[-90.0, 90.0, 200.0]);
+        let repairs = l.clamp();
+        let lat = |i: usize| match l.elements.get(i).map(|e| &e.kind) {
+            Some(ElementKind::MapFrame { center, .. }) => center.y,
+            _ => panic!("frame expected"),
+        };
+        assert_eq!((lat(0), lat(1), lat(2)), (-90.0, 90.0, 90.0));
+        assert_eq!(repairs.elements_adjusted, 1, "only the centre past a pole is repaired: {repairs:?}");
+        let mut l = frames_at(&[-90.0, 90.0]);
+        assert!(l.clamp().is_empty());
+        // Not a number: back to 0, 0.
+        if let Some(ElementKind::MapFrame { center, .. }) = l.elements.first_mut().map(|e| &mut e.kind) {
+            *center = Coord::new(f64::INFINITY, f64::NAN);
+        }
+        assert_eq!(l.clamp().elements_adjusted, 1);
+        assert_eq!(first_centre(&l), Coord::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn mercator_frames_stop_at_its_limit() {
+        // Web Mercator ends at 85.05°: a frame in a map drawn in it is moved there and counted;
+        // one within it, one in no map of the project, and a frame on another map are not.
+        let maps = [Map::new("M")];
+        let mut l = frames_at(&[-90.0, 90.0, 85.0, -85.0511, 12.0]);
+        l.clamp();
+        assert_eq!(l.keep_in_mercator(&maps), 2);
+        let lats: Vec<f64> = l
+            .elements
+            .iter()
+            .filter_map(|e| match &e.kind {
+                ElementKind::MapFrame { center, .. } => Some(center.y),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lats, [-rustgis_geom::MAX_LAT, rustgis_geom::MAX_LAT, 85.0, -85.0511, 12.0]);
+        assert_eq!(l.keep_in_mercator(&maps), 0, "moved once");
+        let mut l = frames_at(&[90.0]);
+        assert_eq!(l.keep_in_mercator(&[Map::new("Other")]), 0, "its map isn't here");
+        assert_eq!(first_centre(&l).y, 90.0);
+    }
+
     #[test]
     fn scale_bar_and_grid_label_sizes_default_and_are_kept_in_range() {
         let page = |grid: &str, bar: &str| {
@@ -3714,7 +3810,15 @@ mod tests {
         let repairs = l.clamp();
         assert_eq!(
             repairs,
-            LayoutRepairs { elements_adjusted: 2, elements_cut: 0, elements_removed: 1, page_adjusted: 1, series_removed: 1, mgrs_off: 0 },
+            LayoutRepairs {
+                elements_adjusted: 2,
+                elements_cut: 0,
+                elements_removed: 1,
+                page_adjusted: 1,
+                series_removed: 1,
+                mgrs_off: 0,
+                frames_moved: 0
+            },
             "what changed is counted"
         );
         assert!(l.clamp().is_empty(), "a repaired layout needs nothing more");

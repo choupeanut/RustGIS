@@ -1,0 +1,24 @@
+{
+  "format": 2,
+  "name": "Frame centred on a pole",
+  "active_map": 0,
+  "maps": [
+    {
+      "name": "Map",
+      "layers": [],
+      "basemap": "Paper",
+      "projection": {"Custom": "EPSG:3031"},
+      "camera": {"center": {"x": 0, "y": 0}, "res": 30000}
+    }
+  ],
+  "layouts": [
+    {
+      "name": "Polo",
+      "width": 150,
+      "height": 150,
+      "elements": [
+        {"id": 1, "name": "Mapa", "x": 5, "y": 5, "w": 140, "h": 140, "kind": {"MapFrame": {"map": "Map", "center": {"x": 0, "y": -90}, "scale": 60000000, "shape": "Circle"}}}
+      ]
+    }
+  ]
+}

@@ -198,7 +198,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   from the whole world down to site plans at 1:20, finds at 1:1 and 2:1 (a scale of 1:0.5).
   A frame can be turned and tilted like the map view: a new frame, or one matched to the view,
   takes the view's bearing and pitch, and **Bearing** and **Pitch** in its properties (or
-  `layout.update` with `bearing` and `pitch`) set them. Its north arrows turn with it. **Grid** draws a labelled graticule over a frame; **Extent Indicator** outlines another frame's
+  `layout.update` with `bearing` and `pitch`) set them. Its north arrows turn with it. A frame's centre may be a pole (`layout.update` with
+  `center`, latitude -90 to 90): in a polar projection (EPSG:3031, 3413, 3995) a pole is an ordinary
+  point, and a frame centred on it keeps it at its middle. Web Mercator has no pole: a frame of a map
+  drawn in it, read from a layout file or a project centred beyond 85.05°, is moved to that limit and a
+  notice says so. **Grid** draws a labelled graticule over a frame; **Extent Indicator** outlines another frame's
   extent (an overview map).
 - **Frame borders**: the **Border** section of a frame's properties sets the line drawn round it,
   along its shape for a round or polygon frame: its **Color** and **Line width** (dark grey and

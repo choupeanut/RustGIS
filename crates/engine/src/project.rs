@@ -1495,7 +1495,8 @@ impl Project {
         self.layouts.truncate(MAX_LAYOUTS);
         let mut repairs = Vec::new();
         for l in &mut self.layouts {
-            let r = l.clamp();
+            let mut r = l.clamp();
+            r.frames_moved = l.keep_in_mercator(&self.maps);
             if !r.is_empty() {
                 repairs.push((l.name.clone(), r));
             }
@@ -2639,6 +2640,13 @@ pub(crate) fn layout_notices(
         notices.push(format!(
             "{name}: MGRS labels turned off on {mgrs} map frame grid(s) that weren't measured grids in a WGS 84 UTM zone (named by its EPSG code) {when} (in {})",
             layout_names(repairs, |r| r.mgrs_off)
+        ));
+    }
+    let moved = total(|r| r.frames_moved);
+    if moved > 0 {
+        notices.push(format!(
+            "{name}: the centre of {moved} map frame(s) in a Web Mercator map, beyond its 85.05° latitude limit, moved to it {when} (in {})",
+            layout_names(repairs, |r| r.frames_moved)
         ));
     }
     let series = total(|r| r.series_removed);

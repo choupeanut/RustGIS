@@ -14844,6 +14844,69 @@ fn layouts_compose_export_and_round_trip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A layout of one circular map frame of "Map" centred on `lat` (#2684).
+fn frame_at_latitude(lat: f64) -> String {
+    json!({"name": "Polo", "width": 150, "height": 150, "next_id": 2, "series": null, "elements": [
+        {"id": 1, "name": "Mapa", "x": 5, "y": 5, "w": 140, "h": 140, "visible": true, "kind": {"MapFrame": {
+            "map": "Map", "center": {"x": 0.0, "y": lat}, "scale": 60_000_000.0, "shape": "Circle", "extent_of": null}}}]})
+    .to_string()
+}
+
+fn frame_centre(s: &Session, layout: usize) -> rustgis_data::Coord {
+    match s.project.layouts.get(layout).and_then(|l| l.elements.first()).map(|e| &e.kind) {
+        Some(rustgis_map::layout::ElementKind::MapFrame { center, .. }) => *center,
+        _ => panic!("a map frame"),
+    }
+}
+
+#[test]
+fn a_frame_centred_on_a_pole_stays_there_in_a_polar_projection() {
+    let moved = |s: &Session, from: u64| s.notices_since(from).iter().filter(|n| n.text.contains("latitude limit")).count();
+    let mut s = Session::new(Project::default());
+    s.run("map.projection", &json!({"type": "EPSG:3031"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("layout.import", &json!({"text": frame_at_latitude(-90.0)})).unwrap();
+    assert_eq!(frame_centre(&s, 0), rustgis_data::Coord::new(0.0, -90.0), "the pole is not moved");
+    assert!(s.notices_since(mark).is_empty(), "and nothing is said: {:?}", s.notices_since(mark));
+    // The camera that draws it looks at the pole, the middle of the polar map.
+    let centre = frame_centre(&s, 0);
+    let cam = rustgis_map::layout::frame_camera(s.map(), centre, 60_000_000.0, 0.0, 0.0);
+    assert!(cam.center.x.abs() < 1.0 && cam.center.y.abs() < 1.0, "{:?}", cam.center);
+    // layout.update takes it too, and keeps a latitude within a pole.
+    let frame = s.project.layouts[0].elements[0].id;
+    s.run("layout.update", &json!({"element": frame, "center": [10.0, 90.0]})).unwrap();
+    assert_eq!(frame_centre(&s, 0), rustgis_data::Coord::new(10.0, 90.0));
+    s.run("layout.update", &json!({"element": frame, "center": [0.0, -123.0]})).unwrap();
+    assert_eq!(frame_centre(&s, 0), rustgis_data::Coord::new(0.0, -90.0));
+    // The project keeps it through saving and opening.
+    let dir = std::env::temp_dir().join(format!("rustgis-pole-frame-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("polo.rgis").display().to_string();
+    s.run("project.saveAs", &json!({"path": path})).unwrap();
+    let mark = s.notice_mark();
+    s.run("project.open", &json!({"path": path})).unwrap();
+    assert_eq!(frame_centre(&s, 0), rustgis_data::Coord::new(0.0, -90.0));
+    assert_eq!(moved(&s, mark), 0);
+    // Drawn in Web Mercator, which has no pole, a frame centred on one is moved to its limit and
+    // that is said, once, on import (a centre within the limit is not said) and on opening.
+    s.run("map.projection", &json!({"type": "mercator"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("layout.import", &json!({"text": frame_at_latitude(85.0)})).unwrap();
+    assert_eq!(frame_centre(&s, 1).y, 85.0);
+    s.run("layout.import", &json!({"text": frame_at_latitude(-90.0)})).unwrap();
+    assert_eq!(moved(&s, mark), 1, "{:?}", s.notices_since(mark));
+    assert_eq!(frame_centre(&s, 2).y, -rustgis_geom::MAX_LAT);
+    let cam = rustgis_map::layout::frame_camera(s.map(), frame_centre(&s, 2), 60_000_000.0, 0.0, 0.0);
+    assert!(cam.center.is_finite());
+    s.run("layout.update", &json!({"element": s.project.layouts[2].elements[0].id, "layout": 2, "center": [0.0, 90.0]})).unwrap();
+    s.run("project.saveAs", &json!({"path": path})).unwrap();
+    let mark = s.notice_mark();
+    s.run("project.open", &json!({"path": path})).unwrap();
+    assert_eq!(moved(&s, mark), 1, "{:?}", s.notices_since(mark));
+    assert_eq!(frame_centre(&s, 2).y, rustgis_geom::MAX_LAT);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn custom_colour_ramps_add_apply_save_and_travel() {
     use rustgis_map::{Ramp, RasterRenderer, Renderer, Rgba};
