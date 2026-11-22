@@ -450,7 +450,8 @@ fn layers_of(s: &Session) -> Value {
             .map(|l| {
                 json!({
                     "id": l.id, "name": l.name, "raster": l.is_raster(), "visible": l.visible,
-                    "geometry": format!("{:?}", l.dataset.geometry_type), "features": l.dataset.features.len(),
+                    "geometry": format!("{:?}", l.dataset.geometry_type), "features": l.feature_count(),
+                    "loaded": l.dataset.features.len(), "streamed": l.is_streamed(),
                     "selected": l.selection.len(), "active": Some(l.id) == active,
                     "extent": super::project::bbox(l.extent()), "transparency": super::project::percent(l.transparency),
                     "crs": layer_crs(l).map(crs_name),
