@@ -160,9 +160,10 @@ const BUDGET: usize = if cfg!(target_arch = "wasm32") { 160 << 20 } else { 384 <
 pub const RETRY: Duration = Duration::from_secs(60);
 /// How long a read of more than 1 MiB (a big tile of a slow server, #2570) may take in all, where
 /// a map tile has 30 seconds. The longest any caller waits for one: a COG window's first batch of
-/// four bands or more waits 420 seconds (the engine's `batch_wait`: `WINDOW_WAIT` and `BAND_WAIT`);
-/// the others give up sooner (two minutes: a header, one band, a raster in place, a remote file),
-/// and a map's tile layer has nobody waiting. Keep it no less than that wait, no more.
+/// four bands or more waits 420 seconds (the engine's `batch_wait`: `WINDOW_WAIT` and `BAND_WAIT`;
+/// an engine test holds the two together). The others give up at or before that: two minutes for a
+/// header, one band, a raster in place or a remote file, five minutes for a Tessera read, and a
+/// map's tile layer has nobody waiting. Keep it no less than the longest wait, no more.
 pub const LONG_READ: Duration = Duration::from_secs(420);
 /// The largest tile or document fetched.
 pub const MAX_BYTES: usize = 16 << 20;
@@ -2583,7 +2584,12 @@ mod native {
 
     /// Workers share this agent's checked connections and bounded idle pool.
     pub(super) fn agent() -> ureq::Agent {
-        let config = config_builder(std::time::Duration::from_secs(30))
+        agent_with(std::time::Duration::from_secs(30))
+    }
+
+    /// An agent of the workers' kind with `timeout` for a whole request.
+    fn agent_with(timeout: std::time::Duration) -> ureq::Agent {
+        let config = config_builder(timeout)
             // The workers share the agent: keep a connection open for each fetch a server
             // may have under way, so the next tile doesn't connect again.
             .max_idle_connections_per_host(PER_HOST)
@@ -2613,10 +2619,7 @@ mod native {
         match (ceiling == Reach::Public, long) {
             (false, false) => shared_agent(),
             (true, false) => shared_public_agent(),
-            (false, true) => LONG.get_or_init(|| {
-                let config = config_builder(super::LONG_READ).max_idle_connections_per_host(PER_HOST).max_idle_connections(WORKERS).build();
-                checked_agent(config, ureq::unversioned::resolver::DefaultResolver::default(), false)
-            }),
+            (false, true) => LONG.get_or_init(|| agent_with(super::LONG_READ)),
             (true, true) => LONG_PUBLIC.get_or_init(|| public_agent(super::LONG_READ)),
         }
     }
