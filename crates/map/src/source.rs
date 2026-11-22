@@ -158,6 +158,10 @@ pub struct SourceLayer {
     /// Text values a view read found weren't UTF-8 ([`Batch::not_utf8`]), likewise.
     #[serde(skip)]
     not_utf8: Option<Vec<usize>>,
+    /// The encoding `not_utf8` counts were read in, taken when they were kept: the source may be
+    /// opened again before they are said.
+    #[serde(skip)]
+    not_utf8_in: Option<&'static str>,
     #[serde(skip)]
     not_utf8_said: bool,
     /// What else view reads lost or assumed ([`Batch::notes`]), until said by
@@ -833,6 +837,12 @@ impl SourceLayer {
     /// [`SourceLayer::take_not_utf8`] says it, as [`SourceLayer::saw_unread_dates`] does for dates.
     pub fn saw_not_utf8(&mut self, counts: &[usize]) {
         if !self.not_utf8_said && counts.iter().any(|n| *n > 0) {
+            let encoding = self.handle.as_ref().map_or("UTF-8", |h| h.text_encoding());
+            // Counts of another encoding are of another opening's text: they aren't added to these.
+            if self.not_utf8_in != Some(encoding) {
+                self.not_utf8 = None;
+            }
+            self.not_utf8_in = Some(encoding);
             rustgis_data::source::add_unread_dates(self.not_utf8.get_or_insert_with(Vec::new), counts);
         }
     }
@@ -845,7 +855,7 @@ impl SourceLayer {
         let fields = self.info().map(|i| i.fields.clone())?;
         let counts = self.not_utf8.take()?;
         self.not_utf8_said = true;
-        rustgis_data::source::not_utf8_note(&fields, &counts, self.handle.as_ref().map_or("UTF-8", |h| h.text_encoding()))
+        rustgis_data::source::not_utf8_note(&fields, &counts, self.not_utf8_in.take().unwrap_or("UTF-8"))
     }
 
     /// Keeps what view reads said they lost or assumed ([`Batch::notes`]) until
@@ -1647,6 +1657,7 @@ impl SourceLayer {
         self.null_text = None;
         self.null_text_said = false;
         self.not_utf8 = None;
+        self.not_utf8_in = None;
         self.not_utf8_said = false;
         self.forget_read_notes();
         self.reset();
@@ -1978,6 +1989,7 @@ impl SourceLayer {
             null_text: _,
             null_text_said: _,
             not_utf8: _,
+            not_utf8_in: _,
             not_utf8_said: _,
             read_notes: _,
             read_note_kinds: _,
