@@ -1577,14 +1577,14 @@ and the MCP server see it too. A GeoTIFF read in place that is added before its 
 with `null` for its size and bands until then.
 `share.exportRaster` writes an untiled GeoTIFF, in strips of rows, with an 8-bit grey band (a
 hillshade, say) as bytes and another single band as 32-bit floats (so is an RGBA raster with a NaN
-colour that isn't see-through; a cloud-optimised file makes that cell see-through instead); with `"cog": true` it writes a
-cloud-optimised one: 512-pixel tiles, overviews (each half the size of the last, down to one tile),
-and every directory ahead of the tiles, so a reader fetches the header once and then only the tiles
-it needs. Both compress with Deflate after a predictor: the floating-point one for decimal values,
-differences along the row for whole numbers, none for classes. Overviews are averaged, except for a
-single band of classes (a palette raster's, a band with class names, or a band written as 8- or
-16-bit whole numbers with a few distinct values), whose overviews take a pixel so that no class is
-invented; colour and grey-with-alpha files are always averaged. A palette keeps its colour table,
+colour that isn't see-through); with `"cog": true` it writes a cloud-optimised one: 512-pixel
+tiles, overviews (each half the size of the last, down to one tile), and every directory ahead of
+the tiles, so a reader fetches the header once and then only the tiles it needs. A cloud-optimised
+file makes that RGBA raster's NaN cell see-through instead. Both compress with Deflate after a
+predictor: the floating-point one for decimal values, differences along the row for whole numbers,
+none for classes. Overviews are averaged, except for a single band of classes (a palette raster's,
+a band with class names, or a band written as 8- or 16-bit whole numbers with a few distinct
+values), whose overviews take a pixel so that no class is invented; colour and grey-with-alpha files are always averaged. A palette keeps its colour table,
 though not the table's transparency, which a TIFF colour table can't hold (GDAL drops it too).
 Either file is classic TIFF when it would fit in 4 GiB even uncompressed and BigTIFF when it might
 not.
