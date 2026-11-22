@@ -154,29 +154,8 @@ impl Session {
     }
     /// Private pre-handler capture shared by native reads and the exact scoped archive entry.
     fn capture_read(&mut self, command: &str, params: &Value) -> Result<crate::cmd::reads::ReadAhead, String> {
-        if !matches!(
-            command,
-            "layer.addData"
-                | "layer.loadAll"
-                | "layer.reloadData"
-                | "layer.repairSource"
-                | "labels.convert"
-                | "model.run"
-                | "script.run"
-                | "map.reloadTiles"
-                | "map.repairTiles"
-                | "topology.validate"
-                | "service.layers"
-                | "service.add"
-                | "source.syncState"
-                | "table.statistics"
-                | "data.similar"
-                | "raster.imageGrid"
-                | "edit.previewShapeConversion"
-                | "layer.sizeBy"
-        ) && crate::cmd::edit::table_edit_in_background(command).is_none()
-        {
-            return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service reads, topology, Source File State, Read Original Image Grid, Preview Shape Conversion, Column Statistics, Similar and Size by Field prepare background work".into());
+        if crate::cmd::reads::in_background(command).is_none() {
+            return Err(crate::cmd::reads::not_in_background(command));
         }
         let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
         // Scoped previews retain the raw invocation that was approved. Their admitted owner
@@ -193,6 +172,7 @@ impl Session {
                 | "raster.imageGrid"
                 | "edit.previewShapeConversion"
                 | "layer.sizeBy"
+                | "style.importQgis"
         ) && (!matches!(command, "edit.previewShapeConversion" | "raster.imageGrid") || self.policy_user())
             || (command == "edit.convertField" && params.get("table").is_none_or(Value::is_null))
         {
@@ -989,11 +969,21 @@ impl Session {
                         result
                     })
                 };
+                // Each step that adds data, however it lands (a read ahead, a download, a URL
+                // read in place, a line of a script or task), may add the layer the project takes
+                // its system from, and any step that changes the project may find a raster added
+                // earlier whose pixels have landed: taken then, so the steps after it (a new map)
+                // start in it, and inside the transaction that made it, so Undo and a failure take
+                // it back and the project is unsaved ([`crate::cmd::project::first_layer_watch`]).
+                let first_layer = crate::cmd::project::first_layer_watch(self, &spec);
                 let result = match txn {
                     Txn::Own => self.guarded(spec.label, spec.mutates, run),
                     Txn::Shared if spec.id == "edit.applyShapeConversion" => self.shared_step(&spec, |s| s.savepoint(spec.label, run)),
                     Txn::Shared => self.shared_step(&spec, run),
                 };
+                if let (Ok(_), Some(before)) = (&result, first_layer) {
+                    crate::cmd::project::take_first_layer_system(self, &before);
+                }
                 self.url_completion_landed(spec.id, &params, &result);
                 if result.is_ok() && (spec.mutates || spec.effects.contains(crate::policy::Effect::History)) && spec.id != "data.similar" {
                     // Edits and history moves can replace selections without select::set. History

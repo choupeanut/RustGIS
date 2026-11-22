@@ -174,16 +174,44 @@ which searches every tool) or Command Search. Fill in its parameters and click *
 layers or tables are added to the project; selection tools select existing rows and Calculate
 Geometry Attributes updates the input layer. Each run is listed under **Analyze › History**.
 
-**Which coordinate system a tool works in.** Most tools work in longitude/latitude, with
-geodesic distances and areas, whatever system their layers are in. Some work in their first
-input's own coordinate system when it is a projected one, such as a UTM zone or a national grid:
-Summary Statistics, Pivot Table, Join Field, Select Layer By Attribute, Export Features, Merge,
-Polygon To Line, Split Line At Vertices, Feature Envelope To Polygon, Unsplit Line, Feature
-Vertices To Points, Check Geometry and Repair Geometry. Their other inputs are converted into that
-system for the run, and their new layers are kept in it, so the coordinates of what they copy stay
-exactly as they were. If another input has a place that system can't hold, the tool works in
+**Which coordinate system a tool works in.** Most tools work in longitude/latitude, with geodesic
+distances and areas, whatever system their layers are in. Some work in their first input's own
+coordinate system when it is a projected one, such as a UTM zone or a national grid: Summary
+Statistics, Pivot Table, Join Field, Select Layer By Attribute, Export Features, Merge, Polygon To
+Line, Split Line At Vertices, Feature Envelope To Polygon, Unsplit Line, Feature Vertices To
+Points, Check Geometry and Repair Geometry; the overlays Clip, Erase, Intersect, Identity, Union,
+Symmetrical Difference, Update, Split and Dissolve; Minimum Bounding Geometry (convex hull),
+Feature To Point and Summarize Within; Select Layer By Location and Spatial Join; Buffer,
+Simplify, Points Along Lines and Near; and IDW Interpolation, Kriging, Kernel Density, Zonal
+Statistics and Tabulate Area (the last five as said below). Their other vector inputs are converted
+into that system for the run, and their new layers are kept in it, so the coordinates of what they
+copy stay exactly as they were. An overlay there takes each edge as straight in that system, not in
+Web Mercator as it does in longitude/latitude, so where an edge crosses another can differ from the
+same tool's result in longitude/latitude, by up to about L² tan φ / 8R for an edge L long at
+latitude φ: some 20 cm for a 3 km edge at 48°N, 2 m for a 10 km one, 220 m for a 100 km one. An
+input in another system is converted vertex by vertex, as the map draws it in that system, and its
+long edges can run much farther from where they run in longitude/latitude: a degree-wide box's
+east-west edges, which follow their parallels there, are chords in UTM up to 120 m away. The tool
+then says how many edges of which layer run more than a metre away, and how far the farthest does. A
+world projection (World Mercator, Plate Carrée, Robinson, Equal Earth and the like), whose plane has
+the antimeridian as a seam and the poles as lines, is worked on in longitude/latitude, as Web
+Mercator is. If another input has a place that system can't hold, the tool works in
 longitude/latitude instead, and its message says so. A layer in longitude/latitude, Web Mercator or
-another geographic system is worked on in longitude/latitude, as before.
+another geographic system is worked on in longitude/latitude, as before. In a projected system a
+tool works in, distances in metres (Buffer's, Simplify's tolerance, Points Along Lines' spacing,
+Near's, and the search distances of Select Layer By Location and Spatial Join) are measured flat
+there, in its unit, as distances in a projected system are: a kilometre is 1000 of its metres, or
+3280.833 of its US survey feet. A flat metre is not quite a metre on the ground: in a UTM zone, from
+1.0004 m on its central meridian to about 0.999 m at its edges on the equator (0.9998 m at 48.7°N),
+so a buffer of 100 km around a point 2.5° east of the central meridian at 48.7°N reaches 100,017 m
+on the ground on its west side and 99,972 m on its east side. Near's nearest point is that system's
+x and y, and Points Along Lines' angle is from grid north. IDW Interpolation, Kriging and Kernel
+Density make their surface in that system, from its points' own coordinates, unless another system
+is given; Zonal Statistics and Tabulate Area place their zones on a raster in that system as they
+are. A surface given another projected system, or a raster in one, gets the points or zones
+converted straight into it, by the transformation between the two datums where they differ; a raster
+in longitude/latitude or Web Mercator gets them through WGS 84. Their rasters aren't converted, and
+they don't count bent edges. Area, length and perimeter fields stay on the ellipsoid.
 
 In the desktop app a tool runs in the background, so the map and the rest of the window stay in
 use. While it runs, the Tools pane shows its name, a **Cancel** button and, for the tools that
@@ -276,8 +304,9 @@ around a pole spans their longitudes (a flat polygon with no area, for points on
 and the tool says how many hulls have no area), not the cap they
 enclose on the ground. For the same reason a polygon whose ring goes around a pole without reaching
 it (written all the way round a parallel, say, rather than cut at ±180° and closed along the pole)
-is another shape in these coordinates, a line along that parallel; the overlays, joins, containment,
-zone, buffer and distance tools say how many such rings they read, and in which layers, and leave
+is another shape in these coordinates, a line along that parallel; the tools that read areas in
+the plane (the overlays, joins, containment, zone, buffer and distance tools, Dissolve, Feature To
+Point, Count Points and Tabulate Intersection) say how many such rings they read, and in which layers, and leave
 the data as it is. The globe draws a long edge along the great circle between its ends, so near
 a pole it shows a little poleward of where the tools take it: about 850 m at the middle of a 10°
 edge along 88°N (as everywhere, the tools take an edge as straight on the map, not on the globe).
@@ -479,10 +508,11 @@ simplified more than asked: no vertex moves farther on the ground (on the WGS 84
 the tolerance. Near a long stretch reaching toward the equator it can be simplified a little less
 than asked. The scale stops at 85°'s, so beyond 85.05°, where the ground is far narrower, less is
 simplified away than asked (a 3 km tolerance at 89.9°N takes out only what lies within about 60 m
-east–west), and the tool says how many features reach that far. A feature without geometry is
-left out, and the tool says how many. A tolerance of 0 leaves every line and polygon as it is.
-Otherwise a line or polygon with a coordinate missing, or a longitude too far out to place, is
-left as it was; a latitude past ±90° is taken as the pole; a line part of fewer than 2 vertices
+east–west), and the tool says how many features reach that far. For a layer in a projected system
+(see above), the tolerance is a length in that system, the same everywhere. A feature without
+geometry is left out, and the tool says how many. A tolerance of 0 leaves every line and polygon as
+it is. Otherwise a line or polygon with a coordinate missing, or a longitude too far out to place,
+is left as it was; a latitude past ±90° is taken as the pole; a line part of fewer than 2 vertices
 beside a longer one is left out; and, in a run that can't be canceled, a feature too intricate to
 simplify whole within the work allowed keeps more vertices than asked in part of it (a run you can
 cancel takes no limit, looking at Cancel within each feature). The tool says how many of each.
@@ -494,7 +524,7 @@ Points can optionally be weighted by a numeric population field (invalid or non-
 are excluded and reported in the tool messages; for multipoint features, each constituent point part
 receives the feature's weight, a part with a coordinate missing or infinite is left out and
 counted, and a feature with no finite part is skipped). Calculations are performed in the linear units
-of a projected coordinate system (defaults to the layer's projected system; if the input layer lacks a
+of a projected coordinate system (defaults to the projected system the layer is held in, or else was read in; if the input layer lacks a
 coordinate system or is in degrees, or to project into a specific system, supply a projected system via `crs`,
 e.g. `EPSG:32618`). Geocentric systems such as `EPSG:4978` (X, Y and Z from the Earth's centre)
 are refused, whether supplied via `crs` or inherited from the layer: their three axes do not
@@ -527,7 +557,9 @@ uses it as a file destination.
 
 **Buffer** distances, and the distance of **Select Layer By Location**, are measured on the Earth
 (the WGS 84 ellipsoid, as PROJ and GeographicLib measure it), not in the map's display
-projection. Each feature is buffered in an azimuthal equidistant projection on the ellipsoid
+projection, except for a layer in a projected system, which is buffered flat in it (see above); a
+buffer of hundreds of kilometres there can reach past the area the system is made for, where the map
+may not place it. Each feature is buffered in an azimuthal equidistant projection on the ellipsoid
 centred on it, so distances from a point are true; long lines and large polygon outlines are
 buffered in stretches of a few hundred kilometres to limit projection error. Up to 85° of
 latitude, a buffer's sides are within 0.012 % of the distance (or 1 cm), and within 0.05 % along
@@ -631,8 +663,9 @@ gp.run={"tool":"featureVerticesToPoints","params":{"input":"Rivers","output":"ri
 
 **Points Along Lines** (`pointsAlongLines`) writes points at a set `distance` along each part of
 the `input` layer's lines, or each ring of its polygons (holes too), measured on the WGS 84
-ellipsoid as Buffer's distances are, in `units` (Kilometers by default): a point at `startOffset`
-(0 by default), then one every `distance`, stopping `endOffset` before the part's end.
+ellipsoid as Buffer's distances are (flat, for a layer in a projected system, see above), in `units`
+(Kilometers by default): a point at `startOffset` (0 by default), then one every `distance`,
+stopping `endOffset` before the part's end.
 `includeEnd` adds a point where they stop when the distance doesn't land there (the first is
 always at the start offset). Each part and ring is walked on its own from its first vertex, so the
 gap between two parts never counts; a line's parts that cross the antimeridian, one ending on it
@@ -701,8 +734,9 @@ across the extent and coarsens for large inputs. The result is a Float32 GeoTIFF
 IDW Interpolation and Ordinary Kriging make their raster in the projected coordinate system given
 as `crs` (such as `EPSG:32616` for UTM zone 16N, or a State Plane code), and then take the
 extent, pixel size and Kriging's `range` in its units, usually metres or feet. Without `crs`
-they use the projected system the layer was read in, as Kernel Density does, and say so, naming
-it; a layer read in longitude and latitude gives a raster in degrees, with all three in degrees.
+they use the projected system the layer is held in (or else was read in), as Kernel Density
+does without a note, and say so, naming it; a layer read in longitude and latitude gives a
+raster in degrees, with all three in degrees.
 `crs: "EPSG:4326"` makes it in degrees whatever the layer was read in, as these tools always did
 before `crs` was there; so does a layer read in a system that can't hold a raster's cells (a
 geocentric one) or that this version can't project to, with a notice saying which. A script
@@ -808,14 +842,16 @@ used once.
 **Near** (`near`) copies `input` and adds, for each feature, the nearest feature of `near`: its OID
 as the attribute table shows it (`near_fid`), the distance to it (`near_dist`, in `units`,
 Kilometers by default) and the point on it nearest the input feature (`near_x` and `near_y`, in
-longitude from −180° up to 180° and latitude). Distances are measured as Spatial Join's **Closest**
-measures them: on the ground, between the features' nearest points, and zero for features that
-intersect, whose point is one they share. The point is found as the distance is, in a plane centred
-between the features, so on a long edge it can sit off the geodesic by up to about 0.01 % of the
-distance (5 m at 50 km). A `distance` limits how far it looks; features with nothing that near, or
-without geometry, get empty values. Of equally near features, the first in the near layer wins.
-With the same layer as both, each feature's nearest is another feature, not itself. A field name
-the input already has gets a suffix (`near_dist_2`). Selections in both layers are honoured:
+longitude from −180° up to 180° and latitude; for an input in a projected system, its x and y,
+measured flat there, see above). Distances are measured as Spatial Join's **Closest** measures them:
+on the ground (flat, for an input in a projected system), between the features' nearest points, and
+zero for features that intersect, whose point is one they share. The point is found as the distance
+is, in a plane centred between the features, so on a long edge it can sit off the geodesic by up to
+about 0.01 % of the distance (5 m at 50 km). A `distance` limits how far it looks; features with
+nothing that near, or without geometry, get empty values. Of equally near features, the first in the
+near layer wins. With the same layer as both, each feature's nearest is another feature, not itself.
+A field name the input already has gets a suffix (`near_dist_2`). Selections in both layers are
+honoured:
 
 ```text
 gp.run={"tool":"near","params":{"input":"addresses","near":"hydrants","units":"Feet"}}
@@ -823,7 +859,8 @@ gp.run={"tool":"near","params":{"input":"addresses","near":"hydrants","units":"F
 
 **Spatial Join** (`spatialJoin`, also `gp.spatialJoin`) copies attributes from `join` features
 to `target` features. Layers may have different source coordinate systems: their geometry is
-converted to longitude/latitude for the join. `match` is one of:
+converted for the join into the target's system when that is a projected one (see above), else
+to longitude/latitude. `match` is one of:
 
 - **Intersects** (default), **Contains** (target contains join) or **Within** (target lies within
   join).
@@ -837,11 +874,11 @@ converted to longitude/latitude for the join. `match` is one of:
   one, every target gets its nearest feature. Ties keep the join layer's order.
 - **Within a distance**: every join feature within `distance` (required), nearest first.
 
-Distances are on the ground (the WGS 84 ellipsoid, as for Buffer), between the features' nearest
-points (edges and vertices alike), and are zero for features that intersect. `distanceField`
-names a field added for the distance to the joined feature, in `units`; it applies to
-**Closest** and **Within a distance** only, as `distance` does, and the Tools pane shows them
-only for those.
+Distances are on the ground (the WGS 84 ellipsoid, as for Buffer; flat, for a target layer in a
+projected system, see above), between the features' nearest points (edges and vertices alike), and
+are zero for features that intersect. `distanceField` names a field added for the distance to the
+joined feature, in `units`; it applies to **Closest** and **Within a distance** only, as `distance`
+does, and the Tools pane shows them only for those.
 
 **Join one to one** (the default `operation`) copies the first matching feature's attributes;
 **Join one to many** makes a row for each match. Both add `join_count`, the total matches for
@@ -1228,8 +1265,8 @@ CRS metadata. Coordinates are used directly, without projection or snapping.
   memory returns an error.
 - **Feature Envelope To Polygon** (`featureEnvelopeToPolygon`) writes one axis-aligned rectangle
   around all coordinates of each feature, along the axes of the layer's own system when it is a
-  projected one, and of longitude/latitude otherwise. Point features and
-  horizontal or vertical lines have zero-area envelopes and are skipped with a count. Longitude
+  projected one other than a world projection (see above), and of longitude/latitude otherwise.
+  Point features and horizontal or vertical lines have zero-area envelopes and are skipped with a count. Longitude
   bounds are literal, including for features spanning the antimeridian.
 - **Unsplit Line** (`unsplitLine`) joins line parts at exactly equal endpoints where precisely
   two part ends meet and all attribute values agree. Reversed parts and closed cycles are
@@ -1303,8 +1340,9 @@ gp.run={"tool":"checkGeometry","params":{"input":"Parcels"}}
 ### Repairing geometry
 
 **Repair Geometry** (`repairGeometry`) writes every feature to a new layer, `<input>_repaired`
-unless you name it, with its geometry made valid by the rules Check Geometry checks. Only the
-selected features are processed when some are selected. Each output row keeps its feature id,
+unless you name it, with its geometry made valid where it can be (see the table below) by the
+rules Check Geometry checks. Only the selected features are processed when some are selected.
+Each output row keeps its feature id,
 fields, attributes and CRS, and adds a text field `repairs`: the codes of what was repaired,
 separated by `, ` and in the order of the table above, or empty for a feature that needed
 nothing. Features with nothing wrong are copied exactly as stored. If the input already has a
@@ -1379,8 +1417,8 @@ at an angle. So before the overlay takes out a part's holes or merges the parts,
 that narrow in any direction is dropped: `no_area` is added after the other codes in `repairs`, and
 the tool says how many holes and parts were dropped this way, from how many features.
 
-A feature that can't be repaired stays in the output without geometry, with its attributes, and
-`repairs` says why. One the tool couldn't repair is written unchanged, never dropped:
+A feature that can't be repaired stays in the output with its attributes, without its geometry
+or with it unchanged as the table says, and `repairs` says why; none is dropped:
 
 | Code | Written | Why |
 | --- | --- | --- |
@@ -1633,9 +1671,10 @@ cores; `gp.env` returns the threads and cores as `limits.threads` and `limits.co
 runs on one thread.
 
 `gp.env` also returns the memory limits on this computer (`limits`). On the desktop they follow the
-computer's memory, or a control-group limit on Linux (a container's, or a service's such as systemd's `MemoryMax`) when it is lower: each plans for a quarter of it, never
-below the web app's fixed limits and never above a ceiling. `limits.memorySource` says what they
-follow: `computer`, `container` (such a limit, lower than the computer's memory),
+computer's memory, or on Linux the lowest memory limit of the control groups RustGIS runs in, its
+own and those above it (set by a container runtime, or by systemd's `MemoryMax` for a service),
+when it is lower: each plans for a quarter of it, never below the web app's fixed limits and never
+above a ceiling. `limits.memorySource` says what they follow: `computer`, `container` (such a limit, lower than the computer's memory),
 `override` or `unknown`. For tests, or to reproduce a smaller computer, set the environment
 variable `RUSTGIS_MEMORY_BYTES` to the memory in bytes (such as `8589934592` for 8 GiB) before
 starting RustGIS: it replaces the memory read from the computer and any container limit, and the
@@ -2242,9 +2281,10 @@ zone; overlapping zones can therefore report the same missing cell more than onc
 `measure: "Count"` instead puts integer cell counts in the class columns.
 
 Cells are counted by **centre**, as in Zonal Statistics: a cell whose centre is inside a zone
-contributes its whole area; there is no partial-cell weighting. Polygon coordinates are stored
-in WGS 84 and transformed onto the raster's grid; the polygon layer's original CRS metadata
-is not applied again. Invalid features and parts that cannot be placed on the raster are
+contributes its whole area; there is no partial-cell weighting. Zones held in a projected
+system are placed on the raster's grid from their own coordinates (converted straight into the
+raster's system when it is another); other zones are placed from longitude/latitude. Invalid
+features and parts that cannot be placed on the raster are
 counted in notices, with valid features and grid-projected parts retained.
 
 For geographic and **Web Mercator** rasters, cell corners are transformed to WGS 84 and
@@ -2278,7 +2318,7 @@ Open **Zonal Statistics** through Command Search, or choose it in the Workflows 
 
 Zonal Statistics uses the selected polygon features when the layer has a selection. It keeps
 original geometries and fields, and reports features with missing or rejected polygon parts.
-If any polygon part fails validation or transformation to WGS 84, the feature receives count 0 and null
+If any polygon part fails validation, the feature receives count 0 and null
 statistics. If a part subsequently fails projection onto the raster grid, it is omitted and reported;
 statistics cover the remaining valid parts. Large
 overlapping zones each require a separate pass over their raster window.

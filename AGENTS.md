@@ -43,8 +43,8 @@ is out of scope.
 - A new background raster command or export, or a tool whose work grows with its input, goes in
   the lists in `long_commands` (`crates/engine/src/tests/cancellation.rs`), which both cancel tests
   run; the raster and export lists must match the background registries. A read-ahead command
-  (`reads::prepare`, such as `service.layers`, `edit.previewShapeConversion` or `data.similar`)
-  has no registry: add its call to `long_commands` by hand.
+  goes in `reads::IN_BACKGROUND` (a table edit in `edit::TABLE_EDITS`), and `long_commands`
+  fails until it runs every one there or names why not in its exemptions.
   `long_commands_stop_when_cancelled_while_they_run` fails one that never looks at Cancel;
   `cancelling_at_each_check_leaves_nothing_behind` cancels at every check in turn until the command
   finishes before reaching it, on small fixtures, failing if one needs 256 or more checks. It
@@ -156,7 +156,8 @@ It counts only the libraries and programs built for the host, not tests, example
 built only for other targets, nor a row indexed without reading a field (`features[i]` alone); use
 the accessors there too.
 While you work, `cargo xtask changed` runs the same checks on only the packages your branch changes
-and those that depend on them (and `test-hygiene` on the whole workspace), or everything when a
+and those that depend on them (and `test-hygiene` on the whole workspace, and formatting, `layers` and
+`rows` when packages are checked), or everything when a
 changed file such as `Cargo.lock` is outside every package and nothing includes it.
 A new dependency must have a licence `deny.toml` allows (CI runs `cargo deny check licenses`); after
 changing dependencies, run `cargo xtask notices` to refresh the `THIRD-PARTY-LICENSES.txt` files the

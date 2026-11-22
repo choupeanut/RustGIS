@@ -73,17 +73,18 @@ A result is right, or RustGIS says what it lost or assumed
   nodes or ways the file doesn't hold, and inner rings outside every outer one; and the text
   readers' losses listed as `Silent` in `crates/engine/tests/integration/never_silent_reading.rs`, among them
   each vertex's Z in DXF and unreadable coordinates, holes and parts in KML, GeoRSS, MapInfo and
-  DXF, plus geometry-collection members in XLSX/ODS/XLS/XLSB, error-valued attribute cells in XLSX,
+  DXF,
   and attribute fields/values in XLSB short-cell workbooks (the original SheetJS 0.18.5 clean
   workbook retains its point but no attributes, without a notice). A fix makes
-  its case `Said` _(open)_.
+  its case `Said` or `Imported` _(open)_.
 - Lossy sample files in `never_silent_reading.rs` for the readers it doesn't cover yet:
   remaining distinct loss families and parser paths (see the finite
   [coverage inventory](crates/engine/testdata/reading-losses/README.md#coverage-boundaries)). It covers GeoJSON, TopoJSON, CSV,
   KML, KMZ, GPX, GML, GeoRSS,
   DXF, LandXML and MapInfo, with height-loss cases for CityJSON, CityGML, GeoPackage,
   FlatGeobuf, GeoParquet and FileGDB, Z/M-loss and non-UTF-8 text cases for Shapefile, and
-  ring-loss cases for OSM PBF, WKT height/member losses for XLSX, ODS, XLS and XLSB, and
+  ring-loss cases for OSM PBF, separate Z- and M-loss cases for feature-service PBF, and WKT
+  height/member losses for XLSX, ODS, XLS and XLSB, and
   error-cell losses for XLSX; other loss kinds remain.
   XLSM shares the XLSX parser; macros are untested.
   Exports are checked by `never_silent_roundtrip.rs` _(open)_.
@@ -110,10 +111,11 @@ features build on.
   save, not built in memory first.
 - A snapshot test of command ids and parameters, so a removal is always deliberate (the project
   file's JSON Schema, its fixtures and the files past releases saved are checked today).
-- A compressed encoding of today's project JSON, read one release before it is written; a
-  reference system: named connections, copies that remember their source, missing and changed
-  states, a place for results ([#1653](https://github.com/opengeos/RustGIS/issues/1653)).
-  _Coordinate first._
+- A compressed encoding of today's project JSON, read one release before it is written.
+  _Coordinate first_: an issue is needed.
+- A system for the data a project refers to: named connections, copies that remember their
+  source, missing and changed states, a place for results
+  ([#1653](https://github.com/opengeos/RustGIS/issues/1653)). _Coordinate first._
 - What a project holds by default, its own data or links to it
   ([poll #1660](https://github.com/opengeos/RustGIS/discussions/1660)), and storage that opens a
   large project without reading it whole. _Decide first._
