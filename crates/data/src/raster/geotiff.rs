@@ -2006,19 +2006,21 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
     // Without alpha or a no-data marker, byte samples cannot keep NaN holes (for example the
     // cells outside a reprojected RGBI image). Keep those samples as floats instead. With alpha,
     // a hole its alpha hides is fine (the cell is see-through), but one under an opaque alpha
-    // would be written as an opaque 0. Looked at only when the byte branch is reached.
+    // would be written as an opaque 0. A pass over the bands: the byte branch asks it last.
     let byte_holes = || {
+        let counted =
+            || written_bands(r, band).iter().any(|b| r.bands.get(*b).is_some_and(|b| b.stats.count < (w as usize) * (h as usize)));
         r.nodata.is_none()
-            && match r.color {
-                ColorHint::Rgb { alpha: false } => {
-                    written_bands(r, band).iter().any(|b| r.bands.get(*b).is_some_and(|b| b.stats.count < (w as usize) * (h as usize)))
-                }
-                ColorHint::Rgb { alpha: true } => (0..3).any(|b| {
+            && match (&r.color, r.color.alpha(r.bands.len())) {
+                (ColorHint::Rgb { alpha: false }, _) => counted(),
+                (ColorHint::Rgb { alpha: true }, Some((_, colour))) => colour.into_iter().any(|b| {
                     r.bands
                         .get(b)
                         .zip(r.see_through_cells(b))
                         .is_some_and(|(band, hidden)| band.data.iter().enumerate().any(|(i, v)| !v.is_finite() && !hidden(i)))
                 }),
+                // No alpha band to hide a hole (alpha declared on three bands).
+                (ColorHint::Rgb { alpha: true }, None) => counted(),
                 _ => false,
             }
     };
@@ -2066,9 +2068,9 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
             wide!(|v: f32| v, Sample::Float, f32::to_le_bytes)
         }
     } else if rgb
-        && !byte_holes()
         && (!written_bands(r, band).contains(&3) || fits_bytes(r, 3))
         && let (Some(red), Some(green), Some(blue)) = (bytes(0), bytes(1), bytes(2))
+        && !byte_holes()
     {
         let alpha = if written_bands(r, band).contains(&3) { bytes(3) } else { None };
         let n = (w as usize) * (h as usize);
@@ -2736,28 +2738,45 @@ mod tests {
         }
     }
 
-    /// An 8-bit RGBA raster with no no-data value keeps a NaN colour under an opaque alpha (as
-    /// floats, not as an opaque 0); a NaN the alpha already hides, and a clean raster, stay bytes.
+    /// An 8-bit raster with no no-data value keeps a NaN cell as a NaN, in floats, never as 0: grey
+    /// with a second band (`write_all`), RGB without alpha, and RGBA with a NaN colour under an
+    /// opaque alpha (`write` and `write_all`). A NaN colour the alpha hides, and a raster with no
+    /// NaN, stay bytes. An RGBA raster written as floats keeps its alpha band and colour hint.
     #[test]
-    fn rgba_nan_colour_under_opaque_alpha_is_not_written_as_zero() {
+    fn nan_cells_of_byte_rasters_without_no_data_are_not_written_as_zero() {
         let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
-        let rgba = |red: [f32; 3], alpha: [f32; 3]| {
-            let bands = vec![red.to_vec(), vec![5.0; 3], vec![6.0; 3], alpha.to_vec()];
-            Raster::new("rgba", 3, 1, bands, gt, Crs::LonLat, None, ColorHint::Rgb { alpha: true }, "UInt8").unwrap()
-        };
         let nan = f32::NAN;
-        for (case, r, floats) in [
-            ("NaN under an opaque alpha", rgba([1.0, nan, 2.0], [255.0; 3]), true),
-            ("NaN under a clear alpha", rgba([1.0, nan, 2.0], [255.0, 0.0, 255.0]), false),
-            ("no NaN", rgba([1.0, 3.0, 2.0], [255.0; 3]), false),
-        ] {
-            for (writer, bytes) in [("write", write(&r, 0).unwrap()), ("write_all", write_all(&r).unwrap())] {
+        let raster = |bands: Vec<Vec<f32>>, color| Raster::new("nan", 3, 1, bands, gt, Crs::LonLat, None, color, "UInt8").unwrap();
+        let rgb = |red: [f32; 3], blue: [f32; 3]| vec![red.to_vec(), vec![5.0; 3], blue.to_vec()];
+        let rgba = |red: [f32; 3], blue: [f32; 3], alpha: [f32; 3]| {
+            let mut bands = rgb(red, blue);
+            bands.push(alpha.to_vec());
+            raster(bands, ColorHint::Rgb { alpha: true })
+        };
+        let cases = [
+            ("two bands, NaN", raster(vec![vec![1.0, nan, 2.0], vec![3.0; 3]], ColorHint::Gray), true),
+            ("two bands, no NaN", raster(vec![vec![1.0, 4.0, 2.0], vec![3.0; 3]], ColorHint::Gray), false),
+            ("RGB, NaN", raster(rgb([1.0, nan, 2.0], [6.0; 3]), ColorHint::Rgb { alpha: false }), true),
+            ("RGB, no NaN", raster(rgb([1.0, 4.0, 2.0], [6.0; 3]), ColorHint::Rgb { alpha: false }), false),
+            ("RGBA, NaN under an opaque alpha", rgba([1.0, nan, 2.0], [6.0, 6.0, nan], [255.0; 3]), true),
+            ("RGBA, NaN under a clear alpha", rgba([1.0, nan, 2.0], [6.0, nan, 6.0], [255.0, 0.0, 255.0]), false),
+            ("RGBA, no NaN", rgba([1.0, 4.0, 2.0], [6.0; 3], [255.0; 3]), false),
+        ];
+        for (case, r, floats) in &cases {
+            for (writer, bytes) in [("write", write(r, 0).unwrap()), ("write_all", write_all(r).unwrap())] {
+                // `write` keeps one band of a two-band grey raster: only `write_all` is asked of it.
+                if writer == "write" && r.bands.len() == 2 {
+                    continue;
+                }
                 let back = read(std::io::Cursor::new(bytes), "back").unwrap();
-                let expected = if floats { "Float32" } else { "UInt8" };
-                assert_eq!(back.data_type, expected, "{case}, {writer}");
-                if floats {
-                    assert!(back.bands[0].data[1].is_nan(), "{case}, {writer}: {:?}", back.bands[0].data);
-                    assert_eq!(back.bands[0].data[0], 1.0, "{case}, {writer}");
+                let at = format!("{case}, {writer}");
+                assert_eq!(back.data_type, if *floats { "Float32" } else { "UInt8" }, "{at}");
+                assert_eq!((back.band_count(), &back.color), (r.band_count(), &r.color), "{at}");
+                if *floats {
+                    for (b, band) in r.bands.iter().enumerate() {
+                        let same = |(a, b): (&f32, &f32)| a == b || (a.is_nan() && b.is_nan());
+                        assert!(band.data.iter().zip(&back.bands[b].data).all(same), "{at}, band {b}: {:?}", back.bands[b].data);
+                    }
                 }
             }
         }

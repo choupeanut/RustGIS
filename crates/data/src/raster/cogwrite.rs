@@ -137,8 +137,9 @@ fn fits_shorts(r: &Raster, b: usize) -> bool {
     r.data_type == "UInt16" && nodata_ok && ((s.min >= 0.0 && s.max <= 65_535.0) || s.count == 0)
 }
 
-/// Chooses the file's samples like [`super::geotiff::write`] does: a colour raster's colour bands
-/// (as bytes when they are bytes, alpha kept), otherwise `band` alone. 16-bit rasters stay 16-bit,
+/// Chooses the file's samples like [`super::geotiff::write`] does, except that a colour cell with
+/// no value under an opaque alpha is written see-through here (its alpha 0), not as floats there:
+/// a colour raster's colour bands (as bytes when they are bytes, alpha kept), otherwise `band` alone. 16-bit rasters stay 16-bit,
 /// and a grey byte raster is written as bytes when no pixel needs a no-data value the bytes can't
 /// hold. Grey with alpha keeps both bands; a palette raster keeps its colour table.
 fn plan(r: &Raster, band: usize) -> Result<Plan> {
