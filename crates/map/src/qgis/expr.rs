@@ -199,7 +199,8 @@ fn unreadable_differs(expr: &str, d: Dialect) -> bool {
                     texts |= c == '\'' && text.chars().any(cased);
                     ascii |= c == '\'' && text.chars().any(|c| c.is_ascii_alphabetic());
                     wide |= c == '\'' && text.chars().any(|c| !c.is_ascii() && cased(c));
-                    outer.push(' ');
+                    // The quote stays, so a call can tell a field (`lower("n")`) from a text (`lower('X')`).
+                    outer.push(c);
                     i = next;
                 }
                 None => return false,
@@ -210,15 +211,17 @@ fn unreadable_differs(expr: &str, d: Dialect) -> bool {
             }
         }
     }
-    // Folding the case by hand (`lower("n") = 'x'`) is how QGIS ignores it.
+    // Folding the case by hand (`lower("n") = 'x'`) is how QGIS ignores it, when the folded field is
+    // all that is compared: not for a text folded (`"n" = lower('X')`), nor a concatenation.
     let words: Vec<&str> = outer.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
-    let called = |f: &str| {
+    let folds_field = |f: &str| {
         outer.match_indices(f).any(|(at, _)| {
             let start = outer.get(..at).is_some_and(|b| !b.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
-            start && outer.get(at + f.len()..).is_some_and(|r| r.trim_start().starts_with('('))
+            let arg = outer.get(at + f.len()..).and_then(|r| r.trim_start().strip_prefix('(')).map(str::trim_start);
+            start && arg.is_some_and(|a| a.starts_with('"'))
         })
     };
-    if !texts || called("lower") || called("upper") {
+    if !texts || ((folds_field("lower") || folds_field("upper")) && !outer.contains("||")) {
         return false;
     }
     let cmp = outer.replace("<>", " ").replace("!=", " ");
@@ -292,10 +295,23 @@ pub(super) fn null_in_not_in(expr: &str) -> bool {
     let spaced = outer.replace('(', " ( ").replace(')', " ) ").replace(',', " ");
     let words: Vec<&str> = spaced.split_whitespace().collect();
     (0..words.len()).any(|i| {
-        words.get(i) == Some(&"not")
-            && words.get(i + 1) == Some(&"in")
-            && words.get(i + 2) == Some(&"(")
-            && words.get(i + 3..).unwrap_or_default().iter().take_while(|w| **w != ")").any(|w| *w == "null")
+        // `NOT IN (`, or `NOT f IN (` with the field unquoted (a quoted one is blanked above).
+        let at = if words.get(i + 1).is_some_and(|w| *w != "in") { i + 2 } else { i + 1 };
+        if words.get(i) != Some(&"not") || words.get(at) != Some(&"in") || words.get(at + 1) != Some(&"(") {
+            return false;
+        }
+        // The list ends at the `)` that closes its own `(`: a call inside it has one of its own.
+        let mut depth = 0usize;
+        let mut list = words.get(at + 2..).unwrap_or_default().iter().take_while(|w| {
+            match **w {
+                "(" => depth += 1,
+                ")" if depth == 0 => return false,
+                ")" => depth -= 1,
+                _ => {}
+            }
+            true
+        });
+        list.any(|w| *w == "null")
     })
 }
 
@@ -452,6 +468,9 @@ mod tests {
             ("left(\"n\", 1) = 'É'", false, false, false),
             ("left(\"n\", 1) > 'É'", true, true, true),
             ("lower(\"n\") = 'x'", false, false, false),
+            // A folded text, or a folded part of a concatenation, doesn't fold the whole compared text.
+            ("\"k\" = lower('X')", true, true, false),
+            ("lower(\"prefix\") || \"kind\" = 'xy'", true, true, false),
             ("flower(\"n\") = 'x'", true, true, false),
             ("upper(\"n\") LIKE '%PARK%'", false, false, false),
             // A folded field in one part doesn't excuse the texts of the others.
@@ -471,6 +490,11 @@ mod tests {
         // A filter that doesn't tokenize (a function, arithmetic, `BETWEEN`) is read the same way.
         assert!(null_in_not_in("\"a\" + 1 > 2 AND \"p\" NOT IN (1, NULL)"));
         assert!(null_in_not_in("upper(\"n\") = 'x' OR p NOT IN ('a', NULL)"));
+        // A call in the list has its own brackets: the NULL after it is still in the list, and an
+        // unquoted field after NOT is the same predicate.
+        assert!(null_in_not_in("\"p\" NOT IN (length('ab'), NULL)") && null_in_not_in("p NOT IN (abs(1), NULL)"));
+        assert!(null_in_not_in("NOT p IN (1, NULL)") && null_in_not_in("NOT \"p\" IN (1, NULL)"));
+        assert!(!null_in_not_in("\"p\" NOT IN (abs(1), 2)") && !null_in_not_in("NOT p IN (1, 2)"));
         assert!(
             !null_in_not_in("\"p\" NOT IN (1, 2)") && !null_in_not_in("\"p\" IN (1, NULL)") && !null_in_not_in("p IN (1) AND q IS NULL")
         );
