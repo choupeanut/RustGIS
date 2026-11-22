@@ -782,14 +782,13 @@ struct Tally {
 
 impl Tally {
     fn saw(&mut self, window: &Extent, counts: &[usize]) {
-        let none = counts.iter().all(|n| *n == 0);
-        if let Some(at) = self.windows.iter().position(|(w, _)| w == window) {
-            if none {
+        let at = self.windows.iter().position(|(w, _)| w == window);
+        if counts.iter().all(|n| *n == 0) {
+            if let Some(at) = at {
                 self.windows.remove(at);
-            } else if let Some((_, kept)) = self.windows.get_mut(at) {
-                *kept = counts.to_vec();
             }
-        } else if none {
+        } else if let Some((_, kept)) = at.and_then(|at| self.windows.get_mut(at)) {
+            *kept = counts.to_vec();
         } else if self.windows.len() < WINDOWS_COUNTED {
             self.windows.push((*window, counts.to_vec()));
         } else {
@@ -2219,6 +2218,10 @@ mod tests {
         source.saw_null_text(&a, &[2]);
         assert_eq!(std::mem::take(&mut source.not_utf8).total(), Some(vec![1]));
         assert_eq!(std::mem::take(&mut source.null_text).total(), Some(vec![2]));
+        source.saw_unread_dates(&a, &[1], &[1]);
+        source.saw_unread_dates(&a, &[1], &[1]);
+        assert_eq!(std::mem::take(&mut source.unread_dates).total(), Some(vec![1]));
+        assert_eq!(std::mem::take(&mut source.rounded_dates).total(), Some(vec![1]));
     }
 
     /// A view read's notes are said once for each kind, whatever count a later read of another
