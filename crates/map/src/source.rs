@@ -845,7 +845,7 @@ impl SourceLayer {
         let fields = self.info().map(|i| i.fields.clone())?;
         let counts = self.not_utf8.take()?;
         self.not_utf8_said = true;
-        rustgis_data::source::not_utf8_note(&fields, &counts)
+        rustgis_data::source::not_utf8_note(&fields, &counts, self.handle.as_ref().map_or("UTF-8", |h| h.text_encoding()))
     }
 
     /// Keeps what view reads said they lost or assumed ([`Batch::notes`]) until
