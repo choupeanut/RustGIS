@@ -10188,6 +10188,7 @@ fn a_terrain_block_object_changes_only_the_keys_it_gives() {
         .unwrap();
     let walls = json!({"color": "#E0D0B0", "layer": geo});
     assert_eq!(block(v)["water"], json!(null));
+    let first = s.map().view.terrain.clone();
     // The water set alone leaves the box, the depth and the walls as they were.
     let v = s.run("map.terrain", &json!({"block": {"water": {"depth": 5}}})).unwrap();
     let b = block(v);
@@ -10195,8 +10196,9 @@ fn a_terrain_block_object_changes_only_the_keys_it_gives() {
     assert_eq!(b["water"], json!({"depth": 5.0}));
     // Undo puts the whole old block back.
     s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.map().view.terrain, first, "the whole old block (box, depth, walls, water) comes back");
     let back = s.map().view.terrain.as_ref().and_then(|t| t.block.clone()).unwrap();
-    assert!(back.water.is_none() && back.depth == Some(300.0), "{back:?}");
+    assert!(back.water.is_none() && back.depth == Some(300.0) && back.extent.is_some(), "{back:?}");
     s.run("edit.redo", &Value::Null).unwrap();
     // The terrain's water can't go under the block's water, and the refusal says how to take that off.
     let before = s.map().view.terrain.clone();

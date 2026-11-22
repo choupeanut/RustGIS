@@ -109,7 +109,8 @@ that many metres below the lowest ground in the box (ground with no height, draw
 walls are, darker toward their foot, and outlined. Left out, the block stays as it was, and
 a `"block"` object changes only the keys it gives: keys left out stay as they were, and `null` puts one back to its
 default (`"extent": null` the DEM's extent, `"depth": null` half the relief, `"walls": null` `#C8B89A` with no layer,
-`"shape": null` a box, `"radius": null` the circle's largest); `"water"` is given whole (`{depth, field}`) each time.
+`"water": null` or `false` no water in the walls, `"shape": null` a box, `"radius": null` the circle's largest);
+the block's `"water"` is given whole (`{depth, field}`) each time: `{"water": {"depth": 5}}` replaces a water that had a field.
 Without a block, the keys left out take the defaults, and `"block": true` keeps a block as it is, or draws one with them;
 `"block": false` takes it off. It shows in the settled view and in exported maps (over elevation tiles, the walls once the
 box's tiles are read); while the map
