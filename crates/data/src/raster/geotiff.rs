@@ -2004,10 +2004,24 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
     // The fourth sample of a colour file says what it is: alpha, or data (as RGB and near-infrared).
     let fourth = || vec![if matches!(r.color, ColorHint::Rgb { alpha: true }) { 2 } else { 0 }];
     // Without alpha or a no-data marker, byte samples cannot keep NaN holes (for example the
-    // cells outside a reprojected RGBI image). Keep those samples as floats instead.
-    let byte_holes = r.nodata.is_none()
-        && matches!(r.color, ColorHint::Rgb { alpha: false })
-        && written_bands(r, band).iter().any(|b| r.bands.get(*b).is_some_and(|b| b.stats.count < (w as usize) * (h as usize)));
+    // cells outside a reprojected RGBI image). Keep those samples as floats instead. With alpha,
+    // a hole its alpha hides is fine (the cell is see-through), but one under an opaque alpha
+    // would be written as an opaque 0. Looked at only when the byte branch is reached.
+    let byte_holes = || {
+        r.nodata.is_none()
+            && match r.color {
+                ColorHint::Rgb { alpha: false } => {
+                    written_bands(r, band).iter().any(|b| r.bands.get(*b).is_some_and(|b| b.stats.count < (w as usize) * (h as usize)))
+                }
+                ColorHint::Rgb { alpha: true } => (0..3).any(|b| {
+                    r.bands
+                        .get(b)
+                        .zip(r.see_through_cells(b))
+                        .is_some_and(|(band, hidden)| band.data.iter().enumerate().any(|(i, v)| !v.is_finite() && !hidden(i)))
+                }),
+                _ => false,
+            }
+    };
     let all: Vec<usize> = (0..r.bands.len()).collect();
     if every && written_bands(r, band).len() < all.len() {
         // More bands than colour (or one grey band) takes: each a 32-bit float sample, the first
@@ -2052,7 +2066,7 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
             wide!(|v: f32| v, Sample::Float, f32::to_le_bytes)
         }
     } else if rgb
-        && !byte_holes
+        && !byte_holes()
         && (!written_bands(r, band).contains(&3) || fits_bytes(r, 3))
         && let (Some(red), Some(green), Some(blue)) = (bytes(0), bytes(1), bytes(2))
     {
@@ -2719,6 +2733,33 @@ mod tests {
             let r = Raster::new("rgba", 2, 2, bands, gt, Crs::LonLat, None, ColorHint::Rgb { alpha: true }, dt).unwrap();
             let back = read(std::io::Cursor::new(write(&r, 0).unwrap()), "rgba").unwrap();
             assert_eq!((back.band_count(), back.color.clone()), (4, ColorHint::Rgb { alpha: true }), "{dt}");
+        }
+    }
+
+    /// An 8-bit RGBA raster with no no-data value keeps a NaN colour under an opaque alpha (as
+    /// floats, not as an opaque 0); a NaN the alpha already hides, and a clean raster, stay bytes.
+    #[test]
+    fn rgba_nan_colour_under_opaque_alpha_is_not_written_as_zero() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let rgba = |red: [f32; 3], alpha: [f32; 3]| {
+            let bands = vec![red.to_vec(), vec![5.0; 3], vec![6.0; 3], alpha.to_vec()];
+            Raster::new("rgba", 3, 1, bands, gt, Crs::LonLat, None, ColorHint::Rgb { alpha: true }, "UInt8").unwrap()
+        };
+        let nan = f32::NAN;
+        for (case, r, floats) in [
+            ("NaN under an opaque alpha", rgba([1.0, nan, 2.0], [255.0; 3]), true),
+            ("NaN under a clear alpha", rgba([1.0, nan, 2.0], [255.0, 0.0, 255.0]), false),
+            ("no NaN", rgba([1.0, 3.0, 2.0], [255.0; 3]), false),
+        ] {
+            for (writer, bytes) in [("write", write(&r, 0).unwrap()), ("write_all", write_all(&r).unwrap())] {
+                let back = read(std::io::Cursor::new(bytes), "back").unwrap();
+                let expected = if floats { "Float32" } else { "UInt8" };
+                assert_eq!(back.data_type, expected, "{case}, {writer}");
+                if floats {
+                    assert!(back.bands[0].data[1].is_nan(), "{case}, {writer}: {:?}", back.bands[0].data);
+                    assert_eq!(back.bands[0].data[0], 1.0, "{case}, {writer}");
+                }
+            }
         }
     }
 
