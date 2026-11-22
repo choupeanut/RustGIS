@@ -761,4 +761,16 @@ fn malformed_values_are_counted_per_value_and_clean_text_says_nothing() {
     let files = parts(&full, 0x13, None);
     let (_, report) = io::read_zip("places.zip", &rustgis_data::zip::write(&files).unwrap()).unwrap().remove(0);
     assert_eq!(report.messages, [invalid_note(1, "name", "Shift_JIS")]);
+    // The same through a standalone `.dbf` and a read in place.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in files {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let (_, report) = io::read_path(&dir.path().join("places.dbf")).unwrap();
+        assert_eq!(report.messages, [invalid_note(1, "name", "Shift_JIS")]);
+        let src = open_shp(&dir.path().join("places.shp"), "places").unwrap();
+        assert_eq!(rustgis_data::source::materialize(&src).unwrap().1.messages, [invalid_note(1, "name", "Shift_JIS")]);
+    }
 }

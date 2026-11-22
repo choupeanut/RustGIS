@@ -66,7 +66,8 @@ fields, and another counts such field names. A file whose text is all valid UTF-
 Text read in a code page that is decoded here (932 Shift_JIS, 936 GBK, 949 EUC-KR, 950 Big5, the
 Windows pages and the rest) is counted the same way when its bytes aren't valid in that page: the
 notices say how many values and field names, in which fields, and that the `.cpg` or the `.dbf`'s
-language driver declares it. The DOS pages (437, 850, 852, 861, 865) give every byte a character, so nothing in them is replaced.
+language driver declares it. The DOS pages (437, 850, 852, 861, 865) give every byte a
+character, so nothing in them is replaced.
 
 The existing transitive `yore` 1.4.0 package has CP737, CP857, CP860 and CP863 decoders,
 but RustGIS's current `dbase` adapter does not expose them. Making these available would
@@ -88,7 +89,7 @@ tables or system programs are needed for the supported decoders above.
 - [`yore`'s `CodePage` implementations](https://docs.rs/yore/1.4.0/yore/trait.CodePage.html#implementors)
   list the available legacy decoders and lossy decoding API.
 
-`crates/data/tests/shapefile_encoding.rs` specifies fixed bytes and Unicode expectations
+`crates/data/tests/integration/shapefile_encoding.rs` specifies fixed bytes and Unicode expectations
 independently of RustGIS's mapping. Its matrix covers every marker above, names and values,
 ZIP and loose-file imports, a genuinely sampled streamed read, a complete read, and ordered
 chunk traversal. It also checks `.cpg` precedence, fallback diagnostics, the notices for text
