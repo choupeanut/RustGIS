@@ -64,12 +64,17 @@ const MARKER_READ_BYTES: usize = if cfg!(test) { 1 << 10 } else { rustgis_map::s
 
 /// The importer's reader of raster image markers' images ([`qgis::ReadImage`]): [`marker_image`]
 /// within [`MARKER_READ_BYTES`] for the import. On the import's thread, as the rest of it is
-/// (`import_project` and `import_style` say why): each read is one file of at most 1.5 MiB, only
-/// a regular file is opened (a pipe or a device would wait for a writer), and the bound caps them
-/// all.
+/// (`import_project` says why; `import_style` reads on a thread of its own in the desktop app,
+/// [`style_ahead`]): each read is one file of at most 1.5 MiB, only a regular file is opened (a
+/// pipe or a device would wait for a writer), and the bound caps them all. Each looks at Cancel.
 fn marker_images() -> impl FnMut(&str) -> Result<(String, f32), &'static str> {
     let mut read = 0;
     move |source| {
+        // On a read's thread (a style imported in the desktop app) Cancel stops it here, the
+        // work's result then dropped; with no read running nothing is asked.
+        if rustgis_data::progress::check().is_err() {
+            return Err("cancelled");
+        }
         if read >= MARKER_READ_BYTES {
             return Err("past the bytes of images an import reads");
         }
@@ -1991,20 +1996,57 @@ fn notify_report(s: &mut Session, report: &Report) {
     }
 }
 
-/// Imports a QGIS style onto a layer. On the thread that runs it: the style import isn't among
-/// the commands whose reads the app makes on a thread first ([`super::reads`]), as it wasn't
-/// before it read marker images. Reading the style and its images there, with Cancel, is its own
-/// change. Its work is bounded by the style: one file of at most [`MAX_FILE`] bytes, its XML
+/// A QGIS style file read and parsed: the style and what it couldn't carry over.
+type StyleRead = Result<(qgis::Style, Report), String>;
+
+/// Reads and parses the style file `p` names (or gives) for the layer called `layer`: its raster
+/// image markers' relative files start from the style file's folder.
+fn read_style_file(p: &Value, layer: &str) -> StyleRead {
+    let text = qgis_text(p)?;
+    rustgis_data::progress::check().map_err(|e| e.to_string())?;
+    let mut report = Report::default();
+    let style = qgis::read_style(&text, layer, &file_dir(p).unwrap_or_default(), &mut marker_images(), &mut report)?;
+    Ok((style, report))
+}
+
+/// A style read ahead: for the layer it was read for, as it was called then.
+struct StyleAhead {
+    layer: String,
+    read: StyleRead,
+}
+
+/// The key a style read ahead is taken by (see [`super::reads`]).
+fn ahead_key(id: u32) -> String {
+    format!("style.importQgis:{id}")
+}
+
+/// The read `style.importQgis` makes before it runs in the desktop app: on a thread of its own, with
+/// Cancel. A request that is wrong gives nothing, or its error: the command says why. It holds a
+/// copy of the command's own `text` or `data` (at most [`MAX_XML`] bytes or their base64) while it
+/// reads, none of the layer's.
+pub(crate) fn style_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
+    let id = s.layer_id(p).ok()?;
+    let layer = s.map().layer(id)?.name.clone();
+    let p = p.clone();
+    Some(super::reads::ahead("Import QGIS Style", ahead_key(id), move || StyleAhead { read: read_style_file(&p, &layer), layer }))
+}
+
+/// Imports a QGIS style onto a layer. Its reads are made before it runs where the app can make
+/// them on a thread of its own ([`super::reads`]: the desktop app, with Cancel, no progress count;
+/// the style is applied only when they are done, so a cancelled import leaves the layer as it was);
+/// run anywhere else (the command line, a script, the browser) it reads here, on the thread that
+/// runs it. Its work is bounded by the style: one file of at most [`MAX_FILE`] bytes, its XML
 /// parsed within [`MAX_XML`], and its raster image markers' images within [`MARKER_READ_BYTES`],
 /// each file read once and decoded once to check it (see [`marker_images`] and [`marker_image`]).
+/// Cancel is looked at before each image: the file's one read and the XML's one parse don't.
 fn import_style(s: &mut Session, p: &Value) -> CmdResult {
-    let text = qgis_text(p)?;
     let id = s.layer_id(p)?;
     let name = s.map().layer(id).map(|l| l.name.clone()).ok_or("no such layer")?;
-    let mut report = Report::default();
-    // Its raster image markers' relative files start from the style file's folder.
-    let dir = file_dir(p).unwrap_or_default();
-    let style = qgis::read_style(&text, &name, &dir, &mut marker_images(), &mut report)?;
+    let (style, mut report) = match super::reads::take::<StyleAhead>(s, &ahead_key(id)) {
+        Some(a) if a.layer == name => a.read?,
+        Some(_) => return Err("the layer was renamed while its style was read: import it again".into()),
+        None => read_style_file(p, &name)?,
+    };
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     if l.raster.is_some() {
         // A style that doesn't fit leaves the raster as it was, its opacity and scale range too.
