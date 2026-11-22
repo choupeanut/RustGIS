@@ -6372,7 +6372,7 @@ pub(crate) fn import(s: &mut Session, text: &str) -> CmdResult {
         );
     }
     // A frame of a map drawn in Web Mercator can't be centred past its limit: moved to it, and said.
-    let moved = rustgis_map::layout::LayoutRepairs { frames_moved: l.keep_in_mercator(&s.project.maps), ..Default::default() };
+    let moved = rustgis_map::layout::LayoutRepairs { frames_moved: l.keep_centres_placeable(&s.project.maps), ..Default::default() };
     if !moved.is_empty() {
         for notice in crate::project::layout_notices(&l.name, "while importing the layout file", 0, &[(l.name.clone(), moved)]) {
             s.notify(notice, false);

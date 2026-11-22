@@ -22,12 +22,12 @@ pub const PAPER_M_PER_PT: f64 = 0.0254 / 96.0;
 /// The largest a map frame's scale can be: 2:1, larger than life for finds drawings (#902). Even
 /// there its camera ([`frame_camera`]) stays above the map's closest zoom
 /// ([`crate::camera::MIN_RES`]) anywhere on Web Mercator.
-/// The farthest north or south a map frame's centre may be (degrees): a pole is a place in a polar
-/// projection (#2684). Web Mercator stops at [`rustgis_geom::MAX_LAT`] (see [`Layout::keep_in_mercator`]).
-pub const MAX_CENTER_LAT: f64 = 90.0;
 pub const MIN_FRAME_SCALE: f64 = 0.5;
 /// The smallest: the whole world many times over.
 pub const MAX_FRAME_SCALE: f64 = 1e10;
+/// The farthest north or south a map frame's centre may be (degrees): a pole is a place in a polar
+/// projection (#2684). A map that can't show it has the centre moved ([`Layout::keep_centres_placeable`]).
+pub const MAX_CENTER_LAT: f64 = 90.0;
 
 /// The tokens a layout's text expands besides the map's ([`crate::graphics::TOKENS`], from its
 /// first map frame), with what each shows.
@@ -2664,25 +2664,26 @@ impl Layout {
             frames_moved: 0,
         }
     }
-}
 
-impl Layout {
-    /// Moves the centre of each map frame whose map is drawn in Web Mercator (the globe too) from
-    /// beyond its latitude limit, [`rustgis_geom::MAX_LAT`], to it, as the map draws it, and
-    /// counts them. A pole is no place in Web Mercator, but is in a polar projection, so
-    /// [`Layout::clamp`], which knows no map, leaves it. A frame of a map not in `maps` is left.
-    pub fn keep_in_mercator(&mut self, maps: &[Map]) -> usize {
+    /// Moves the centre of each map frame past [`rustgis_geom::MAX_LAT`] whose map can't show it
+    /// to that limit, as a map drawn in Web Mercator (the globe too) does, and counts them.
+    /// [`Layout::clamp`] knows no map, so it keeps a pole, which a polar projection places; one
+    /// that can't place the centre but can place the limit at its longitude (World Mercator,
+    /// EPSG:3395) moves it, and a map that places the pole is left alone. A frame of a map not in
+    /// `maps` is left too.
+    pub fn keep_centres_placeable(&mut self, maps: &[Map]) -> usize {
         let mut moved = 0usize;
         for e in &mut self.elements {
             if let ElementKind::MapFrame { map, center, .. } = &mut e.kind
                 && center.y.abs() > rustgis_geom::MAX_LAT
-                && maps
-                    .iter()
-                    .find(|m| m.name.eq_ignore_ascii_case(map))
-                    .is_some_and(|m| matches!(m.flat(), crate::projection::Flat::Mercator))
+                && let Some(m) = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))
             {
-                center.y = rustgis_geom::MAX_LAT.copysign(center.y);
-                moved = moved.saturating_add(1);
+                let limit = Coord::new(center.x, rustgis_geom::MAX_LAT.copysign(center.y));
+                let mercator = matches!(m.flat(), crate::projection::Flat::Mercator);
+                if mercator || (m.to_map(*center).is_none() && m.to_map(limit).is_some()) {
+                    center.y = limit.y;
+                    moved = moved.saturating_add(1);
+                }
             }
         }
         moved
@@ -2706,8 +2707,8 @@ pub struct LayoutRepairs {
     /// Map frames whose grid had MGRS labels on a graticule or over a system other than a WGS 84
     /// UTM zone, turned off.
     pub mgrs_off: usize,
-    /// Map frames in a Web Mercator map moved from beyond its latitude limit to it
-    /// ([`Layout::keep_in_mercator`], which the caller runs, as it knows the maps).
+    /// Map frames whose map can't show their centre, past 85.05° latitude, moved to that limit
+    /// ([`Layout::keep_centres_placeable`], which the caller runs, as it knows the maps).
     pub frames_moved: usize,
 }
 
@@ -3740,7 +3741,7 @@ mod tests {
         let maps = [Map::new("M")];
         let mut l = frames_at(&[-90.0, 90.0, 85.0, -85.0511, 12.0]);
         l.clamp();
-        assert_eq!(l.keep_in_mercator(&maps), 2);
+        assert_eq!(l.keep_centres_placeable(&maps), 2);
         let lats: Vec<f64> = l
             .elements
             .iter()
@@ -3750,10 +3751,22 @@ mod tests {
             })
             .collect();
         assert_eq!(lats, [-rustgis_geom::MAX_LAT, rustgis_geom::MAX_LAT, 85.0, -85.0511, 12.0]);
-        assert_eq!(l.keep_in_mercator(&maps), 0, "moved once");
+        assert_eq!(l.keep_centres_placeable(&maps), 0, "moved once");
         let mut l = frames_at(&[90.0]);
-        assert_eq!(l.keep_in_mercator(&[Map::new("Other")]), 0, "its map isn't here");
+        assert_eq!(l.keep_centres_placeable(&[Map::new("Other")]), 0, "its map isn't here");
         assert_eq!(first_centre(&l).y, 90.0);
+        // A polar projection places the pole: left. World Mercator can't: moved to its limit.
+        let map_in = |code: &str| {
+            let mut m = Map::new("M");
+            m.set_projection(crate::Projection::Custom(code.into()));
+            m
+        };
+        let mut l = frames_at(&[-90.0]);
+        assert_eq!(l.keep_centres_placeable(&[map_in("EPSG:3031")]), 0);
+        assert_eq!(first_centre(&l).y, -90.0);
+        let mut l = frames_at(&[-90.0, 80.0]);
+        assert_eq!(l.keep_centres_placeable(&[map_in("EPSG:3395")]), 1);
+        assert_eq!(first_centre(&l).y, -rustgis_geom::MAX_LAT);
     }
 
     #[test]

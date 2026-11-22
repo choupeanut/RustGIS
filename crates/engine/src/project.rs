@@ -1496,7 +1496,7 @@ impl Project {
         let mut repairs = Vec::new();
         for l in &mut self.layouts {
             let mut r = l.clamp();
-            r.frames_moved = l.keep_in_mercator(&self.maps);
+            r.frames_moved = l.keep_centres_placeable(&self.maps);
             if !r.is_empty() {
                 repairs.push((l.name.clone(), r));
             }
@@ -2645,7 +2645,7 @@ pub(crate) fn layout_notices(
     let moved = total(|r| r.frames_moved);
     if moved > 0 {
         notices.push(format!(
-            "{name}: the centre of {moved} map frame(s) in a Web Mercator map, beyond its 85.05° latitude limit, moved to it {when} (in {})",
+            "{name}: the centre of {moved} map frame(s) lies past 85.05° latitude, which its map's projection can't show, and was moved to that limit {when} (in {})",
             layout_names(repairs, |r| r.frames_moved)
         ));
     }

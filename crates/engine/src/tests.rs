@@ -14861,7 +14861,7 @@ fn frame_centre(s: &Session, layout: usize) -> rustgis_data::Coord {
 
 #[test]
 fn a_frame_centred_on_a_pole_stays_there_in_a_polar_projection() {
-    let moved = |s: &Session, from: u64| s.notices_since(from).iter().filter(|n| n.text.contains("latitude limit")).count();
+    let moved = |s: &Session, from: u64| s.notices_since(from).iter().filter(|n| n.text.contains("projection can't show")).count();
     let mut s = Session::new(Project::default());
     s.run("map.projection", &json!({"type": "EPSG:3031"})).unwrap();
     let mark = s.notice_mark();
@@ -14904,6 +14904,16 @@ fn a_frame_centred_on_a_pole_stays_there_in_a_polar_projection() {
     s.run("project.open", &json!({"path": path})).unwrap();
     assert_eq!(moved(&s, mark), 1, "{:?}", s.notices_since(mark));
     assert_eq!(frame_centre(&s, 2).y, rustgis_geom::MAX_LAT);
+    // World Mercator (EPSG:3395) is no polar projection either: it can't place a pole, so a frame
+    // centred on one is moved to the limit it can, and said, where Web Mercator's own edge isn't
+    // asked for (the pole stays in 3031 above, where it is placed).
+    s.run("map.projection", &json!({"type": "EPSG:3395"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("layout.import", &json!({"text": frame_at_latitude(85.0)})).unwrap();
+    assert_eq!(moved(&s, mark), 0, "within the limit");
+    s.run("layout.import", &json!({"text": frame_at_latitude(90.0)})).unwrap();
+    assert_eq!(moved(&s, mark), 1, "{:?}", s.notices_since(mark));
+    assert_eq!(frame_centre(&s, 4).y, rustgis_geom::MAX_LAT);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
