@@ -70,8 +70,9 @@ const MARKER_READ_BYTES: usize = if cfg!(test) { 1 << 10 } else { rustgis_map::s
 fn marker_images() -> impl FnMut(&str) -> Result<(String, f32), &'static str> {
     let mut read = 0;
     move |source| {
-        // On a read's thread (a style imported in the desktop app) Cancel stops it here, the
-        // work's result then dropped; with no read running nothing is asked.
+        // Under a Cancel (a style read on a thread of its own, a project imported by a script or model)
+        // a Cancel stops the images here; the import notes each as skipped, so its caller looks at
+        // Cancel again once the parse is done and gives the cancelled error. With none, nothing is asked.
         if rustgis_data::progress::check().is_err() {
             return Err("cancelled");
         }
@@ -165,6 +166,9 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
     let dir = ps(p, "dir").filter(|d| !d.trim().is_empty()).map(str::to_string).or_else(|| file_dir(p));
     let mut report = Report::default();
     let project = qgis::read_project(&text, dir.as_deref().unwrap_or_default(), &mut marker_images(), &mut report)?;
+    // A script or model runs this under its Cancel: one that came during the images was noted as a
+    // skipped image, and no layer is added for a cancelled run.
+    rustgis_data::progress::check().map_err(|e| e.to_string())?;
     // A map of its own, named as the project.
     let name = if project.title.is_empty() { "QGIS project" } else { project.title.as_str() };
     s.run_part("map.new", &json!({"name": name}))?;
@@ -2006,6 +2010,8 @@ fn read_style_file(p: &Value, layer: &str) -> StyleRead {
     rustgis_data::progress::check().map_err(|e| e.to_string())?;
     let mut report = Report::default();
     let style = qgis::read_style(&text, layer, &file_dir(p).unwrap_or_default(), &mut marker_images(), &mut report)?;
+    // A Cancel that came during the images was noted as a skipped image: the read is cancelled.
+    rustgis_data::progress::check().map_err(|e| e.to_string())?;
     Ok((style, report))
 }
 
@@ -2042,6 +2048,7 @@ pub(crate) fn style_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWo
 fn import_style(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let name = s.map().layer(id).map(|l| l.name.clone()).ok_or("no such layer")?;
+    // The name is the only layer input `read_style` uses, so a style read for another name is read again by the user.
     let (style, mut report) = match super::reads::take::<StyleAhead>(s, &ahead_key(id)) {
         Some(a) if a.layer == name => a.read?,
         Some(_) => return Err("the layer was renamed while its style was read: import it again".into()),

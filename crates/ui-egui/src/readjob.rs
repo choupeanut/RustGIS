@@ -1715,6 +1715,17 @@ mod tests {
         assert!(matches!(app.session.map().layer(id).unwrap().symbol(0).marker, rustgis_engine::map::Marker::Picture(_)));
         app.run("edit.undo", Value::Null).unwrap();
         assert!(matches!(app.session.map().layer(id).unwrap().symbol(0).marker, rustgis_engine::map::Marker::Circle));
+        // A clean style says nothing; one whose image isn't a PNG or JPEG says so once, on landing.
+        let said = |app: &RustGisApp| app.session.notices.iter().filter(|n| n.text.contains("isn't a PNG or JPEG")).count();
+        assert_eq!(said(&app), 0);
+        std::fs::write(dir.path().join("pin.gif"), b"GIF89a").unwrap();
+        let gif = dir.path().join("gif.qml");
+        let text = std::fs::read_to_string(&path).unwrap().replace(&picture.display().to_string(), "pin.gif");
+        std::fs::write(&gif, text).unwrap();
+        app.run_by_user("style.importQgis", json!({"layer": id, "path": gif})).unwrap();
+        assert_eq!(said(&app), 0, "said on landing, not before");
+        landed(&mut app, 60);
+        assert_eq!(said(&app), 1);
     }
 
     /// Task steps cannot bypass the worker through direct or scripted table writes.

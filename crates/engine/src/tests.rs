@@ -3599,6 +3599,28 @@ fn qgis_style_import_reads_its_files_ahead() {
     assert!(e.contains("cancelled"), "{e}");
     assert!(control.looked() > 0, "never looks at Cancel");
     assert!(contents(&s.project) == before);
+    // A Cancel that comes at any check (the file's, each image's, after the parse) is the cancelled
+    // error, not a style with its image noted as skipped; read here under the same probe as well.
+    let count = Control::cancelled_at_look(u64::MAX);
+    crate::cmd::reads::read_ahead(&mut s, "style.importQgis", &p).unwrap().run(&count).unwrap();
+    assert!(count.looked() >= 3, "the file, the image and the parse's end look: {}", count.looked());
+    for n in 1..=count.looked() {
+        let e = crate::cmd::reads::read_ahead(&mut s, "style.importQgis", &p).unwrap().run(&Control::cancelled_at_look(n)).err().unwrap();
+        assert!(e.contains("cancelled"), "check {n}: {e}");
+    }
+    let here = Control::cancelled_at_look(u64::MAX);
+    {
+        let _probe = rustgis_analysis::control::install_progress(Some(here.clone()));
+        s.run("style.importQgis", &p).unwrap();
+    }
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert!(here.looked() >= 3, "read here: {}", here.looked());
+    for n in 1..=here.looked() {
+        let _probe = rustgis_analysis::control::install_progress(Some(Control::cancelled_at_look(n)));
+        let e = s.run("style.importQgis", &p).unwrap_err();
+        assert!(e.contains("cancelled"), "check {n}, read here: {e}");
+        assert!(contents(&s.project) == before, "check {n}");
+    }
     // Renamed while it was read: refused, the layer as it was.
     let read = crate::cmd::reads::read_ahead(&mut s, "style.importQgis", &p).unwrap().run(&Control::stoppable()).unwrap();
     let id = s.layer_id(&p).unwrap();
