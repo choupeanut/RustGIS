@@ -192,6 +192,7 @@ pub(super) fn case_differs(expr: &str, d: Dialect) -> bool {
 fn unreadable_differs(expr: &str, d: Dialect) -> bool {
     let chars: Vec<char> = expr.chars().collect();
     let (mut i, mut texts, mut ascii, mut wide, mut outer) = (0, false, false, false, String::new());
+    let (mut has_upper, mut has_lower) = (false, false);
     while let Some(&c) = chars.get(i) {
         match c {
             '"' | '\'' => match quoted(&chars, i, c) {
@@ -199,6 +200,8 @@ fn unreadable_differs(expr: &str, d: Dialect) -> bool {
                     texts |= c == '\'' && text.chars().any(cased);
                     ascii |= c == '\'' && text.chars().any(|c| c.is_ascii_alphabetic());
                     wide |= c == '\'' && text.chars().any(|c| !c.is_ascii() && cased(c));
+                    has_upper |= c == '\'' && text.chars().any(char::is_uppercase);
+                    has_lower |= c == '\'' && text.chars().any(char::is_lowercase);
                     // The quote stays, so a call can tell a field (`lower("n")`) from a text (`lower('X')`).
                     outer.push(c);
                     i = next;
@@ -212,16 +215,35 @@ fn unreadable_differs(expr: &str, d: Dialect) -> bool {
         }
     }
     // Folding the case by hand (`lower("n") = 'x'`) is how QGIS ignores it, when the folded field is
-    // all that is compared: not for a text folded (`"n" = lower('X')`), nor a concatenation.
+    // all that is compared: not for a text folded (`"n" = lower('X')`), nor a concatenation, nor a
+    // call or a `CASE` beside it, and only when the text is folded too (`lower("n") = 'X'` never
+    // matches in QGIS).
     let words: Vec<&str> = outer.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
     let folds_field = |f: &str| {
         outer.match_indices(f).any(|(at, _)| {
             let start = outer.get(..at).is_some_and(|b| !b.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
             let arg = outer.get(at + f.len()..).and_then(|r| r.trim_start().strip_prefix('(')).map(str::trim_start);
-            start && arg.is_some_and(|a| a.starts_with('"'))
+            // A quoted field (`"n"`), or a bare one (`n`) closed by its bracket.
+            let field = arg.is_some_and(|a| {
+                let name = a.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or_default();
+                let bare = name.starts_with(|c: char| c.is_alphabetic() || c == '_')
+                    && !matches!(name, "null" | "true" | "false")
+                    && a.get(name.len()..).is_some_and(|rest| rest.trim_start().starts_with(')'));
+                a.starts_with('"') || bare
+            });
+            start && field
         })
     };
-    if !texts || ((folds_field("lower") || folds_field("upper")) && !outer.contains("||")) {
+    let other_call = outer.match_indices('(').any(|(at, _)| {
+        let head = outer.get(..at).unwrap_or_default().trim_end();
+        let name = head.rsplit(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or_default();
+        !matches!(name, "lower" | "upper")
+    });
+    let case_expr = words.iter().any(|w| matches!(*w, "case" | "when" | "then" | "else"));
+    let (lower_field, upper_field) = (folds_field("lower"), folds_field("upper"));
+    let folded_text = (!lower_field || !has_upper) && (!upper_field || !has_lower);
+    let exempt = (lower_field || upper_field) && folded_text && !other_call && !case_expr && !outer.contains("||");
+    if !texts || exempt {
         return false;
     }
     let cmp = outer.replace("<>", " ").replace("!=", " ");
@@ -295,9 +317,19 @@ pub(super) fn null_in_not_in(expr: &str) -> bool {
     let spaced = outer.replace('(', " ( ").replace(')', " ) ").replace(',', " ");
     let words: Vec<&str> = spaced.split_whitespace().collect();
     (0..words.len()).any(|i| {
-        // `NOT IN (`, or `NOT f IN (` with the field unquoted (a quoted one is blanked above).
-        let at = if words.get(i + 1).is_some_and(|w| *w != "in") { i + 2 } else { i + 1 };
-        if words.get(i) != Some(&"not") || words.get(at) != Some(&"in") || words.get(at + 1) != Some(&"(") {
+        if words.get(i) != Some(&"not") {
+            return false;
+        }
+        // `NOT IN (`, or `NOT f IN (` with the field unquoted (a quoted one is blanked above), each
+        // maybe in brackets: `NOT (p IN (1, NULL))`.
+        let mut at = i + 1;
+        while words.get(at) == Some(&"(") {
+            at += 1;
+        }
+        if words.get(at) != Some(&"in") {
+            at += 1;
+        }
+        if words.get(at) != Some(&"in") || words.get(at + 1) != Some(&"(") {
             return false;
         }
         // The list ends at the `)` that closes its own `(`: a call inside it has one of its own.
@@ -468,6 +500,19 @@ mod tests {
             ("left(\"n\", 1) = 'É'", false, false, false),
             ("left(\"n\", 1) > 'É'", true, true, true),
             ("lower(\"n\") = 'x'", false, false, false),
+            // A folded field is exempt only when the text is folded too: `lower("n") = 'X'` never matches in QGIS.
+            ("lower(\"kind\") = 'x'", false, false, false),
+            ("upper(\"kind\") = 'X'", false, false, false),
+            ("lower(\"kind\") = 'X'", true, true, false),
+            ("upper(\"kind\") = 'x'", true, true, false),
+            ("lower(\"kind\") LIKE 'X%'", true, false, true),
+            // A bare field in the fold is the same field.
+            ("lower(kind) = 'x'", false, false, false),
+            ("lower(kind) = 'X'", true, true, false),
+            // A call or a CASE beside the fold doesn't excuse the other texts.
+            ("if(lower(\"n\") = 'x', \"kind\" = 'Y', FALSE)", true, true, false),
+            ("if(lower(\"n\") = 'x', \"kind\" = 'y', FALSE)", true, true, false),
+            ("CASE WHEN lower(\"n\") = 'x' THEN \"kind\" = 'y' END", true, true, false),
             // A folded text, or a folded part of a concatenation, doesn't fold the whole compared text.
             ("\"k\" = lower('X')", true, true, false),
             ("lower(\"prefix\") || \"kind\" = 'xy'", true, true, false),
@@ -495,6 +540,9 @@ mod tests {
         assert!(null_in_not_in("\"p\" NOT IN (length('ab'), NULL)") && null_in_not_in("p NOT IN (abs(1), NULL)"));
         assert!(null_in_not_in("NOT p IN (1, NULL)") && null_in_not_in("NOT \"p\" IN (1, NULL)"));
         assert!(!null_in_not_in("\"p\" NOT IN (abs(1), 2)") && !null_in_not_in("NOT p IN (1, 2)"));
+        // A NOT over a bracketed IN is the same predicate, NULL in its list or not.
+        assert!(null_in_not_in("NOT (p IN (1, NULL))") && null_in_not_in("NOT (\"p\" IN (1, NULL))"));
+        assert!(!null_in_not_in("NOT (p IN (1, 2))"));
         assert!(
             !null_in_not_in("\"p\" NOT IN (1, 2)") && !null_in_not_in("\"p\" IN (1, NULL)") && !null_in_not_in("p IN (1) AND q IS NULL")
         );
