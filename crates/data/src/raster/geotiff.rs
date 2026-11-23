@@ -1941,7 +1941,9 @@ fn float_cell(r: &Raster, opaque: f32, nan_cells: bool, is_alpha: bool, v: f32) 
 /// tag names (an opaque alpha is 1; a no-data value of 1, or of 0.5 and a half-see-through alpha
 /// of the right size). Then no-data is written as NaN, with the tag `nan`, in every band.
 fn alpha_hits_no_data(r: &Raster, opaque: f32, alpha: &[f32]) -> bool {
-    r.nodata.is_some() && alpha.iter().any(|&v| r.is_valid(v) && !r.is_valid(v / opaque))
+    // An alpha already on the float scale (`opaque` 1: a float raster, or no declared alpha) isn't
+    // changed, so can't collide: no scan.
+    r.nodata.is_some() && opaque != 1.0 && alpha.iter().any(|&v| r.is_valid(v) && !r.is_valid(v / opaque))
 }
 
 /// Writes a raster as a Deflate-compressed GeoTIFF: a colour raster's colour bands (RGB(A) bytes
@@ -2013,6 +2015,7 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
     // predictor.
     // Set when no-data is written as NaN (see [`alpha_hits_no_data`]): the tag then says so.
     let nan_tag = std::cell::Cell::new(false);
+    let nodata_tag = || if nan_tag.get() { Some("nan".to_string()) } else { r.nodata.map(|d| d.to_string()) };
     let image = |written: &[usize], sample: Sample, extra: Vec<u16>| -> Result<Strips> {
         let colour = if rgb { 3 } else { 1 };
         Ok(Strips {
@@ -2023,7 +2026,7 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
             photometric: if rgb { 2 } else { 1 },
             extra,
             classes: matches!(written, [b] if r.bands.get(*b).is_some_and(few_classes)),
-            tags: geo_entries(r, &geo, written, if nan_tag.get() { Some("nan".to_string()) } else { r.nodata.map(|d| d.to_string()) }),
+            tags: geo_entries(r, &geo, written, nodata_tag()),
         })
     };
     // The fourth sample of a colour file says what it is: alpha, or data (as RGB and near-infrared).
