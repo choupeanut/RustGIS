@@ -1923,12 +1923,18 @@ pub fn written_bands(r: &Raster, band: usize) -> Vec<usize> {
     (0..if fourth { 4 } else { 3 }).collect()
 }
 
+/// An alpha cell `v` of `r` as a float file holds it: a float file's alpha is opaque at 1, so an
+/// integer raster's is divided by its `opaque` value (see [`super::alpha_max`]). A cell with no
+/// value (NaN, or the no-data value the file's tag names) stays as it is, so it still has none.
+pub(super) fn float_alpha(r: &Raster, opaque: f32, v: f32) -> f32 {
+    if r.is_valid(v) { v / opaque } else { v }
+}
+
 /// Writes a raster as a Deflate-compressed GeoTIFF: a colour raster's colour bands (RGB(A) bytes
 /// when they are 8-bit, else 32-bit floats, alpha kept), so it reads back in colour; otherwise
 /// `band` (0-based), as bytes when it is an 8-bit band of whole bytes, else as 32-bit floats.
 /// An integer raster's alpha, when written as floats, is divided by its opaque value (1 is opaque
-/// in a float file).
-/// `band` is for rasters that aren't colour ones: a colour raster always writes its colour bands,
+/// in a float file; see [`float_alpha`]). `band` is for rasters that aren't colour ones: a colour raster always writes its colour bands,
 /// as its 8-bit form did before. The strips go through the predictors and Deflate effort of the
 /// COG writer ([`super::cogwrite::write_strips`]). A cancelled run stops it (with
 /// [`DataError::Cancelled`]) within a strip.
@@ -1940,7 +1946,8 @@ pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
 /// when that keeps them all. Otherwise: 8-bit samples when the raster is `UInt8` and every valid
 /// value is a whole number in 0–255 (an empty cell only where no-data can mark it), else 32-bit
 /// float samples (RGB first for a colour raster, and alpha after them when it has one). [`read`]
-/// reads them back as the same bands.
+/// reads them back as the same bands. An integer raster's alpha, when written as floats, is divided
+/// by its opaque value, as [`write`] does.
 pub fn write_all(r: &Raster) -> Result<Vec<u8>> {
     encode(r, 0, true)
 }
@@ -2067,9 +2074,8 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
             let byte = |_: usize, v: f32| if r.is_valid(v) { v.clamp(0.0, 255.0) as u8 } else { nodata };
             wide!(byte, Sample::Byte, u8::to_le_bytes)
         } else {
-            // A float file's alpha is opaque at 1: an integer raster's is divided by its opaque value.
             let (opaque, alpha_band) = (super::alpha_max(&r.data_type), alpha.then_some(if rgb { 3 } else { 1 }));
-            wide!(|bi: usize, v: f32| if Some(bi) == alpha_band { v / opaque } else { v }, Sample::Float, f32::to_le_bytes)
+            wide!(|bi: usize, v: f32| if Some(bi) == alpha_band { float_alpha(r, opaque, v) } else { v }, Sample::Float, f32::to_le_bytes)
         }
     } else if rgb
         && (!written_bands(r, band).contains(&3) || fits_bytes(r, 3))
@@ -2093,8 +2099,7 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
         }
     } else if rgb && let (Some(red), Some(green), Some(blue)) = (r.bands.first(), r.bands.get(1), r.bands.get(2)) {
         // Colour bands that aren't bytes (three embedding dimensions): kept as 32-bit floats, with
-        // their alpha band when they have one. A float file's alpha is opaque at 1, so an integer
-        // raster's alpha (255 for bytes) is divided by its opaque value, to stay as see-through.
+        // their alpha band when they have one, scaled by [`float_alpha`].
         let n = (w as usize) * (h as usize);
         let at = |b: &crate::raster::Band, i: usize| b.data.get(i).copied().unwrap_or(f32::NAN);
         // Only a declared alpha: the fourth band of an RGBI image is data.
@@ -2103,7 +2108,7 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
             Some(alpha) => {
                 let mut data = Vec::with_capacity(n * 4);
                 for i in 0..n {
-                    data.extend([at(red, i), at(green, i), at(blue, i), at(alpha, i) / opaque]);
+                    data.extend([at(red, i), at(green, i), at(blue, i), float_alpha(r, opaque, at(alpha, i))]);
                 }
                 put(image(&[0, 1, 2, 3], Sample::Float, fourth())?, &data, f32::to_le_bytes, &mut out)?;
             }
@@ -2851,6 +2856,32 @@ mod tests {
         let opaque = crate::raster::alpha_max(&back.data_type);
         assert_eq!((back.band_count(), &back.color), (2, &ColorHint::GrayAlpha));
         assert_eq!(back.bands[1].data.iter().map(|a| (a / opaque * 255.0).round()).collect::<Vec<_>>(), [255.0, 128.0, 255.0]);
+    }
+
+    /// An alpha cell equal to the no-data value is no value, and stays one when written as floats:
+    /// it isn't scaled to 1 (opaque); the cells beside it are. (The COG writer has no no-data tag
+    /// beside an alpha band: its alpha says which pixels have no value.)
+    #[test]
+    fn alpha_equal_to_no_data_stays_no_data_when_written_as_floats() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let rgba = |extra: usize| {
+            let mut bands = vec![vec![100.0; 3], vec![200.0; 3], vec![300.0; 3], vec![32767.0, 16384.0, 32767.0]];
+            bands.extend(vec![vec![5.0; 3]; extra]);
+            Raster::new("rgba", 3, 1, bands, gt, Crs::LonLat, Some(32767.0), ColorHint::Rgb { alpha: true }, "Int16").unwrap()
+        };
+        for (case, r) in [("four bands", rgba(0)), ("five bands", rgba(1))] {
+            let mut files = vec![("write_all", write_all(&r).unwrap())];
+            if r.band_count() == 4 {
+                files.push(("write", write(&r, 0).unwrap()));
+            }
+            for (writer, bytes) in files {
+                let back = read(std::io::Cursor::new(bytes), "back").unwrap();
+                let at = format!("{case}, {writer}");
+                assert_eq!(back.value(3, 0, 0), None, "{at}: {:?}", back.bands[3].data);
+                assert_eq!(back.value(3, 2, 0), None, "{at}");
+                assert!(back.value(3, 1, 0).is_some_and(|a| (a - 0.5).abs() < 1e-3), "{at}: {:?}", back.bands[3].data);
+            }
+        }
     }
 
     #[test]

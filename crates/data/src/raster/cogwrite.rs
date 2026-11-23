@@ -34,6 +34,9 @@
 //!
 //! The untiled GeoTIFF ([`super::geotiff::write`]) is written here too, by [`write_strips`]: one
 //! image in strips of rows, with the same predictors, Deflate effort and threads, and no overviews.
+//!
+//! Alpha: a float file's alpha is opaque at 1, so the alpha of an integer raster written as floats
+//! is divided by its opaque value (255 for bytes), as the untiled writer does.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -326,7 +329,6 @@ fn tile_samples(r: &Raster, plan: &Plan, lv: &Level, tx: u32, ty: u32) -> Vec<u8
     let mut raw = Vec::with_capacity(t * t * spp * bps);
     let float_pad = r.nodata.map_or(f32::NAN, |d| d as f32);
     let int_pad = plan.nodata_int.unwrap_or(0);
-    // A float file's alpha is opaque at 1: an integer raster's is divided by its opaque value.
     let opaque = super::alpha_max(&r.data_type);
     let mut px = vec![f32::NAN; spp];
     for y in 0..t {
@@ -345,23 +347,21 @@ fn tile_samples(r: &Raster, plan: &Plan, lv: &Level, tx: u32, ty: u32) -> Vec<u8
             {
                 *alpha = 0.0;
             }
-            for (i, v) in px.iter().enumerate() {
+            // A float file's alpha is opaque at 1: an integer raster's is divided by its opaque value.
+            // (No no-data tag goes with an alpha band, so none of its cells is a no-data one.)
+            if plan.sample == Sample::Float
+                && let Some(alpha) = plan.alpha.and_then(|a| px.get_mut(a))
+            {
+                *alpha /= opaque;
+            }
+            for v in &px {
                 match plan.sample {
                     Sample::Byte => raw.push(if v.is_nan() { int_pad as u8 } else { v.round().clamp(0.0, 255.0) as u8 }),
                     Sample::Short => {
                         let n = if v.is_nan() { int_pad } else { v.round().clamp(0.0, 65_535.0) as u16 };
                         raw.extend_from_slice(&n.to_le_bytes());
                     }
-                    Sample::Float => {
-                        let v = if v.is_nan() {
-                            float_pad
-                        } else if plan.alpha == Some(i) {
-                            v / opaque
-                        } else {
-                            *v
-                        };
-                        raw.extend_from_slice(&v.to_le_bytes());
-                    }
+                    Sample::Float => raw.extend_from_slice(&(if v.is_nan() { float_pad } else { *v }).to_le_bytes()),
                 }
             }
         }

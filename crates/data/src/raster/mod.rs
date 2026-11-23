@@ -2188,11 +2188,11 @@ pub(crate) mod tests {
                 let cog = geotiff::read(std::io::Cursor::new(cogwrite::write(&r, 0).unwrap()), "cog").unwrap();
                 assert_eq!((back.data_type.as_str(), cog.data_type.as_str()), ("Float32", "Float32"));
             }
-            // The alpha band's top is its type's opaque value: a 16-bit one, written as floats,
-            // is opaque at 1 (its pixels are divided by 65535).
+            // The alpha band's top is its type's opaque value: a 16-bit one, written as floats, is
+            // opaque at 1 (its pixels are divided by 65535).
             let mut same: Vec<_> = r.bands.iter().map(stats).collect();
-            if let Some(a) = same.get_mut(3) {
-                a.2 = f64::from(alpha_max(&back.data_type));
+            if let Some(a) = same.get_mut(3).filter(|_| data_type == "UInt16") {
+                a.2 = 1.0;
             }
             assert_eq!(back.bands.iter().map(stats).collect::<Vec<_>>(), same, "{data_type}");
         }
