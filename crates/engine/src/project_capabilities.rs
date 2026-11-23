@@ -696,8 +696,9 @@ fn command_uses(uses: &impl Fn(&str, &Value) -> bool, id: &str, params: &Value) 
 /// A graph read as the run reads it (`model::graph_from_json_counted`): an object with `nodes`, at
 /// most `MAX_NODES` nodes and `MAX_EDGES` connections (a bigger one is refused there, so needs
 /// nothing), and only a node of kind `tool` runs, with `params` that aren't an object dropped (the
-/// checks read nothing from one). Read in place, without a copy: a node the run can't read is
-/// passed over, as it drops that node and not the rest.
+/// checks read nothing from one). Read in place, without a copy, so a node the run drops (an empty
+/// or repeated id, an unreadable `x`, a `layer` that isn't text) is read here all the same: that
+/// only over-requires, which is safe, and a node it can't use never hides the others.
 ///
 /// No recursion: a node is checked by the leaf check only. A node runs a tool (`model::tool_of`),
 /// so one naming a command, `model.run` included, fails there and is read as the id no check
@@ -1267,6 +1268,7 @@ mod tests {
                 assert_eq!(saved, expected, "{why} (container {index})");
             }
         };
+        // A notebook cell is cut at `MAX_SOURCE` on load: the task and history containers cover the oversized graphs.
         all(nodes_with_last(MAX_NODES, h3()), Some(json!(["dggs-system"])), "as many nodes as a run takes, the last one needing it");
         all(nodes_with_last(MAX_NODES + 1, h3()), None, "one more is refused");
         all(nodes_with_last(100_000, h3()), None, "far more is refused");
