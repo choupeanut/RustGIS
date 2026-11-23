@@ -1091,8 +1091,9 @@ pub struct Session {
     pub(crate) window_view: Option<[f64; 4]>,
     /// Set by [`Session::request_url`] for [`Session::guarded`]: the command running changed
     /// nothing, it only left a request (a plugin's own answer can't claim that). Also set by a move
-    /// that left everything where it was (`layout.arrange`, `layer.move`): no step to undo. A
-    /// command's own: [`Session::guarded`] gives each a clear flag and puts the enclosing one's back.
+    /// that left everything where it was (`layout.arrange`, `layer.move`): no step to undo.
+    /// Each command has its own: [`Session::guarded`] clears it on entry and puts the enclosing
+    /// command's back on exit.
     request_only: bool,
     /// What the commands run as steps of the transaction running now did ([`Session::shared_step`]):
     /// the one account scripts, tasks and plugins decide their undo step from.

@@ -949,7 +949,7 @@ impl Session {
             // changed nothing, which a plugin's answer can't (`a_pending_answer_is_no_undo_step`); two
             // tests pin it (`plugin_settings_are_kept_per_plugin_across_sessions_updates_and_toggles`,
             // `shape_conversion_plugin_handled_rejection_is_atomic_and_has_no_inner_undo`). A script or
-            // task takes none when no line edited (#2637).
+            // task takes none when no line edited (see #2622).
             let steps = bridge.s.shared_steps;
             bridge.s.request_only = res.is_ok() && (state_command || steps.requested) && !steps.edited;
             res

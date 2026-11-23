@@ -23852,6 +23852,47 @@ fn a_nested_commands_request_flag_is_not_the_enclosing_commands() {
     assert_eq!(s.undo.len(), undo, "a command that left only a request takes no step");
 }
 
+/// A nested command that sets the flag and then panics: the panic becomes its error, the flag goes
+/// with it, and the enclosing command that goes on keeps its undo step (#2637).
+#[test]
+fn a_nested_panic_leaves_the_enclosing_commands_request_flag_alone() {
+    let mut s = Session::new(Project::default());
+    s.map_mut().name = "Before".into();
+    let undo = s.undo.len();
+    let r = s.guarded("Outer", true, |s| {
+        let panicked = s.guarded("Panics", true, |s| {
+            s.request_only = true;
+            panic!("nested command panicked");
+        });
+        assert!(panicked.is_err());
+        s.map_mut().name = "After".into();
+        Ok(Value::Null)
+    });
+    assert!(r.is_ok());
+    assert_eq!(s.undo.len(), undo + 1, "the outer edit keeps its step");
+    assert!(s.undo());
+    assert_eq!(s.map().name, "Before");
+}
+
+/// A script whose lines leave a request (`layer.addUrl` held for the app, no network) and then edit
+/// is one undo step; one that only left the request has none (#2637).
+#[test]
+fn a_script_that_leaves_a_request_and_then_edits_is_one_undo_step() {
+    let mut s = Session::new(Project::default());
+    s.leave_downloads = true;
+    let undo = s.undo.len();
+    let ask = r#"layer.addUrl {"url": "https://x.org/a.geojson"}"#;
+    s.run("script.run", &json!({"script": ask})).unwrap();
+    assert_eq!(s.take_url_requests().len(), 1);
+    assert_eq!(s.undo.len(), undo, "a request alone is no step");
+    let maps = s.project.maps.len();
+    s.run("script.run", &json!({"script": format!("{ask}\nmap.new {{\"name\": \"B\"}}")})).unwrap();
+    assert_eq!(s.take_url_requests().len(), 1);
+    assert_eq!(s.undo.len(), undo + 1, "the edit after the request takes the script's step");
+    assert!(s.undo());
+    assert_eq!(s.project.maps.len(), maps);
+}
+
 /// A command that left a request for the front end and then failed takes the request back with
 /// its other changes: nothing is downloaded for a command that reported failure.
 #[test]
