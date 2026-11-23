@@ -1926,6 +1926,8 @@ pub fn written_bands(r: &Raster, band: usize) -> Vec<usize> {
 /// Writes a raster as a Deflate-compressed GeoTIFF: a colour raster's colour bands (RGB(A) bytes
 /// when they are 8-bit, else 32-bit floats, alpha kept), so it reads back in colour; otherwise
 /// `band` (0-based), as bytes when it is an 8-bit band of whole bytes, else as 32-bit floats.
+/// An integer raster's alpha, when written as floats, is divided by its opaque value (1 is opaque
+/// in a float file).
 /// `band` is for rasters that aren't colour ones: a colour raster always writes its colour bands,
 /// as its 8-bit form did before. The strips go through the predictors and Deflate effort of the
 /// COG writer ([`super::cogwrite::write_strips`]). A cancelled run stops it (with
@@ -2055,17 +2057,19 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
                         crate::progress::check()?;
                     }
                     // Every band holds `n` values (checked above), so none is filled in.
-                    data.extend(r.bands.iter().map(|b| $sample(b.data.get(i).copied().unwrap_or(f32::NAN))));
+                    data.extend(r.bands.iter().enumerate().map(|(bi, b)| $sample(bi, b.data.get(i).copied().unwrap_or(f32::NAN))));
                 }
                 put(image(&all[..], $kind, extras)?, &data, $le, &mut out)?;
             }};
         }
         if as_bytes {
             let nodata = r.nodata.map_or(0, |d| d as u8);
-            let byte = |v: f32| if r.is_valid(v) { v.clamp(0.0, 255.0) as u8 } else { nodata };
+            let byte = |_: usize, v: f32| if r.is_valid(v) { v.clamp(0.0, 255.0) as u8 } else { nodata };
             wide!(byte, Sample::Byte, u8::to_le_bytes)
         } else {
-            wide!(|v: f32| v, Sample::Float, f32::to_le_bytes)
+            // A float file's alpha is opaque at 1: an integer raster's is divided by its opaque value.
+            let (opaque, alpha_band) = (super::alpha_max(&r.data_type), alpha.then_some(if rgb { 3 } else { 1 }));
+            wide!(|bi: usize, v: f32| if Some(bi) == alpha_band { v / opaque } else { v }, Sample::Float, f32::to_le_bytes)
         }
     } else if rgb
         && (!written_bands(r, band).contains(&3) || fits_bytes(r, 3))
@@ -2089,14 +2093,17 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
         }
     } else if rgb && let (Some(red), Some(green), Some(blue)) = (r.bands.first(), r.bands.get(1), r.bands.get(2)) {
         // Colour bands that aren't bytes (three embedding dimensions): kept as 32-bit floats, with
-        // their alpha band when they have one.
+        // their alpha band when they have one. A float file's alpha is opaque at 1, so an integer
+        // raster's alpha (255 for bytes) is divided by its opaque value, to stay as see-through.
         let n = (w as usize) * (h as usize);
         let at = |b: &crate::raster::Band, i: usize| b.data.get(i).copied().unwrap_or(f32::NAN);
+        // Only a declared alpha: the fourth band of an RGBI image is data.
+        let opaque = if matches!(r.color, ColorHint::Rgb { alpha: true }) { super::alpha_max(&r.data_type) } else { 1.0 };
         match r.bands.get(3).filter(|_| written_bands(r, band).contains(&3)) {
             Some(alpha) => {
                 let mut data = Vec::with_capacity(n * 4);
                 for i in 0..n {
-                    data.extend([at(red, i), at(green, i), at(blue, i), at(alpha, i)]);
+                    data.extend([at(red, i), at(green, i), at(blue, i), at(alpha, i) / opaque]);
                 }
                 put(image(&[0, 1, 2, 3], Sample::Float, fourth())?, &data, f32::to_le_bytes, &mut out)?;
             }
@@ -2773,13 +2780,77 @@ mod tests {
                 assert_eq!(back.data_type, if *floats { "Float32" } else { "UInt8" }, "{at}");
                 assert_eq!((back.band_count(), &back.color), (r.band_count(), &r.color), "{at}");
                 if *floats {
-                    for (b, band) in r.bands.iter().enumerate() {
+                    // An alpha band is on the float scale: `rgba_written_as_floats_keeps_its_opacity`.
+                    let alpha = if r.color == (ColorHint::Rgb { alpha: true }) { Some(3) } else { None };
+                    for (b, band) in r.bands.iter().enumerate().filter(|(b, _)| Some(*b) != alpha) {
                         let same = |(a, b): (&f32, &f32)| a == b || (a.is_nan() && b.is_nan());
                         assert!(band.data.iter().zip(&back.bands[b].data).all(same), "{at}, band {b}: {:?}", back.bands[b].data);
                     }
                 }
             }
         }
+    }
+
+    /// An RGBA raster written as floats keeps how see-through each pixel is: its alpha is on the
+    /// float scale (1 is opaque) once read back, whatever scale the integer raster had. The
+    /// colours stay as they are (a float raster is stretched by its own range when drawn).
+    #[test]
+    fn rgba_written_as_floats_keeps_its_opacity() {
+        use super::super::cogwrite;
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let rgba = |data_type: &str, red: [f32; 3], alpha: [f32; 3]| {
+            let bands = vec![red.to_vec(), vec![5.0; 3], vec![6.0; 3], alpha.to_vec()];
+            Raster::new("rgba", 3, 1, bands, gt, Crs::LonLat, None, ColorHint::Rgb { alpha: true }, data_type).unwrap()
+        };
+        // The opacity (0-255) the map draws a pixel with: its alpha over the type's opaque value.
+        let opacity =
+            |r: &Raster, i: usize| ((r.bands[3].data[i] / crate::raster::alpha_max(&r.data_type)).clamp(0.0, 1.0) * 255.0).round();
+        let nan = f32::NAN;
+        let cases = [
+            ("UInt8, NaN colour", rgba("UInt8", [1.0, nan, 2.0], [255.0, 128.0, 255.0])),
+            ("UInt16", rgba("UInt16", [1000.0, 2000.0, 3000.0], [65535.0, 32768.0, 65535.0])),
+            ("Int16", rgba("Int16", [100.0, -200.0, 300.0], [32767.0, 16384.0, 32767.0])),
+            ("Float32", rgba("Float32", [0.1, 0.2, 0.3], [1.0, 0.5, 1.0])),
+            ("UInt8, five bands, NaN colour", {
+                let mut r = rgba("UInt8", [1.0, nan, 2.0], [255.0, 128.0, 255.0]);
+                r.bands.push(r.bands[1].clone());
+                r
+            }),
+        ];
+        for (case, r) in &cases {
+            let mut files = vec![("write", write(r, 0).unwrap()), ("write_all", write_all(r).unwrap())];
+            // The COG writer makes a cell with a NaN colour fully see-through, by design.
+            if !case.contains("NaN") {
+                files.push(("cog", cogwrite::write(r, 0).unwrap()));
+            }
+            for (writer, bytes) in files {
+                let back = read(std::io::Cursor::new(bytes), "back").unwrap();
+                let at = format!("{case}, {writer}");
+                // `write` keeps the colour bands and alpha; `write_all` every band.
+                let kept = if writer == "write" { 4 } else { r.band_count() };
+                assert_eq!((back.band_count(), &back.color), (kept, &ColorHint::Rgb { alpha: true }), "{at}");
+                for i in 0..3 {
+                    assert_eq!(opacity(&back, i), opacity(r, i), "{at}, pixel {i}: alpha {:?}", back.bands[3].data);
+                }
+            }
+        }
+        // Grey with alpha, past what `write` keeps (`write_all`): the same.
+        let grey = Raster::new(
+            "grey",
+            3,
+            1,
+            vec![vec![1.0, nan, 2.0], vec![255.0, 128.0, 255.0]],
+            gt,
+            Crs::LonLat,
+            None,
+            ColorHint::GrayAlpha,
+            "UInt8",
+        )
+        .unwrap();
+        let back = read(std::io::Cursor::new(write_all(&grey).unwrap()), "back").unwrap();
+        let opaque = crate::raster::alpha_max(&back.data_type);
+        assert_eq!((back.band_count(), &back.color), (2, &ColorHint::GrayAlpha));
+        assert_eq!(back.bands[1].data.iter().map(|a| (a / opaque * 255.0).round()).collect::<Vec<_>>(), [255.0, 128.0, 255.0]);
     }
 
     #[test]
