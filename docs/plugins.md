@@ -1003,7 +1003,7 @@ its standard input and output: no port, no token, nothing another program can jo
 - When the map changes, the desktop app sends `{"event": "view", "view": {center, scale,
   projection, bearing, pitch}}` (the view, as `host.view` answers it), `{"event": "layers"}` (layers added,
   removed, reordered, made active, renamed, shown or hidden, restyled, made more or less transparent, their
-  fields or features changed, and web tile layers changed), `{"event": "selection"}` or `{"event": "project"}` (another project
+  fields or features changed, the source count of a layer read in place changed, and web tile layers changed), `{"event": "selection"}` or `{"event": "project"}` (another project
   opened). Ask for what changed with host requests. Changes the program made itself are told too: a view it set comes back as
   a `view` event, so compare before following it. An event can arrive while the program waits
   for an answer: match answers by their `id`. While the program is behind in reading its input,
