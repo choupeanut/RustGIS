@@ -1923,18 +1923,32 @@ pub fn written_bands(r: &Raster, band: usize) -> Vec<usize> {
     (0..if fourth { 4 } else { 3 }).collect()
 }
 
-/// An alpha cell `v` of `r` as a float file holds it: a float file's alpha is opaque at 1, so an
-/// integer raster's is divided by its `opaque` value (see [`super::alpha_max`]). A cell with no
-/// value (NaN, or the no-data value the file's tag names) stays as it is, so it still has none.
-pub(super) fn float_alpha(r: &Raster, opaque: f32, v: f32) -> f32 {
-    if r.is_valid(v) { v / opaque } else { v }
+/// A cell `v` of `r` as a float file holds it beside an alpha band. A float file's alpha is opaque
+/// at 1, so an integer raster's alpha (`is_alpha`) is divided by its `opaque` value (see
+/// [`super::alpha_max`]). A cell with no value stays without one: as it is, or as NaN when
+/// `nan_cells` (see [`alpha_hits_no_data`]).
+fn float_cell(r: &Raster, opaque: f32, nan_cells: bool, is_alpha: bool, v: f32) -> f32 {
+    if !r.is_valid(v) {
+        if nan_cells { f32::NAN } else { v }
+    } else if is_alpha {
+        v / opaque
+    } else {
+        v
+    }
+}
+
+/// Whether a valid cell of `alpha`, divided by `opaque`, would become the no-data value the file's
+/// tag names (an opaque alpha is 1; a no-data value of 1, or of 0.5 and a half-see-through alpha
+/// of the right size). Then no-data is written as NaN, with the tag `nan`, in every band.
+fn alpha_hits_no_data(r: &Raster, opaque: f32, alpha: &[f32]) -> bool {
+    r.nodata.is_some() && alpha.iter().any(|&v| r.is_valid(v) && !r.is_valid(v / opaque))
 }
 
 /// Writes a raster as a Deflate-compressed GeoTIFF: a colour raster's colour bands (RGB(A) bytes
 /// when they are 8-bit, else 32-bit floats, alpha kept), so it reads back in colour; otherwise
 /// `band` (0-based), as bytes when it is an 8-bit band of whole bytes, else as 32-bit floats.
 /// An integer raster's alpha, when written as floats, is divided by its opaque value (1 is opaque
-/// in a float file; see [`float_alpha`]). `band` is for rasters that aren't colour ones: a colour raster always writes its colour bands,
+/// in a float file; see [`float_cell`]). `band` is for rasters that aren't colour ones: a colour raster always writes its colour bands,
 /// as its 8-bit form did before. The strips go through the predictors and Deflate effort of the
 /// COG writer ([`super::cogwrite::write_strips`]). A cancelled run stops it (with
 /// [`DataError::Cancelled`]) within a strip.
@@ -1997,6 +2011,8 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
     // metadata tag, read back on open. Grey or RGB samples come first, then those `extra` says
     // what they are (unassociated alpha, 2, or data, 0). A single band of classes takes no
     // predictor.
+    // Set when no-data is written as NaN (see [`alpha_hits_no_data`]): the tag then says so.
+    let nan_tag = std::cell::Cell::new(false);
     let image = |written: &[usize], sample: Sample, extra: Vec<u16>| -> Result<Strips> {
         let colour = if rgb { 3 } else { 1 };
         Ok(Strips {
@@ -2007,7 +2023,7 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
             photometric: if rgb { 2 } else { 1 },
             extra,
             classes: matches!(written, [b] if r.bands.get(*b).is_some_and(few_classes)),
-            tags: geo_entries(r, &geo, written, r.nodata.map(|d| d.to_string())),
+            tags: geo_entries(r, &geo, written, if nan_tag.get() { Some("nan".to_string()) } else { r.nodata.map(|d| d.to_string()) }),
         })
     };
     // The fourth sample of a colour file says what it is: alpha, or data (as RGB and near-infrared).
@@ -2075,7 +2091,9 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
             wide!(byte, Sample::Byte, u8::to_le_bytes)
         } else {
             let (opaque, alpha_band) = (super::alpha_max(&r.data_type), alpha.then_some(if rgb { 3 } else { 1 }));
-            wide!(|bi: usize, v: f32| if Some(bi) == alpha_band { float_alpha(r, opaque, v) } else { v }, Sample::Float, f32::to_le_bytes)
+            let nan_cells = alpha_band.and_then(|a| r.bands.get(a)).is_some_and(|b| alpha_hits_no_data(r, opaque, &b.data));
+            nan_tag.set(nan_cells);
+            wide!(|bi: usize, v: f32| float_cell(r, opaque, nan_cells, Some(bi) == alpha_band, v), Sample::Float, f32::to_le_bytes)
         }
     } else if rgb
         && (!written_bands(r, band).contains(&3) || fits_bytes(r, 3))
@@ -2099,16 +2117,19 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
         }
     } else if rgb && let (Some(red), Some(green), Some(blue)) = (r.bands.first(), r.bands.get(1), r.bands.get(2)) {
         // Colour bands that aren't bytes (three embedding dimensions): kept as 32-bit floats, with
-        // their alpha band when they have one, scaled by [`float_alpha`].
+        // their alpha band when they have one, scaled by [`float_cell`].
         let n = (w as usize) * (h as usize);
         let at = |b: &crate::raster::Band, i: usize| b.data.get(i).copied().unwrap_or(f32::NAN);
         // Only a declared alpha: the fourth band of an RGBI image is data.
         let opaque = if matches!(r.color, ColorHint::Rgb { alpha: true }) { super::alpha_max(&r.data_type) } else { 1.0 };
         match r.bands.get(3).filter(|_| written_bands(r, band).contains(&3)) {
             Some(alpha) => {
+                let nan_cells = alpha_hits_no_data(r, opaque, &alpha.data);
+                nan_tag.set(nan_cells);
+                let cell = |is_alpha: bool, v: f32| float_cell(r, opaque, nan_cells, is_alpha, v);
                 let mut data = Vec::with_capacity(n * 4);
                 for i in 0..n {
-                    data.extend([at(red, i), at(green, i), at(blue, i), float_alpha(r, opaque, at(alpha, i))]);
+                    data.extend([cell(false, at(red, i)), cell(false, at(green, i)), cell(false, at(blue, i)), cell(true, at(alpha, i))]);
                 }
                 put(image(&[0, 1, 2, 3], Sample::Float, fourth())?, &data, f32::to_le_bytes, &mut out)?;
             }
@@ -2882,6 +2903,43 @@ mod tests {
                 assert!(back.value(3, 1, 0).is_some_and(|a| (a - 0.5).abs() < 1e-3), "{at}: {:?}", back.bands[3].data);
             }
         }
+    }
+
+    /// A float file's alpha is scaled to 0–1, so an opaque alpha (1) must not become the no-data
+    /// value the file's tag names (here 1): a valid cell stays valid and an invalid one stays
+    /// invalid, in every band, whatever the tag says. The COG writer has no tag beside an alpha
+    /// band, so its opaque alpha can't hit one.
+    #[test]
+    fn scaled_alpha_does_not_become_the_no_data_value() {
+        use super::super::cogwrite;
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let rgba = |extra: usize| {
+            // Pixel 0: valid, opaque. 1: valid, half see-through. 2: no red (1 is no-data), opaque.
+            // 3: opaque colours, an alpha that is the no-data value.
+            let mut bands = vec![vec![100.0, 200.0, 1.0, 100.0], vec![100.0; 4], vec![300.0; 4], vec![32767.0, 16384.0, 32767.0, 1.0]];
+            bands.extend(vec![vec![5.0; 4]; extra]);
+            Raster::new("rgba", 4, 1, bands, gt, Crs::LonLat, Some(1.0), ColorHint::Rgb { alpha: true }, "Int16").unwrap()
+        };
+        for (case, r) in [("four bands", rgba(0)), ("five bands", rgba(1))] {
+            let mut files = vec![("write_all", write_all(&r).unwrap())];
+            if r.band_count() == 4 {
+                files.push(("write", write(&r, 0).unwrap()));
+            }
+            for (writer, bytes) in files {
+                let back = read(std::io::Cursor::new(bytes), "back").unwrap();
+                let at = format!("{case}, {writer}");
+                let alpha = |i| back.value(3, i, 0);
+                assert!(alpha(0).is_some_and(|a| (a - 1.0).abs() < 1e-6), "{at}: {:?}", back.bands[3].data);
+                assert!(alpha(1).is_some_and(|a| (a - 0.5).abs() < 1e-3), "{at}");
+                assert!(alpha(2).is_some_and(|a| (a - 1.0).abs() < 1e-6), "{at}");
+                assert_eq!(alpha(3), None, "{at}");
+                assert_eq!((back.value(0, 0, 0), back.value(0, 2, 0)), (Some(100.0), None), "{at}");
+                assert_eq!(back.value(2, 0, 0), Some(300.0), "{at}");
+            }
+        }
+        let back = read(std::io::Cursor::new(cogwrite::write(&rgba(0), 0).unwrap()), "cog").unwrap();
+        assert_eq!(back.nodata, None);
+        assert!(back.value(3, 0, 0).is_some_and(|a| (a - 1.0).abs() < 1e-6) && back.value(3, 2, 0).is_some());
     }
 
     #[test]
