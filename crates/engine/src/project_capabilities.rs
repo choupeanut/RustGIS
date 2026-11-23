@@ -122,10 +122,10 @@ impl Project {
     /// Apply the same capability predicate to every replayable project container.
     fn uses_commands(&self, uses: CommandCheck) -> bool {
         self.models.iter().any(|m| model_uses(&m.steps, m.graph.as_ref(), uses))
-            || self.tasks.iter().any(|t| t.steps.iter().any(|s| uses(&s.command, &s.params)))
+            || self.tasks.iter().any(|t| t.steps.iter().any(|s| command_uses(&uses, &s.command, &s.params)))
             || self.gp_history.iter().any(|h| {
-                uses(if h.id.is_empty() { &h.tool } else { &h.id }, &h.params)
-                    || h.command.as_ref().is_some_and(|(id, params)| uses(id, params))
+                command_uses(&uses, if h.id.is_empty() { &h.tool } else { &h.id }, &h.params)
+                    || h.command.as_ref().is_some_and(|(id, params)| command_uses(&uses, id, params))
             })
             || self.notebooks.iter().any(|n| {
                 n.language().is_none()
@@ -683,7 +683,38 @@ fn script_uses(script: &str, uses: impl Fn(&str, &Value) -> bool) -> bool {
     script
         .lines()
         .take(crate::cmd::workflows::MAX_SCRIPT_LINES)
-        .any(|line| crate::script_line(line).is_some_and(|parsed| parsed.is_ok_and(|(id, params)| uses(&id, &params))))
+        .any(|line| crate::script_line(line).is_some_and(|parsed| parsed.is_ok_and(|(id, params)| command_uses(&uses, &id, &params))))
+}
+
+/// `uses` on a saved command and, for a `model.run` given its graph inline, on each of the graph's
+/// tool nodes as on a saved model's steps (#2758): that graph is in no saved model, so nothing
+/// else reads it, and an older reader would run its nodes with the option dropped.
+fn command_uses(uses: &impl Fn(&str, &Value) -> bool, id: &str, params: &Value) -> bool {
+    uses(id, params) || (id == "model.run" && inline_graph_uses(params, uses))
+}
+
+/// A graph read as the run reads it (`model::graph_from_json_counted`): an object with `nodes`, at
+/// most `MAX_NODES` nodes and `MAX_EDGES` connections (a bigger one is refused there, so needs
+/// nothing), and only a node of kind `tool` runs, with `params` that aren't an object dropped (the
+/// checks read nothing from one). Read in place, without a copy: a node the run can't read is
+/// passed over, as it drops that node and not the rest.
+///
+/// No recursion: a node is checked by the leaf check only. A node runs a tool (`model::tool_of`),
+/// so one naming a command, `model.run` included, fails there and is read as the id no check
+/// matches; and one naming `script.run` is skipped, as its check is the one that reads into a
+/// script, which could hold another graph.
+fn inline_graph_uses(params: &Value, uses: &impl Fn(&str, &Value) -> bool) -> bool {
+    let Some(graph) = params.get("graph") else { return false };
+    let few = |key: &str, max: usize| graph.get(key).and_then(Value::as_array).is_none_or(|list| list.len() <= max);
+    few("edges", crate::model::MAX_EDGES)
+        && graph.get("nodes").and_then(Value::as_array).filter(|nodes| nodes.len() <= crate::model::MAX_NODES).is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                let tool = node.get("tool").and_then(Value::as_str).unwrap_or("");
+                node.get("kind").and_then(Value::as_str) == Some("tool")
+                    && tool != "script.run"
+                    && uses(tool, node.get("params").unwrap_or(&Value::Null))
+            })
+        })
 }
 
 fn relief_effects(layer: &Layer) -> bool {
@@ -1242,9 +1273,9 @@ mod tests {
         let mut edges = nodes_with_last(2, h3());
         edges["graph"]["edges"] = json!(vec![json!({"from": "j", "to": "h", "toPort": "input"}); MAX_EDGES + 1]);
         all(edges, None, "more connections than a run takes");
-        // A node that is itself a `model.run`, to a depth the project's JSON allows.
+        // A node that is itself a `model.run`, nested to the depth the project's JSON allows (128).
         let mut nested = graph_of_one_tool("a5Grid", json!({"system": "H3"}));
-        for _ in 0..40 {
+        for _ in 0..24 {
             nested = json!({"graph": {"nodes": [{"id": "m", "kind": "tool", "tool": "model.run", "params": nested}]}});
         }
         all(nested, None, "a node is a tool, not a model run: nothing inside it is read");

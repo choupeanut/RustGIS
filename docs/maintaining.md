@@ -145,6 +145,7 @@ The same containers require `dggs-system` when Generate Tessellation or Aggregat
 (`a5Grid`, `a5Aggregate`) is given a `system` other than A5: those were A5's tools, and an older
 reader would make A5 cells, warning only that it ignored the key. A blank `system`, `A5` or none
 needs nothing.
+The same containers read a `model.run` whose `graph` is given inline: each of its tool nodes needs what the same tool as a step needs, so a saved task step, script line or notebook cell that runs one is covered too.
 
 Projects with a background on a layout element, or a saved task step, script, notebook command
 cell or history entry that gives one (`layout.addElement` or `layout.update` with a
