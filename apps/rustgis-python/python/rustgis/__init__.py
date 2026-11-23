@@ -120,8 +120,9 @@ class Layer:
 
     @property
     def count(self) -> int:
-        """How many features the layer holds: for a layer read in place, its source's total, or
-        the features loaded now when the source doesn't say how many."""
+        """How many features the layer holds: for a layer read in place, its source's total (for a
+        large PostGIS table the planner's estimate, not an exact count), or the features loaded now
+        when the source doesn't say how many, which may be only part of the layer. 0 for a raster."""
         info = self.info
         found = info.get("features")
         return int((info.get("loaded") if found is None else found) or 0)
@@ -491,8 +492,9 @@ class _Api:
 
     def layers(self) -> List[Dict[str, Any]]:
         """The active map's layers, top first, each with its id, name, type, feature count
-        (``features``: a layer read in place gives its source's total, or None; ``loaded`` is how
-        many are in memory), fields, renderer and visibility."""
+        (``features``: a layer read in place gives its source's total, an estimate for a large
+        PostGIS table, or None; ``loaded`` is how many are in memory; both are in a feature layer's
+        entry only, not a raster's), fields, renderer and visibility."""
         return list(self.info().get("layers", []))
 
     def layer_names(self) -> List[str]:
