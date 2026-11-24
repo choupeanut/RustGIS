@@ -1181,36 +1181,59 @@ mod tests {
         }
     }
 
-    /// A node of an inline graph is checked as a step of a saved model is, by every capability.
+    /// A node of an inline graph is checked as a step of a saved model is, by every capability: one
+    /// sample for each entry of `COMMAND_CAPABILITIES`, each requiring exactly its own name, so an
+    /// entry added later without a sample fails here. The walk takes a node's id and parameters as
+    /// they come, as a saved model's does, so every entry is reachable; only the tool-based ones
+    /// (`tabulate*`, `dggs-system`) are also a node a run can run, the rest are parity.
     #[test]
     fn an_inline_graph_node_is_checked_as_a_saved_step_is() {
-        let samples = [
-            ("raster.function", json!({"function": "slope", "units": "percent"})),
-            ("raster.functionChain", json!({"steps": [{"function": "slope", "units": "percent"}]})),
-            ("tabulateIntersection", json!({"areaUnit": "ac", "includeEmptyZones": true})),
-            ("a5Grid", json!({"system": "H3"})),
-            ("a5Aggregate", json!({"system": "S2"})),
-            ("layout.update", json!({"element": 1, "background": {}})),
-            ("map.graticule", json!({"type": "mgrs", "onTop": true, "color": "#000000"})),
-            ("map.basemap", json!({"name": "blank", "color": "#112233"})),
-            ("layer.marker", json!({"image": "iVBORw0KGgo"})),
-            ("buffer", json!({"input": "Cities", "distance": 1})),
+        let ink_layout = {
+            let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_element_ink.rgis")).unwrap();
+            serde_json::to_value(&fixture).unwrap()["layouts"][0].to_string()
+        };
+        let chart = json!({"kind": "chart"});
+        let samples: Vec<(Option<&str>, &str, Value)> = vec![
+            (Some("slope-percent"), "raster.function", json!({"function": "slope", "units": "percent"})),
+            (Some("slope-percent"), "raster.functionChain", json!({"steps": [{"function": "slope", "units": "percent"}]})),
+            (Some("tabulate-intersection-unit"), "tabulateIntersection", json!({"areaUnit": "ac"})),
+            (Some("tabulate-intersection-empty-zones"), "tabulateIntersection", json!({"includeEmptyZones": true})),
+            (Some("layout-element-background"), "layout.update", json!({"element": 1, "background": {}})),
+            (Some("picture-markers"), "layer.marker", json!({"image": "iVBORw0KGgo"})),
+            (Some("graticule-mgrs"), "map.graticule", json!({"type": "mgrs"})),
+            (Some("graticule-on-top"), "map.graticule", json!({"onTop": true})),
+            (Some("graticule-color"), "map.graticule", json!({"color": "#000000"})),
+            (Some("layout-element-ink"), "layout.import", json!({"text": ink_layout})),
+            (Some("layout-element-wrap"), "layout.addElement", json!({"kind": "text", "wrap": true})),
+            (Some("layout-chart-data"), "layout.addElement", json!({"kind": "chart", "group": "Region"})),
+            (Some("layout-chart-look"), "layout.update", json!({"element": 1, "values": true})),
+            (Some("layout-chart-classes"), "layout.update", json!({"element": 1, "classes": true})),
+            (Some("layout-chart-stack"), "layout.update", json!({"element": 1, "stack": "Kind"})),
+            (Some("layout-chart-facing"), "layout.update", json!({"element": 1, "mirror": true})),
+            (Some("blank-paper"), "map.basemap", json!({"name": "blank", "color": "#112233"})),
+            (Some("layout-frame-border"), "layout.update", json!({"element": 1, "border": {}})),
+            (Some("layout-text-size"), "layout.update", json!({"element": 1, "textSize": 12})),
+            (Some("dggs-system"), "a5Grid", json!({"system": "H3"})),
+            (Some("dggs-system"), "a5Aggregate", json!({"system": "S2"})),
+            (Some("label-weight"), "labels.placement", json!({"weight": 9})),
+            (None, "buffer", json!({"input": "Cities", "distance": 1})),
+            (None, "layout.addElement", chart),
         ];
-        let mut required_somewhere = std::collections::BTreeSet::new();
-        for (id, params) in samples {
+        let mut covered = std::collections::BTreeSet::new();
+        for (capability, id, params) in samples {
             let step = [ModelStep { tool: id.into(), params: params.clone() }];
-            let saved = saved_requires_of_inline_graph(&graph_of_one_tool(id, params.clone()));
-            let expected: Vec<&str> =
+            let names: Vec<&str> =
                 COMMAND_CAPABILITIES.iter().filter_map(|&(name, uses)| model_uses(&step, None, uses).then_some(name)).collect();
-            required_somewhere.extend(expected.iter().copied());
-            for (index, saved) in saved.into_iter().enumerate() {
-                let expected = (!expected.is_empty()).then(|| json!(expected));
-                // A capability the saved project names for another reason (its own header) is not
-                // among these documents, which are otherwise empty.
-                assert_eq!(saved, expected, "{id} {params} in container {index}");
+            assert_eq!(names, capability.into_iter().collect::<Vec<_>>(), "the sample {id} {params} requires exactly its own capability");
+            covered.extend(capability);
+            for (index, saved) in saved_requires_of_inline_graph(&graph_of_one_tool(id, params.clone())).into_iter().enumerate() {
+                // The documents are otherwise empty, so the header names only what the node needs.
+                assert_eq!(saved, capability.map(|name| json!([name])), "{id} {params} in container {index}");
             }
         }
-        assert!(required_somewhere.len() >= 10, "the samples reach most capabilities: {required_somewhere:?}");
+        let missing: Vec<&str> = COMMAND_CAPABILITIES.iter().map(|&(name, _)| name).filter(|name| !covered.contains(name)).collect();
+        assert!(missing.is_empty(), "add a sample for each command capability, missing: {missing:?}");
+        assert_eq!(covered.len(), COMMAND_CAPABILITIES.len(), "a sample names a capability the table doesn't have: {covered:?}");
     }
 
     /// An inline graph is read as the run reads it: only an object with `nodes`, only nodes of kind
