@@ -1,0 +1,136 @@
+//! Task files (`.rgistask`) are read with the project's header check, so an older RustGIS than the
+//! file refuses what it can't keep, naming it (#2818).
+
+use crate::{Project, Session};
+use serde_json::{Value, json};
+
+/// A task file as every release so far writes it: no `format`, no `requires`.
+fn bare() -> Value {
+    json!({"name": "Lesson", "description": "", "steps": [{"title": "Zoom", "instructions": "", "command": "map.zoomIn", "params": {}}]})
+}
+
+/// `bare` with `key` set to `value`.
+fn with(key: &str, value: Value) -> String {
+    let mut v = bare();
+    v[key] = value;
+    v.to_string()
+}
+
+fn import(s: &mut Session, text: &str) -> Result<Value, String> {
+    s.run("task.import", &json!({"text": text}))
+}
+
+/// What the project's own reader says for the same header, said of a task.
+fn as_a_project_says(text: &str) -> String {
+    crate::project::check_format(text, "project").unwrap_err().replace("this project", "this task")
+}
+
+#[test]
+fn a_task_file_needing_an_unknown_capability_is_refused_by_name() {
+    let mut s = Session::new(Project::default());
+    let text = with("requires", json!(["label-weight", "future-step-key", "future-step-key"]));
+    let err = import(&mut s, &text).unwrap_err();
+    assert_eq!(err, "this task needs what this RustGIS can't read: future-step-key. Update RustGIS to open it.");
+    assert_eq!(err, as_a_project_says(&text));
+    assert!(s.project.tasks.is_empty(), "nothing imported");
+
+    // Read from a path and from a base64 file, as from text.
+    let path = std::env::temp_dir().join(format!("task-requires-2818-{}.rgistask", std::process::id()));
+    std::fs::write(&path, &text).unwrap();
+    let from_path = s.run("task.import", &json!({"path": path.to_string_lossy()})).unwrap_err();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(from_path, err);
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&text);
+    assert_eq!(s.run("task.import", &json!({"data": data})).unwrap_err(), err);
+    assert!(s.project.tasks.is_empty(), "nothing imported");
+
+    // Told to update, not that a step is forbidden, when the file is both.
+    let mut both = bare();
+    both["requires"] = json!(["future-step-key"]);
+    both["steps"] = json!([{"title": "Add", "command": "layer.addData", "params": {"path": "/data/roads.geojson"}}]);
+    let err = import(&mut s, &both.to_string()).unwrap_err();
+    assert!(err.contains("future-step-key") && !err.contains("reads or writes files"), "{err}");
+}
+
+#[test]
+fn a_task_file_of_a_newer_format_is_refused() {
+    let mut s = Session::new(Project::default());
+    let text = with("format", json!(crate::project::READ_FORMAT + 1));
+    let err = import(&mut s, &text).unwrap_err();
+    assert_eq!(err, "this task was saved by a newer RustGIS (format 3). Update RustGIS to open it.");
+    assert!(s.project.tasks.is_empty(), "nothing imported");
+}
+
+#[test]
+fn a_task_file_with_a_hostile_requires_is_refused_as_a_project_is() {
+    let mut s = Session::new(Project::default());
+    let many: Vec<String> = (0..=crate::project::MAX_REQUIRES).map(|i| format!("future-{i}")).collect();
+    for requires in [
+        json!(5),
+        json!("label-weight"),
+        json!({"a": 1}),
+        json!(["label-weight", 1]),
+        json!([["nested"]]),
+        json!(many),
+        json!(["x".repeat(1 << 20)]),
+        json!(["line\nbreak\u{202e}name"]),
+    ] {
+        let text = with("requires", requires.clone());
+        let err = import(&mut s, &text).unwrap_err();
+        assert_eq!(err, as_a_project_says(&text), "{}", err.chars().take(120).collect::<String>());
+        assert!(err.len() < 1024, "the refusal stays short for a huge name: {} bytes", err.len());
+        assert!(!err.contains('\n') && !err.contains('\u{202e}'), "{err}");
+    }
+    assert!(s.project.tasks.is_empty(), "nothing imported");
+}
+
+/// Not text at all, or a list, is still `not a RustGIS task`, as before.
+#[test]
+fn a_task_file_that_is_no_task_is_still_said_so() {
+    let mut s = Session::new(Project::default());
+    for text in ["[]", "5", "{}", "{\"name\": \"x\"}", "not json"] {
+        let err = import(&mut s, text).unwrap_err();
+        assert!(err.starts_with("not a RustGIS task"), "{text}: {err}");
+    }
+}
+
+#[test]
+fn task_files_without_a_header_or_with_known_capabilities_import() {
+    let mut s = Session::new(Project::default());
+    // A file as every release so far writes it.
+    import(&mut s, &bare().to_string()).unwrap();
+    // A header listing nothing, and one listing what this RustGIS knows.
+    import(&mut s, &with("requires", json!([]))).unwrap();
+    import(&mut s, &with("requires", json!(["label-weight", "dggs-system", "table-export-order"]))).unwrap();
+    import(&mut s, &with("format", json!(crate::project::READ_FORMAT))).unwrap();
+    assert_eq!(s.project.tasks.len(), 4);
+    assert!(s.project.tasks.iter().all(|t| t.steps.len() == 1 && t.steps[0].command == "map.zoomIn"));
+}
+
+/// A recorded `task.import` keeps the document's header when its text is cleaned of credentials,
+/// so replaying it refuses what the first run would have (`roles::document`).
+#[test]
+fn a_recorded_task_import_keeps_the_check_when_its_text_is_cleaned() {
+    const SECRET: &str = "RGSYNTH_task_requires_20261124";
+    let mut task = bare();
+    task["requires"] = json!(["future-step-key"]);
+    task["steps"] =
+        json!([{"title": "Add", "command": "layer.addUrl", "params": {"url": format!("https://h.invalid/a.geojson?token={SECRET}")}}]);
+    let text = task.to_string();
+    let (clean, report) = crate::roles::command("task.import", &json!({"text": text}), 0);
+    let clean = clean.expect("the credential is cleaned out of the text");
+    let cleaned = clean["text"].as_str().unwrap();
+    assert!(!cleaned.contains(SECRET), "{cleaned}");
+    assert_eq!(report.unchecked, 0);
+    let kept: Value = serde_json::from_str(cleaned).unwrap();
+    assert_eq!(kept["requires"], json!(["future-step-key"]), "{cleaned}");
+    assert_eq!((kept["name"].as_str(), kept["steps"].as_array().map(Vec::len)), (Some("Lesson"), Some(1)));
+    let mut s = Session::new(Project::default());
+    let err = import(&mut s, cleaned).unwrap_err();
+    assert!(err.contains("future-step-key"), "{err}");
+
+    // A text that needs no cleaning is kept as written.
+    let (clean, report) = crate::roles::command("task.import", &json!({"text": bare().to_string()}), 0);
+    assert!(clean.is_none() && report.unchecked == 0);
+}
