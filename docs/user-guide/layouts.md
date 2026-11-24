@@ -439,10 +439,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   200 lines at most, whatever its box: lines past them are said apart, with the advice to split
   the text into more than one, since a taller box doesn't draw them. A text whose ink crosses the
   page's edge is said as soon as it does, in a notice of its own, so a text both cut below its box
-  and past the edge is told each: `layout.addElement` and `layout.update` warn when they add one,
-  set what its lines or box are, show it, move it (`x`, `y`) or turn it (`rotation`), and advise
-  moving it inside the page, resizing it or reducing its size. A move or a turn alone says only that,
-  not the lines again; a text turned within the page, or with no letter or ink to show, says nothing.
+  and past the edge is told each: `layout.addElement` and `layout.update` add a text whose ink
+  crosses it, set what its lines or box are, show it, move it (`x`, `y`) or turn it (`rotation`),
+  and `layout.duplicateElement` copies it past the edge, and each advises moving it inside the
+  page, resizing it or reducing its size. A move, a turn or a copy alone says only that, not the
+  lines again; a text turned within the page, or with no letter or ink to show, says nothing.
 - **Text** and **Dynamic Text**: `{date}`, `{time}`, `{scale}`, `{map}`, `{crs}`, `{page}`,
   `{pages}`, `{pageName}` and `{layout}` fill in when the page is drawn; the Format pane's
   **Insert Dynamic Text** menu, under the text, lists each with what it shows. The text, its

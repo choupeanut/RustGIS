@@ -3194,6 +3194,7 @@ fn duplicate_element(s: &mut Session, p: &Value) -> CmdResult {
     if dx.abs() > 5000.0 || dy.abs() > 5000.0 {
         return Err("the copy's offset is up to 5000 mm".into());
     }
+    let li = index(s, p)?;
     let l = active(s, p)?;
     let e = l.element(id).cloned().ok_or_else(|| format!("no element {id}"))?;
     let name = numbered(&e.name, |n| l.elements.iter().any(|x| x.name == n));
@@ -3203,6 +3204,9 @@ fn duplicate_element(s: &mut Session, p: &Value) -> CmdResult {
         c.background = e.background;
     }
     super::say_name_cut(s, "Duplicate Element", "the copy's name", &e.name, &name);
+    // Its offset can take a text's ink past the page's edge, as a move does (#2703); the lines it
+    // loses are the original's, said when it was set.
+    say_text_fit(s, li, copy, false);
     Ok(json!({"element": copy, "name": name}))
 }
 
@@ -3638,8 +3642,9 @@ fn text_fit_loss(s: &Session, li: usize, id: u32) -> Option<rustgis_render::layo
 }
 
 /// What a text is given that changes the lines it breaks into or the room they have, or shows it
-/// (#2346): a move or a turn doesn't (they say only whether it runs off the page, #2703), nor a colour (the Format pane sets one at each step of a
-/// pick), except one that shows a text without ink, which `update` tells apart.
+/// (#2346). A move or a turn changes no line, so `update` says only whether the text runs off the
+/// page then (#2703); nor does a colour (the Format pane sets one at each step of a pick), except
+/// one that shows a text without ink, which `update` tells apart.
 const TEXT_FIT_KEYS: [&str; 12] =
     ["text", "size", "w", "h", "wrap", "font", "fallback", "bold", "italic", "letterSpacing", "align", "visible"];
 /// What a scale bar is given that changes its labels (#2581): its text size (`null` included, which
