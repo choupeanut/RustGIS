@@ -16,6 +16,15 @@ fn with(key: &str, value: Value) -> String {
     v.to_string()
 }
 
+/// A file removed when the test ends, whether or not an assertion failed first.
+struct TempFile(std::path::PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn import(s: &mut Session, text: &str) -> Result<Value, String> {
     s.run("task.import", &json!({"text": text}))
 }
@@ -35,10 +44,9 @@ fn a_task_file_needing_an_unknown_capability_is_refused_by_name() {
     assert!(s.project.tasks.is_empty(), "nothing imported");
 
     // Read from a path and from a base64 file, as from text.
-    let path = std::env::temp_dir().join(format!("task-requires-2818-{}.rgistask", std::process::id()));
-    std::fs::write(&path, &text).unwrap();
-    let from_path = s.run("task.import", &json!({"path": path.to_string_lossy()})).unwrap_err();
-    std::fs::remove_file(&path).unwrap();
+    let file = TempFile(std::env::temp_dir().join(format!("task-requires-2818-{}.rgistask", std::process::id())));
+    std::fs::write(&file.0, &text).unwrap();
+    let from_path = s.run("task.import", &json!({"path": file.0.to_string_lossy()})).unwrap_err();
     assert_eq!(from_path, err);
     use base64::Engine;
     let data = base64::engine::general_purpose::STANDARD.encode(&text);
@@ -93,6 +101,15 @@ fn a_task_file_that_is_no_task_is_still_said_so() {
         let err = import(&mut s, text).unwrap_err();
         assert!(err.starts_with("not a RustGIS task"), "{text}: {err}");
     }
+    // A `format` that isn't a whole number is read as the project reader reads it (it used to be
+    // ignored here, as a task file never had one): not a task this RustGIS can read.
+    for format in [json!("2"), json!(2.5), json!(-1), json!(null), json!([2])] {
+        let text = with("format", format.clone());
+        let err = import(&mut s, &text).unwrap_err();
+        assert!(err.starts_with("not a RustGIS task"), "{format}: {err}");
+        assert_eq!(err, crate::project::check_format(&text, "task").unwrap_err());
+    }
+    assert!(s.project.tasks.is_empty(), "nothing imported");
 }
 
 #[test]
@@ -133,4 +150,31 @@ fn a_recorded_task_import_keeps_the_check_when_its_text_is_cleaned() {
     // A text that needs no cleaning is kept as written.
     let (clean, report) = crate::roles::command("task.import", &json!({"text": bare().to_string()}), 0);
     assert!(clean.is_none() && report.unchecked == 0);
+}
+
+/// A recorded `task.import` is cleaned through the typed task as it always was: a key the task
+/// doesn't have, with a credential in it, isn't kept beside the cleaned steps. Only `format` and
+/// `requires` are put back from the document.
+#[test]
+fn a_recorded_task_import_keeps_only_its_envelope_beside_the_typed_clean() {
+    const SECRET: &str = "RGSYNTH_stray_key_20261124";
+    let mut task = bare();
+    task["requires"] = json!(["label-weight"]);
+    task["format"] = json!(crate::project::READ_FORMAT);
+    task["token"] = json!(SECRET);
+    task["extra"] = json!({"password": SECRET});
+    // A credential in a step makes the document change, so it is written again from the typed task.
+    task["steps"] =
+        json!([{"title": "Add", "command": "layer.addUrl", "params": {"url": format!("https://h.invalid/a.geojson?token={SECRET}")}}]);
+    let (clean, report) = crate::roles::command("task.import", &json!({"text": task.to_string()}), 0);
+    let cleaned = clean.expect("the credential is cleaned out of the text");
+    let cleaned = cleaned["text"].as_str().unwrap();
+    assert!(!cleaned.contains(SECRET), "{cleaned}");
+    assert_eq!(report.unchecked, 0);
+    let kept: Value = serde_json::from_str(cleaned).unwrap();
+    let mut keys: Vec<&String> = kept.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["description", "format", "name", "requires", "steps"], "{cleaned}");
+    assert_eq!(kept["requires"], json!(["label-weight"]));
+    assert_eq!(kept["format"], json!(crate::project::READ_FORMAT));
 }

@@ -385,9 +385,9 @@ fn document(kind: Document, v: &Value, depth: usize, report: &mut Report) -> Opt
     let Some(text) = v.as_str().filter(|s| s.len() as u64 <= crate::project::max_bytes()) else { return invalid(v, report) };
     // One this RustGIS wouldn't read, or would rewrite without what it doesn't know, stays as
     // written. Only project and map readers read format 2 and refuse a document for what it
-    // requires; the others keep format 1's bound. A task's and a model's readers do look at
-    // `requires`, so their cleaned copies keep the document's other keys (`task_document`,
-    // `model_document`).
+    // requires; for the others it is a format past `FORMAT` (also 2 now). A task's and a model's
+    // readers do look at `requires`, so their cleaned copies keep it (`task_document` puts it and
+    // `format` back; `model_document` keeps its envelope).
     if crate::project::kept_as_written(text, matches!(kind, Document::Project | Document::Map)) {
         report.unchecked = report.unchecked.saturating_add(1);
         return None;
@@ -424,19 +424,25 @@ fn text_document<T: DeserializeOwned + Serialize + Durable>(text: &str, depth: u
     })
 }
 
-/// A task document keeps its other keys as written, `requires` among them (`task.import` refuses
-/// what it lists that this RustGIS doesn't know), and cleans only its steps.
+/// A task document is cleaned through the typed task, as it always was (a key the task doesn't
+/// have is not kept), and then `format` and `requires` are put back from the document: `task.import`
+/// reads them (it refuses a newer format and what `requires` lists that this RustGIS doesn't know),
+/// and the typed copy has neither.
 fn task_document(text: &str, depth: usize) -> Result<(String, Report), String> {
-    let mut v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    let mut report = Report::default();
-    let Some(obj) = v.as_object_mut() else { return Err("not a task".into()) };
-    let Some(field) = obj.get("steps") else { return Err("not a task".into()) };
-    if let Some(clean) = typed_value::<VecTask>(field, depth, &mut report) {
-        obj.insert("steps".into(), clean);
-        Ok((v.to_string(), report))
-    } else {
-        Ok((text.into(), report))
+    let (clean, report) = text_document::<crate::project::Task>(text, depth)?;
+    if clean == text {
+        return Ok((clean, report));
     }
+    let original: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let mut rewritten: Value = serde_json::from_str(&clean).map_err(|e| e.to_string())?;
+    if let (Some(from), Some(to)) = (original.as_object(), rewritten.as_object_mut()) {
+        for key in ["format", "requires"] {
+            if let Some(value) = from.get(key) {
+                to.insert(key.into(), value.clone());
+            }
+        }
+    }
+    Ok((rewritten.to_string(), report))
 }
 
 /// Model import has two envelopes; keeps the envelope's other fields and cleans only its model.
