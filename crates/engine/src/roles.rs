@@ -427,16 +427,23 @@ fn text_document<T: DeserializeOwned + Serialize + Durable>(text: &str, depth: u
 /// A task document is cleaned through the typed task, as it always was (a key the task doesn't
 /// have is not kept), and then `format` and `requires` are put back from the document: `task.import`
 /// reads them (it refuses a newer format and what `requires` lists that this RustGIS doesn't know),
-/// and the typed copy has neither.
+/// and the typed copy has neither. Neither is a place for a credential, so a document whose header
+/// holds one is withheld whole (`[parameters withheld]`, which no replay reads as a task), as a
+/// document that doesn't read is; dropping only the header would let a replay skip the check.
 fn task_document(text: &str, depth: usize) -> Result<(String, Report), String> {
+    let original: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let header = ["format", "requires"];
+    if header.iter().filter_map(|key| original.get(key)).any(suspicious) {
+        let report = Report { withheld: 1, ..Report::default() };
+        return Ok((WITHHELD.into(), report));
+    }
     let (clean, report) = text_document::<crate::project::Task>(text, depth)?;
     if clean == text {
         return Ok((clean, report));
     }
-    let original: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let mut rewritten: Value = serde_json::from_str(&clean).map_err(|e| e.to_string())?;
     if let (Some(from), Some(to)) = (original.as_object(), rewritten.as_object_mut()) {
-        for key in ["format", "requires"] {
+        for key in header {
             if let Some(value) = from.get(key) {
                 to.insert(key.into(), value.clone());
             }

@@ -178,3 +178,48 @@ fn a_recorded_task_import_keeps_only_its_envelope_beside_the_typed_clean() {
     assert_eq!(kept["requires"], json!(["label-weight"]));
     assert_eq!(kept["format"], json!(crate::project::READ_FORMAT));
 }
+
+/// What a recorded `task.import` keeps of `requires` and `format` is only what carries no credential:
+/// one that does is withheld with the whole text, which replays as no task, so a replay can't skip
+/// the capability check by losing the list. A clean list is still kept, rewritten or not.
+#[test]
+fn a_recorded_task_import_keeps_its_requires_only_when_it_carries_no_credential() {
+    const SECRET: &str = "RGSYNTH_requires_20261124";
+    let secret_step =
+        json!([{"title": "Add", "command": "layer.addUrl", "params": {"url": format!("https://h.invalid/a.geojson?token={SECRET}")}}]);
+    let clean_step = bare()["steps"].clone();
+    for (key, value) in [
+        ("requires", json!(["future-step-key", format!("https://h.invalid/x?token={SECRET}")])),
+        ("requires", json!({"token": SECRET})),
+        ("requires", json!([{"headers": {"Authorization": format!("Bearer {SECRET}")}}])),
+        ("format", json!({"token": SECRET})),
+    ] {
+        // Rewritten (a credential in a step) and kept as written (none).
+        for steps in [&secret_step, &clean_step] {
+            let mut task = bare();
+            task[key] = value.clone();
+            task["steps"] = steps.clone();
+            let (clean, report) = crate::roles::command("task.import", &json!({"text": task.to_string()}), 0);
+            let params = clean.unwrap_or_else(|| panic!("{key} {value}: kept as written, credential and all"));
+            let cleaned = params["text"].as_str().unwrap();
+            assert!(!cleaned.contains(SECRET), "{key} {value}: {cleaned}");
+            assert_eq!(report.withheld, 1, "{key} {value}");
+            // The replay is refused: nothing is imported without the check.
+            let mut s = Session::new(Project::default());
+            assert!(import(&mut s, cleaned).is_err(), "{key} {value}: {cleaned}");
+            assert!(s.project.tasks.is_empty());
+        }
+    }
+    // A clean list is kept, so the replay is checked.
+    for steps in [&secret_step, &clean_step] {
+        let mut task = bare();
+        task["requires"] = json!(["future-step-key"]);
+        task["steps"] = steps.clone();
+        let (clean, report) = crate::roles::command("task.import", &json!({"text": task.to_string()}), 0);
+        let kept = clean.map_or(task.to_string(), |p| p["text"].as_str().unwrap().to_string());
+        assert_eq!(serde_json::from_str::<Value>(&kept).unwrap()["requires"], json!(["future-step-key"]), "{kept}");
+        assert_eq!(report.withheld, 0);
+        let mut s = Session::new(Project::default());
+        assert!(import(&mut s, &kept).unwrap_err().contains("future-step-key"));
+    }
+}
