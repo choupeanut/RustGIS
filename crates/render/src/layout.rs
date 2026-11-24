@@ -564,6 +564,18 @@ pub fn lines_left_out_notice(loss: &TextLoss) -> Option<String> {
     Some(format!("{count} of the text \"{}\" ({}) {said}", loss.name, loss.id))
 }
 
+/// What a text whose ink crosses the page's edge is told (#2703), from its [`TextLoss`]: `None`
+/// when none does. Its lines left out below its box are [`lines_left_out_notice`]'s: a text can
+/// have both, and each is said.
+pub fn off_page_notice(loss: &TextLoss) -> Option<String> {
+    loss.off_page.then(|| {
+        format!(
+            "The text \"{}\" ({}) runs off the page, so part of it isn't drawn; move it inside the page, resize it or reduce its size",
+            loss.name, loss.id
+        )
+    })
+}
+
 /// One element on transparency, allocating only its on-page pixel bounds.
 /// Outer `None` means rendering failed; inner `None` means the element is off-page.
 /// A fatal source error is retained for the composed SVG's revision check and error report.
@@ -6968,7 +6980,7 @@ mod tests {
         assert_eq!(told(&l), None, "turned within the page");
         turn(&mut l, 180.0);
         assert_eq!(told(&l), None, "turned within the page");
-        put(&mut l, (60.0, 0.0));
+        put(&mut l, (80.0, 10.0));
         turn(&mut l, 0.0);
         assert_eq!(told(&l), None, "unturned, it is inside");
         turn(&mut l, 180.0);
