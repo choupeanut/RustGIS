@@ -385,7 +385,9 @@ fn document(kind: Document, v: &Value, depth: usize, report: &mut Report) -> Opt
     let Some(text) = v.as_str().filter(|s| s.len() as u64 <= crate::project::max_bytes()) else { return invalid(v, report) };
     // One this RustGIS wouldn't read, or would rewrite without what it doesn't know, stays as
     // written. Only project and map readers read format 2 and refuse a document for what it
-    // requires; the others keep format 1's bound and don't look at `requires`.
+    // requires; the others keep format 1's bound. A task's and a model's readers do look at
+    // `requires`, so their cleaned copies keep the document's other keys (`task_document`,
+    // `model_document`).
     if crate::project::kept_as_written(text, matches!(kind, Document::Project | Document::Map)) {
         report.unchecked = report.unchecked.saturating_add(1);
         return None;
@@ -399,7 +401,7 @@ fn document(kind: Document, v: &Value, depth: usize, report: &mut Report) -> Opt
                 text_document::<rustgis_map::Map>(text, depth)
             }
         }
-        Document::Task => text_document::<crate::project::Task>(text, depth),
+        Document::Task => task_document(text, depth),
         Document::Presentation => text_document::<rustgis_map::presentation::Presentation>(text, depth),
         Document::Notebook => crate::cmd::notebook::durable_document(text, depth),
         Document::Model => model_document(text, depth),
@@ -420,6 +422,21 @@ fn text_document<T: DeserializeOwned + Serialize + Durable>(text: &str, depth: u
     durable::output_owned_changed(parsed, depth, |value, changed| {
         if changed { serde_json::to_string(value).map_err(|e| e.to_string()) } else { Ok(text.into()) }
     })
+}
+
+/// A task document keeps its other keys as written, `requires` among them (`task.import` refuses
+/// what it lists that this RustGIS doesn't know), and cleans only its steps.
+fn task_document(text: &str, depth: usize) -> Result<(String, Report), String> {
+    let mut v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let mut report = Report::default();
+    let Some(obj) = v.as_object_mut() else { return Err("not a task".into()) };
+    let Some(field) = obj.get("steps") else { return Err("not a task".into()) };
+    if let Some(clean) = typed_value::<VecTask>(field, depth, &mut report) {
+        obj.insert("steps".into(), clean);
+        Ok((v.to_string(), report))
+    } else {
+        Ok((text.into(), report))
+    }
 }
 
 /// Model import has two envelopes; keeps the envelope's other fields and cleans only its model.
