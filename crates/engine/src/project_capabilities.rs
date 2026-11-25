@@ -1192,43 +1192,53 @@ mod tests {
             let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_element_ink.rgis")).unwrap();
             serde_json::to_value(&fixture).unwrap()["layouts"][0].to_string()
         };
+        let svg = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 4"/>"#)
+        };
         let chart = json!({"kind": "chart"});
-        let samples: Vec<(Option<&str>, &str, Value)> = vec![
-            (Some("slope-percent"), "raster.function", json!({"function": "slope", "units": "percent"})),
-            (Some("slope-percent"), "raster.functionChain", json!({"steps": [{"function": "slope", "units": "percent"}]})),
-            (Some("tabulate-intersection-unit"), "tabulateIntersection", json!({"areaUnit": "ac"})),
-            (Some("tabulate-intersection-empty-zones"), "tabulateIntersection", json!({"includeEmptyZones": true})),
-            (Some("layout-element-background"), "layout.update", json!({"element": 1, "background": {}})),
-            (Some("picture-markers"), "layer.marker", json!({"image": "iVBORw0KGgo"})),
-            (Some("graticule-mgrs"), "map.graticule", json!({"type": "mgrs"})),
-            (Some("graticule-on-top"), "map.graticule", json!({"onTop": true})),
-            (Some("graticule-color"), "map.graticule", json!({"color": "#000000"})),
-            (Some("layout-element-ink"), "layout.import", json!({"text": ink_layout})),
-            (Some("layout-element-wrap"), "layout.addElement", json!({"kind": "text", "wrap": true})),
-            (Some("layout-chart-data"), "layout.addElement", json!({"kind": "chart", "group": "Region"})),
-            (Some("layout-chart-look"), "layout.update", json!({"element": 1, "values": true})),
-            (Some("layout-chart-classes"), "layout.update", json!({"element": 1, "classes": true})),
-            (Some("layout-chart-stack"), "layout.update", json!({"element": 1, "stack": "Kind"})),
-            (Some("layout-chart-facing"), "layout.update", json!({"element": 1, "mirror": true})),
-            (Some("blank-paper"), "map.basemap", json!({"name": "blank", "color": "#112233"})),
-            (Some("layout-frame-border"), "layout.update", json!({"element": 1, "border": {}})),
-            (Some("layout-text-size"), "layout.update", json!({"element": 1, "textSize": 12})),
-            (Some("dggs-system"), "a5Grid", json!({"system": "H3"})),
-            (Some("dggs-system"), "a5Aggregate", json!({"system": "S2"})),
-            (Some("label-weight"), "labels.placement", json!({"weight": 9})),
-            (None, "buffer", json!({"input": "Cities", "distance": 1})),
-            (None, "layout.addElement", chart),
+        let samples: Vec<(&[&str], &str, Value)> = vec![
+            (&["slope-percent"], "raster.function", json!({"function": "slope", "units": "percent"})),
+            (&["slope-percent"], "raster.functionChain", json!({"steps": [{"function": "slope", "units": "percent"}]})),
+            (&["tabulate-intersection-unit"], "tabulateIntersection", json!({"areaUnit": "ac"})),
+            (&["tabulate-intersection-empty-zones"], "tabulateIntersection", json!({"includeEmptyZones": true})),
+            (&["layout-element-background"], "layout.update", json!({"element": 1, "background": {}})),
+            (&["picture-markers"], "layer.marker", json!({"image": "iVBORw0KGgo"})),
+            (&["graticule-mgrs"], "map.graticule", json!({"type": "mgrs"})),
+            (&["graticule-on-top"], "map.graticule", json!({"onTop": true})),
+            (&["graticule-color"], "map.graticule", json!({"color": "#000000"})),
+            (&["layout-element-ink"], "layout.import", json!({"text": ink_layout})),
+            (&["layout-element-wrap"], "layout.addElement", json!({"kind": "text", "wrap": true})),
+            (&["layout-chart-data"], "layout.addElement", json!({"kind": "chart", "group": "Region"})),
+            (&["layout-chart-look"], "layout.update", json!({"element": 1, "values": true})),
+            (&["layout-chart-classes"], "layout.update", json!({"element": 1, "classes": true})),
+            (&["layout-chart-stack"], "layout.update", json!({"element": 1, "stack": "Kind"})),
+            (&["layout-chart-facing"], "layout.update", json!({"element": 1, "mirror": true})),
+            (&["layout-chart-outline"], "layout.update", json!({"element": 1, "barOutline": {"width": 1}})),
+            (&["blank-paper"], "map.basemap", json!({"name": "blank", "color": "#112233"})),
+            (&["layout-frame-border"], "layout.update", json!({"element": 1, "border": {}})),
+            (&["layout-text-size"], "layout.update", json!({"element": 1, "textSize": 12})),
+            (&["dggs-system"], "a5Grid", json!({"system": "H3"})),
+            (&["dggs-system"], "a5Aggregate", json!({"system": "S2"})),
+            (&["label-weight"], "labels.placement", json!({"weight": 9})),
+            (&["label-clearance"], "labels.placement", json!({"clearance": 9})),
+            (&["label-duplicates"], "labels.placement", json!({"removeDuplicates": 20})),
+            (&["tile-resampling"], "map.addTiles", json!({"resampling": "nearest"})),
+            // An SVG image is a picture marker as well, in a node as in a saved command.
+            (&["picture-markers", "svg-markers"], "layer.marker", json!({"image": svg})),
+            (&[], "buffer", json!({"input": "Cities", "distance": 1})),
+            (&[], "layout.addElement", chart),
         ];
         let mut covered = std::collections::BTreeSet::new();
         for (capability, id, params) in samples {
             let step = [ModelStep { tool: id.into(), params: params.clone() }];
             let names: Vec<&str> =
                 COMMAND_CAPABILITIES.iter().filter_map(|&(name, uses)| model_uses(&step, None, uses).then_some(name)).collect();
-            assert_eq!(names, capability.into_iter().collect::<Vec<_>>(), "the sample {id} {params} requires exactly its own capability");
-            covered.extend(capability);
+            assert_eq!(names, capability, "the sample {id} {params} requires exactly its own capability");
+            covered.extend(capability.iter().copied());
             for (index, saved) in saved_requires_of_inline_graph(&graph_of_one_tool(id, params.clone())).into_iter().enumerate() {
                 // The documents are otherwise empty, so the header names only what the node needs.
-                assert_eq!(saved, capability.map(|name| json!([name])), "{id} {params} in container {index}");
+                assert_eq!(saved, (!capability.is_empty()).then(|| json!(capability)), "{id} {params} in container {index}");
             }
         }
         let missing: Vec<&str> = COMMAND_CAPABILITIES.iter().map(|&(name, _)| name).filter(|name| !covered.contains(name)).collect();
