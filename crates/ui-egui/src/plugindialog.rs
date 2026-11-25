@@ -263,6 +263,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let fields = c.form.iter().any(|f| !is_tabs(f));
 
     let mut open = true;
+    let screen = ctx.content_rect();
     let title = crate::i18n::fmt(
         "{plugin} › {command}",
         &[("plugin", m.translate(&lang, &m.name)), ("command", &m.translate(&lang, &c.label).replace('\n', " "))],
@@ -275,10 +276,11 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         .default_width(460.0)
         // As tall as the screen allows, not egui's default: the help is laid out first, so the
         // fields get what it leaves, and a long one left them two rows (#2816). The window
-        // still shrinks to its content, and never starts taller than a short screen.
-        .default_height((ctx.content_rect().height() - 80.0).max(420.0).min((ctx.content_rect().height() - 16.0).max(120.0)))
+        // still shrinks to its content, and egui keeps a window on a screen shorter than 420
+        // points (`a_long_form_in_a_short_window_stays_on_screen`).
+        .default_height((screen.height() - 80.0).max(420.0))
         .pivot(Align2::CENTER_CENTER)
-        .default_pos(ctx.content_rect().center())
+        .default_pos(screen.center())
         .show(ctx, |ui| {
             if let Some(f) = tabbed {
                 tab_clicked = tab_row(ui, f, &mut d.values, m, &lang);
@@ -784,32 +786,37 @@ mod tests {
         (h.get_by_label_contains(title).rect().min.y, h.get_by_label("Run").rect().max.y)
     }
 
-    /// A long help takes the room the window starts with, so the fields scroll in two rows: the
-    /// window starts as tall as the screen allows, and every field is in view (#2816).
+    /// A long help over a few fields, on a tall screen: every field is in view, above Run and
+    /// inside the screen, with nothing to scroll to (#2816).
     #[test]
     fn a_long_help_leaves_the_fields_in_view() {
         let mut h = launch("ui-dialog-help");
         h.state_mut().run_by_user("plugin:ui-dialog-help/qh", Value::Null).unwrap();
         h.run();
         let run = h.get_by_label("Run").rect();
+        let screen = h.ctx.content_rect();
         for i in 0..4 {
             let field = h.get_by_label(&format!("Field {i}")).rect();
             assert!(field.max.y <= run.min.y, "Field {i} is out of view, below Run: {field:?}, Run {run:?}");
+            assert!(screen.contains_rect(field), "Field {i} is off the screen: {field:?} in {screen:?}");
         }
         plugins::unload("ui-dialog-help");
     }
 
     /// On a screen shorter than the window would start, a form of many fields scrolls: the window
-    /// stays on the screen with Run in it.
+    /// stays on the screen with Run in it, whatever the screen's height.
     #[test]
     fn a_long_form_in_a_short_window_stays_on_screen() {
-        let mut h = launch_in("ui-dialog-form-short", 360.0);
-        h.state_mut().run_by_user("plugin:ui-dialog-form-short/qw", Value::Null).unwrap();
-        h.run();
-        let screen = h.ctx.content_rect();
-        let (top, bottom) = window_span(&h, "Echo Long");
-        assert!(top >= screen.min.y && bottom <= screen.max.y, "the window leaves the screen: {top}..{bottom} in {screen:?}");
-        plugins::unload("ui-dialog-form-short");
+        for height in [240.0, 300.0, 360.0, 420.0, 435.0, 440.0] {
+            let plugin = format!("ui-dialog-form-short-{height}");
+            let mut h = launch_in(&plugin, height);
+            h.state_mut().run_by_user(&format!("plugin:{plugin}/qw"), Value::Null).unwrap();
+            h.run();
+            let screen = h.ctx.content_rect();
+            let (top, bottom) = window_span(&h, "Echo Long");
+            assert!(top >= screen.min.y && bottom <= screen.max.y, "the window leaves the screen: {top}..{bottom} in {screen:?}");
+            plugins::unload(&plugin);
+        }
     }
 
     /// A short help and a few fields keep the small window they open in today.
