@@ -691,6 +691,26 @@ impl WriteLosses {
         value
     }
 
+    /// What a tally of one row's write says, as a preview names it, in the order [`held`] gives
+    /// them: the error that made it null, a result the field couldn't hold, then what a cut took.
+    /// `None` for a clean write.
+    pub(crate) fn previewed(&self) -> Option<PreviewLoss> {
+        let cuts = &self.cuts;
+        if let Some((fault, ..)) = self.errors.first() {
+            return Some(PreviewLoss::Error(*fault));
+        }
+        [
+            (self.unread, PreviewLoss::Unheld),
+            (cuts.fractions, PreviewLoss::Fraction),
+            (cuts.past, PreviewLoss::Range),
+            (cuts.not_numbers, PreviewLoss::NotANumber),
+            (cuts.not_finite, PreviewLoss::NotFinite),
+            (cuts.times, PreviewLoss::Time),
+        ]
+        .into_iter()
+        .find_map(|(n, loss)| (n > 0).then_some(loss))
+    }
+
     /// The notices for what writing `field`, of type `ty`, lost, each starting with `by` (the
     /// command or rule that wrote it). Rows are numbered from 1, as `@row_number` numbers them.
     /// The error notices are templates a translated interface shows in its language.
@@ -1778,8 +1798,10 @@ pub fn check_calculation(expr: &str, ds: &rustgis_data::Dataset) -> Result<(), S
     Calculation::parse(expr, ds).map(|_| ())
 }
 
-/// One row of a Calculate Field preview: the value the field would get, what writing it loses,
+/// One row of a Calculate Field preview: the value the field would hold, what writing it loses,
 /// the kind the run's notices count, and the layer's check that would refuse the edit (#2837).
+/// A calculation rule that writes the field overwrites the expression's result on the run, so the
+/// value is the last such rule's result, as the field holds it, with what that write loses (#2884).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalculationPreview {
     pub row: usize,
@@ -1793,12 +1815,15 @@ pub struct CalculationPreview {
 
 /// What Calculate Field would write with `expr` into field `field` of `rows` (rows past the end
 /// left out), parsed once as [`check_calculation`] reads it: the error is the same. With a
-/// layer's `design`, each row also says which of its checks would refuse it: its calculation
-/// rules, then its domains, allowed combinations and constraint rules, run as an edit runs them
-/// (`apply_with`, in `design`) on a copy of that row alone, its value written, which reads
-/// `@row_number` as the layer's row. The copy holds that row alone, with the layer's fields and
-/// coordinate system: nothing else of the layer is copied. Not previewed: an edit refused because
-/// an area it reads is ambiguous, which needs the whole edit's geometry.
+/// layer's `design`, each row is run as an edit runs it (`apply_with`, in `design`) on a copy of
+/// that row alone, its value written, which reads `@row_number` as the layer's row: the layer's
+/// calculation rules first, in order, so a rule that writes `field` gives the value and what
+/// writing it loses (the later of two rules wins; what Calculate's own result lost, which the run
+/// says in its notices, isn't shown then), then each row says which of its domains, allowed
+/// combinations and constraint rules would refuse it. The copy holds that row alone, with the
+/// layer's fields and coordinate system: nothing else of the layer is copied. Not previewed: an
+/// edit refused because an area it reads is ambiguous, which needs the whole edit's geometry, and
+/// a rule that no longer reads, which the run skips and says.
 pub fn preview_calculation(
     expr: &str,
     ds: &rustgis_data::Dataset,
@@ -1806,21 +1831,20 @@ pub fn preview_calculation(
     rows: &[usize],
     design: Option<&rustgis_map::design::Design>,
 ) -> Result<Vec<CalculationPreview>, String> {
-    use rustgis_map::design::RuleKind;
     let calc = Calculation::parse(expr, ds)?;
     let ty = ds.fields.get(field).map(|f| f.ty).ok_or("no field")?;
-    // Only these can refuse a row: a layer with calculation rules alone refuses none.
-    let layer_checks =
-        design.filter(|d| !d.domains.is_empty() || !d.contingent.is_empty() || d.rules.iter().any(|r| r.kind == RuleKind::Constraint));
+    // Only a layer with a rule or a check changes the value or refuses a row.
+    let ruled = design.filter(|d| !d.domains.is_empty() || !d.contingent.is_empty() || !d.rules.is_empty());
     // The layer's fields, which its rules are read against, and its constraint rules: only for a
-    // layer with checks.
-    let prepared = layer_checks.map(|d| {
+    // layer with rules or checks.
+    let prepared = ruled.map(|d| {
         let metadata = rustgis_data::Dataset::new(ds.name.clone(), ds.geometry_type, ds.fields.clone());
         let constraints = super::design::constraint_rules(d, &metadata);
         (d, metadata, constraints)
     });
-    // What the layer's checks would refuse the edit of `row` with, `value` written.
-    let refusal_of = |row: usize, value: &Value| {
+    // What the layer's rules leave in `field` of `row` with `value` written (the value and what
+    // the last rule writing it lost, when one does), and what its checks would refuse the edit with.
+    let ruled_row = |row: usize, value: &Value| {
         let (d, metadata, constraints) = prepared.as_ref()?;
         let before = ds.features.row(row)?.to_feature();
         // Shares the layer's rows (an `Arc`) until `one.features` is replaced on the next line, so
@@ -1828,17 +1852,22 @@ pub fn preview_calculation(
         let mut one = ds.clone();
         one.features = vec![before.clone()].into();
         one.features.set_value(0, field, value.clone());
-        let _ = super::design::calculation_rules(d, &mut one, metadata, &[0], row);
-        super::design::refusal(d, &one, constraints, 0, Some(&before), row)
+        let (cuts, _) = super::design::calculation_rules(d, &mut one, metadata, &[0], row);
+        let written = cuts.iter().rfind(|(_, name, ..)| ds.field_index(name) == Some(field)).map(|(.., losses, _)| losses.previewed());
+        let refusal = super::design::refusal(d, &one, constraints, 0, Some(&before), row);
+        Some((written.map(|lost| (one.value(0, field).clone(), lost)), refusal))
     };
     Ok(rows
         .iter()
         .filter(|r| **r < ds.features.len())
         .map(|&row| {
             let Held { value, cut, other } = held(calc.eval_or_fault(ds, row), ty);
-            let refusal = refusal_of(row, &value);
+            let (written, refused) = ruled_row(row, &value).unwrap_or((None, None));
             // The error is why the value is null; a cut alone says what it took.
-            CalculationPreview { row, value, lost: other.or(cut).and_then(Loss::previewed), refused: refusal }
+            let own = other.or(cut).and_then(Loss::previewed);
+            // A rule's write replaces the expression's: its value, and what it lost.
+            let (value, lost) = written.unwrap_or((value, own));
+            CalculationPreview { row, value, lost, refused }
         })
         .collect())
 }
