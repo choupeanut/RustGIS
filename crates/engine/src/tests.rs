@@ -52503,6 +52503,18 @@ fn calculate_field_preview_shows_what_a_calculation_rule_leaves_in_the_field() {
         let points = json!({"type": "FeatureCollection", "features": features});
         s.run("layer.addDataText", &json!({"fileName": "calc.geojson", "text": points.to_string()})).unwrap();
         for (name, field, expression) in rules {
+            if expression.contains("nosuch") {
+                // The command refuses a rule that doesn't read; a hand-edited file or an earlier version may hold one.
+                let id = s.map().layer_by_name("calc").unwrap().id;
+                let rule = rustgis_map::design::AttributeRule {
+                    name: name.to_string(),
+                    kind: rustgis_map::design::RuleKind::Calculation,
+                    field: field.to_string(),
+                    expression: expression.to_string(),
+                };
+                s.map_mut().layer_mut(id).unwrap().design.rules.push(rule);
+                continue;
+            }
             s.run(
                 "data.attributeRule",
                 &json!({"layer": "calc", "name": name, "kind": "calculation", "field": field, "expression": expression}),
@@ -52543,7 +52555,7 @@ fn calculate_field_preview_shows_what_a_calculation_rule_leaves_in_the_field() {
     assert_eq!(shown, clean([2, 3, 4]));
     assert_eq!(ran, [V::Int(2), V::Int(3), V::Int(4)]);
     // What the rule's own write loses is what the preview says: a fraction its whole-number field
-    // drops (row 1: 3 * 0.5), and an error that made it null.
+    // drops (the second row: 3 * 0.5), and an error that made it null.
     let (shown, ran) = both(&[("Half", "n", "n * 0.5")], "n + 1");
     assert_eq!(shown, vec![(V::Int(1), None), (V::Int(1), Some(PreviewLoss::Fraction)), (V::Int(2), None)]);
     assert_eq!(ran, [V::Int(1), V::Int(1), V::Int(2)]);
@@ -52554,6 +52566,25 @@ fn calculate_field_preview_shows_what_a_calculation_rule_leaves_in_the_field() {
     let (shown, ran) = both(&[("Tens", "n", "n * 10")], "n + 0.5");
     assert_eq!(shown, clean([10, 20, 30]));
     assert_eq!(ran, [V::Int(10), V::Int(20), V::Int(30)]);
+    // A rule reading `@row_number` reads the layer's row in the preview's copy: 1, 2, 3.
+    let (shown, ran) = both(&[("Place", "n", "@row_number * 10")], "n + 1");
+    assert_eq!(shown, clean([10, 20, 30]));
+    assert_eq!(ran, [V::Int(10), V::Int(20), V::Int(30)]);
+    // A rule that no longer reads is skipped, as the run skips it: the others still apply.
+    let (shown, ran) = both(&[("Gone", "n", "nosuch + 1")], "n + 1");
+    assert_eq!(shown, clean([2, 3, 4]));
+    assert_eq!(ran, [V::Int(2), V::Int(3), V::Int(4)]);
+    let (shown, ran) = both(&[("Gone", "n", "nosuch + 1"), ("Tens", "n", "n * 10")], "n + 1");
+    assert_eq!(shown, clean([20, 30, 40]));
+    assert_eq!(ran, [V::Int(20), V::Int(30), V::Int(40)]);
+    // A rule on another field feeding a domain it breaks still refuses the row, as the run does.
+    let mut with_domain = layer(&[("Place", "m", "n * 10")]);
+    with_domain.run("data.domain", &json!({"layer": "calc", "field": "m", "min": 0, "max": 25})).unwrap();
+    let l = with_domain.map().layer_by_name("calc").unwrap();
+    let n = l.dataset.field_index("n").unwrap();
+    let previewed = preview_calculation("n", &l.dataset, n, &[0, 1, 2], Some(&l.design)).unwrap();
+    assert_eq!(previewed.iter().map(|p| p.refused.is_some()).collect::<Vec<_>>(), [false, false, true], "30 is past the domain");
+    assert_eq!(previewed.iter().map(|p| p.value.clone()).collect::<Vec<_>>(), [V::Int(1), V::Int(2), V::Int(3)]);
     // No rule: the expression's value, as before; no rows: nothing previewed.
     let (shown, _) = both(&[], "n + 1");
     assert_eq!(shown, clean([2, 3, 4]));

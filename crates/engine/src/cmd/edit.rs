@@ -1831,12 +1831,23 @@ pub fn preview_calculation(
     rows: &[usize],
     design: Option<&rustgis_map::design::Design>,
 ) -> Result<Vec<CalculationPreview>, String> {
+    use rustgis_map::design::RuleKind;
     let calc = Calculation::parse(expr, ds)?;
     let ty = ds.fields.get(field).map(|f| f.ty).ok_or("no field")?;
-    // Only a layer with a rule or a check changes the value or refuses a row.
-    let ruled = design.filter(|d| !d.domains.is_empty() || !d.contingent.is_empty() || !d.rules.is_empty());
-    // The layer's fields, which its rules are read against, and its constraint rules: only for a
-    // layer with rules or checks.
+    // The dialog asks every frame, so the one-row copy and the rules are skipped unless they
+    // change the answer: the layer has a check (a domain, an allowed combination or a constraint
+    // rule, which any calculation rule's result may feed), or a calculation rule writes `field`.
+    // A layer with only calculation rules on other fields gets the expression's value, as it
+    // would from running them.
+    let ruled = design.filter(|d| {
+        !d.domains.is_empty()
+            || !d.contingent.is_empty()
+            || d.rules.iter().any(|r| match r.kind {
+                RuleKind::Constraint => true,
+                RuleKind::Calculation => ds.field_index(&r.field) == Some(field),
+            })
+    });
+    // The layer's fields, which its rules are read against, and its constraint rules.
     let prepared = ruled.map(|d| {
         let metadata = rustgis_data::Dataset::new(ds.name.clone(), ds.geometry_type, ds.fields.clone());
         let constraints = super::design::constraint_rules(d, &metadata);
@@ -2051,6 +2062,38 @@ fn split_op(e: &str) -> (&str, Option<char>, Option<&str>) {
 mod tests {
     use super::*;
     use rustgis_data::{Dataset, Field};
+
+    /// What a tally of one write says in a preview (`WriteLosses::previewed`) is what the preview
+    /// says of the same result when it holds it (`held`, then `Loss::previewed`): the two readings
+    /// of a loss don't drift apart.
+    #[test]
+    fn a_losses_tally_previews_as_the_result_it_counts() {
+        use rustgis_data::query::Fault;
+        let at = Value::parse("2026-11-23T10:30:00", FieldType::DateTime);
+        let cases: Vec<(Value, Option<Fault>, FieldType, Option<PreviewLoss>)> = vec![
+            (Value::Float(1e300), None, FieldType::Integer, Some(PreviewLoss::Range)),
+            (Value::Float(2.5), None, FieldType::Integer, Some(PreviewLoss::Fraction)),
+            (Value::Float(f64::NAN), None, FieldType::Double, Some(PreviewLoss::NotANumber)),
+            (Value::Float(f64::INFINITY), None, FieldType::Double, Some(PreviewLoss::NotFinite)),
+            (Value::Text("n/a".into()), None, FieldType::Integer, Some(PreviewLoss::Unheld)),
+            (at, None, FieldType::Date, Some(PreviewLoss::Time)),
+            (Value::Null, Some(Fault::DivisionByZero), FieldType::Double, Some(PreviewLoss::Error(Fault::DivisionByZero))),
+            (Value::Float(2.0), None, FieldType::Integer, None),
+            (Value::Null, None, FieldType::Double, None),
+        ];
+        for (value, fault, ty, expected) in cases {
+            let result = (value.clone(), fault);
+            let held = held(result.clone(), ty);
+            let by_held = held.other.or(held.cut).and_then(Loss::previewed);
+            let by_tally = {
+                let mut losses = WriteLosses::default();
+                losses.write(0, result, ty);
+                losses.previewed()
+            };
+            assert_eq!(by_held, expected, "{value:?} into {ty:?}");
+            assert_eq!(by_tally, by_held, "{value:?} into {ty:?}");
+        }
+    }
 
     /// A null an expression's error wrote says so, by kind with its count and first rows, on a
     /// layer and a table, from the language and from the earlier calculator; a clean run, and

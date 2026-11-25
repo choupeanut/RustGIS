@@ -248,7 +248,8 @@ and nothing changes until **Calculate** is clicked. On a layer, each previewed r
 layer's calculation rules and checks (domains, allowed combinations of values, constraint rules) as
 Calculate would. A calculation rule that writes the chosen field overwrites Calculate's result, so
 the preview shows the rule's result, as the field holds it, with what writing that loses (the later
-of two rules wins; what Calculate's own result lost isn't shown then, though Calculate says it). A
+of two rules wins; what Calculate's own result lost isn't shown then, though Calculate says it; a
+rule that no longer reads is skipped, as Calculate skips it and says so). A
 row the checks would refuse says so in Calculate's words:
 `Preview: 15 · 30 · 45 (refused: 45 isn't allowed in v (its domain))`. Calculate refuses the whole
 edit when any of its rows is refused, so rows the preview doesn't show can still refuse it. An area
