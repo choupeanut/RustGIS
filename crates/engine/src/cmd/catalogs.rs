@@ -110,7 +110,8 @@ fn overture_add(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Adds a theme type's files (read in place, the map's view kept), all or none: when one can't be
 /// added, the ones added before it are taken out again, so trying again doesn't add them twice.
-/// Files left to the app (a plugin's command in the app) make the answer `"pending": true`.
+/// Files left to the app (a plugin's command in the app) make the answer `"pending": true`; the
+/// ones that landed before a later file failed stay (each its own undo step), and the error says so.
 pub(crate) fn add_files(s: &mut Session, ty: &str, urls: &[String]) -> CmdResult {
     // What a failure puts back: the map's layers in their order and its layer ids (not a copy of
     // their data), and the active layer.
@@ -129,7 +130,14 @@ pub(crate) fn add_files(s: &mut Session, ty: &str, urls: &[String]) -> CmdResult
             Err(e) => {
                 s.map_mut().restore_layers(&before);
                 s.active_layer = active;
-                return Err(if n > 1 { format!("{e} (none of the {n} files was added)") } else { e });
+                // Layers a plugin's earlier run left to the app have landed before this run: they
+                // stay, each its own undo step, so say so rather than that none was added.
+                let kept = layers.iter().filter(|id| s.map().layer(**id).is_some()).count();
+                return Err(match (n > 1, kept) {
+                    (false, _) => e,
+                    (true, 0) => format!("{e} (none of the {n} files was added)"),
+                    (true, k) => format!("{e} ({k} of the {n} files was added earlier and stays; undo removes it)"),
+                });
             }
         }
     }

@@ -37561,6 +37561,45 @@ fn a_plugin_command_adding_overture_files_runs_again_when_they_are_added() {
     rustgis_plugins::unload("eng-overture");
 }
 
+/// When the second of a plugin command's Overture files fails after the first landed, the command's
+/// error says the first stays (it is its own undo step), not that none was added.
+#[test]
+fn a_failed_pending_overture_add_says_which_files_stay() {
+    use rustgis_data::{Dataset, Feature, Field, FieldType, Geometry, GeometryType, Value};
+    let mut ds = Dataset::new("b", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    for i in 0..5u32 {
+        let c = rustgis_geom::Coord::new(7.0 + 0.01 * f64::from(i), 46.0);
+        ds.features.push(Feature { id: u64::from(i) + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(i64::from(i))] });
+    }
+    let good = rustgis_data::source::parquet::write(&ds).unwrap();
+    let mut s = world();
+    plugin("eng-overture-fail", &["edit", "network"]);
+    let layers = s.map().layers.len();
+    let home = "https://overturemaps-us-west-2.s3.amazonaws.com/release/2026-11-18.0/theme=buildings/type=building";
+    let urls = [format!("{home}/part-0.parquet"), format!("{home}/part-1.parquet")];
+    let p = json!({"op": "overture.add", "params": {"theme": "buildings", "files": urls}});
+    s.run_leaving_downloads("plugin:eng-overture-fail/f", &p).unwrap();
+    let asked = s.take_url_requests();
+    assert_eq!(asked.len(), 2);
+    // The first lands and is added; the second's download fails.
+    let id = s.download_started_for(&asked[0]).unwrap();
+    assert!(s.download_landed(id, good));
+    let mut add = asked[0].params().clone();
+    add["id"] = json!(id);
+    s.complete_download(id, &add).unwrap();
+    let id = s.download_started_for(&asked[1]).unwrap();
+    assert!(s.download_landed(id, b"not a parquet file".to_vec()));
+    let mut add = asked[1].params().clone();
+    add["id"] = json!(id);
+    let _ = s.complete_download(id, &add);
+    let ran = s.poll_plugin_retries();
+    let e = ran.first().and_then(|r| r.1.as_ref().err()).cloned().unwrap_or_default();
+    assert_eq!(s.map().layers.len(), layers + 1, "the first file's layer stays: {ran:?}");
+    assert!(e.contains("1 of the 2 files was added earlier and stays"), "{e}");
+    assert!(!e.contains("none of the"), "{e}");
+    rustgis_plugins::unload("eng-overture-fail");
+}
+
 /// A multi-file add that fails puts the map back exactly: the same layers in the same order, and
 /// the same active layer.
 #[test]

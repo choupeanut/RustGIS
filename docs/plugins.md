@@ -703,7 +703,7 @@ the way, once for each document at most, and a map layer is added by the run tha
 left to download as `layer.addUrl` does, and while any is under way it answers `{"pending": true,
 "files": n, "layers": [...]}` (the layers already in; none on the first run), so the command can
 return and runs again once they are added, when `overture.add` answers the ids of the layers it
-added. It adds all of an area's files or none: a file that fails stops the command with an error.
+added. It adds all of an area's files or none when it adds them itself; when they are left to download, a file that fails stops the command with an error that says how many were added before it. Those stay, each its own undo step.
 It also fetches the catalog on each run, which waits with the window held.
 
 While a command waits the window answers, so the user can work and the project can change. The
