@@ -37565,6 +37565,14 @@ fn a_plugin_command_adding_overture_files_runs_again_when_they_are_added() {
 /// error says the first stays (it is its own undo step), not that none was added.
 #[test]
 fn a_failed_pending_overture_add_says_which_files_stay() {
+    // The failed file comes second (the loop has added the first) or first (it never reaches the
+    // one that landed after it).
+    for bad_first in [false, true] {
+        a_failed_pending_overture_add_says_which_files_stay_in(bad_first);
+    }
+}
+
+fn a_failed_pending_overture_add_says_which_files_stay_in(bad_first: bool) {
     use rustgis_data::{Dataset, Feature, Field, FieldType, Geometry, GeometryType, Value};
     let mut ds = Dataset::new("b", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
     for i in 0..5u32 {
@@ -37572,6 +37580,9 @@ fn a_failed_pending_overture_add_says_which_files_stay() {
         ds.features.push(Feature { id: u64::from(i) + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(i64::from(i))] });
     }
     let good = rustgis_data::source::parquet::write(&ds).unwrap();
+    fn bad_bytes() -> Vec<u8> {
+        b"not a parquet file".to_vec()
+    }
     let mut s = world();
     plugin("eng-overture-fail", &["edit", "network"]);
     let layers = s.map().layers.len();
@@ -37581,20 +37592,17 @@ fn a_failed_pending_overture_add_says_which_files_stay() {
     s.run_leaving_downloads("plugin:eng-overture-fail/f", &p).unwrap();
     let asked = s.take_url_requests();
     assert_eq!(asked.len(), 2);
-    // The first lands and is added; the second's download fails.
-    let id = s.download_started_for(&asked[0]).unwrap();
-    assert!(s.download_landed(id, good));
-    let mut add = asked[0].params().clone();
-    add["id"] = json!(id);
-    s.complete_download(id, &add).unwrap();
-    let id = s.download_started_for(&asked[1]).unwrap();
-    assert!(s.download_landed(id, b"not a parquet file".to_vec()));
-    let mut add = asked[1].params().clone();
-    add["id"] = json!(id);
-    let _ = s.complete_download(id, &add);
+    // One lands and is added; the other's download fails.
+    for (q, bytes) in asked.iter().zip(if bad_first { [bad_bytes(), good.clone()] } else { [good.clone(), bad_bytes()] }) {
+        let id = s.download_started_for(q).unwrap();
+        assert!(s.download_landed(id, bytes));
+        let mut add = q.params().clone();
+        add["id"] = json!(id);
+        let _ = s.complete_download(id, &add);
+    }
     let ran = s.poll_plugin_retries();
     let e = ran.first().and_then(|r| r.1.as_ref().err()).cloned().unwrap_or_default();
-    assert_eq!(s.map().layers.len(), layers + 1, "the first file's layer stays: {ran:?}");
+    assert_eq!(s.map().layers.len(), layers + 1, "the file that landed stays: {ran:?}");
     assert!(e.contains("1 of the 2 files landed earlier and stay"), "{e}");
     assert!(!e.contains("none of the"), "{e}");
     rustgis_plugins::unload("eng-overture-fail");

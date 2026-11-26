@@ -132,7 +132,17 @@ pub(crate) fn add_files(s: &mut Session, ty: &str, urls: &[String]) -> CmdResult
                 s.active_layer = active;
                 // Layers a plugin's earlier run left to the app have landed before this run: they
                 // stay, each its own undo step, so say so rather than that none was added.
-                let kept = layers.iter().filter(|id| s.map().layer(**id).is_some()).count();
+                // Counted from the downloads that landed, whichever of the files they were: a file
+                // after the failed one may have landed too, and this loop never reached it.
+                let kept = s
+                    .rerun_landed
+                    .iter()
+                    .filter(|(asked, _, added)| {
+                        added.added_any()
+                            && !added.gone(s.map())
+                            && asked.get("url").and_then(Value::as_str).is_some_and(|u| urls.iter().any(|x| x == u))
+                    })
+                    .count();
                 return Err(match (n > 1, kept) {
                     (false, _) => e,
                     (true, 0) => format!("{e} (none of the {n} files was added)"),
