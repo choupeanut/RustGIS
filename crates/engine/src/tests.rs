@@ -37561,8 +37561,8 @@ fn a_plugin_command_adding_overture_files_runs_again_when_they_are_added() {
     rustgis_plugins::unload("eng-overture");
 }
 
-/// When the second of a plugin command's Overture files fails after the first landed, the command's
-/// error says the first stays (it is its own undo step), not that none was added.
+/// When one of a plugin command's Overture files fails and the other landed (before or after it),
+/// the command's error says that one stays (its own undo step), not that none was added.
 #[test]
 fn a_failed_pending_overture_add_says_which_files_stay() {
     // The failed file comes second (the loop has added the first) or first (it never reaches the
@@ -37592,6 +37592,7 @@ fn a_failed_pending_overture_add_says_which_files_stay_in(bad_first: bool) {
     s.run_leaving_downloads("plugin:eng-overture-fail/f", &p).unwrap();
     let asked = s.take_url_requests();
     assert_eq!(asked.len(), 2);
+    assert_eq!(asked[0].params()["url"], json!(urls[0]), "asked in the files' order");
     // One lands and is added; the other's download fails.
     for (q, bytes) in asked.iter().zip(if bad_first { [bad_bytes(), good.clone()] } else { [good.clone(), bad_bytes()] }) {
         let id = s.download_started_for(q).unwrap();
@@ -37604,6 +37605,7 @@ fn a_failed_pending_overture_add_says_which_files_stay_in(bad_first: bool) {
     let e = ran.first().and_then(|r| r.1.as_ref().err()).cloned().unwrap_or_default();
     assert_eq!(s.map().layers.len(), layers + 1, "the file that landed stays: {ran:?}");
     assert!(e.contains("1 of the 2 files landed earlier and stay"), "{e}");
+    assert!(e.contains(if bad_first { "part-0.parquet" } else { "part-1.parquet" }), "the failed file's own error: {e}");
     assert!(!e.contains("none of the"), "{e}");
     rustgis_plugins::unload("eng-overture-fail");
 }
