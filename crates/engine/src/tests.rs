@@ -37595,7 +37595,7 @@ fn a_failed_pending_overture_add_says_which_files_stay() {
     let ran = s.poll_plugin_retries();
     let e = ran.first().and_then(|r| r.1.as_ref().err()).cloned().unwrap_or_default();
     assert_eq!(s.map().layers.len(), layers + 1, "the first file's layer stays: {ran:?}");
-    assert!(e.contains("1 of the 2 files was added earlier and stays"), "{e}");
+    assert!(e.contains("1 of the 2 files landed earlier and stay"), "{e}");
     assert!(!e.contains("none of the"), "{e}");
     rustgis_plugins::unload("eng-overture-fail");
 }

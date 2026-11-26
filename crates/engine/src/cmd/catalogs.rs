@@ -136,7 +136,7 @@ pub(crate) fn add_files(s: &mut Session, ty: &str, urls: &[String]) -> CmdResult
                 return Err(match (n > 1, kept) {
                     (false, _) => e,
                     (true, 0) => format!("{e} (none of the {n} files was added)"),
-                    (true, k) => format!("{e} ({k} of the {n} files was added earlier and stays; undo removes it)"),
+                    (true, k) => format!("{e} ({k} of the {n} files landed earlier and stay, each its own undo step)"),
                 });
             }
         }
