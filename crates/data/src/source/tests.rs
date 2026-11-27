@@ -5415,7 +5415,13 @@ fn parquet_delta_pages_of_many_blocks_read_back() {
     for v2 in [false, true] {
         for page_bytes in [None, Some(4 << 10)] {
             write_encoded_parquet_fixture(&ds, &p, 3000, false, FixturePages { delta: true, v2, page_bytes });
+            let encodings = text_encodings(&p, "label");
+            assert!(encodings.contains(&::parquet::basic::Encoding::DELTA_BYTE_ARRAY), "{encodings:?}");
+            parquet::reset_delta_pages();
             let batch = parquet::ParquetSource::open_path(&p, "pts").unwrap().read(&whole).unwrap();
+            // The label column's pages (version 1 has a definition level stream in front of the
+            // values) went through the check: one page, or several of about 4 KiB.
+            assert!(parquet::delta_pages() >= if page_bytes.is_some() { 2 } else { 1 }, "v2 {v2} {page_bytes:?}");
             assert_eq!(batch.features.len(), 3000, "v2 {v2} {page_bytes:?}");
             for (i, f) in batch.features.iter().enumerate() {
                 assert_eq!(f.attrs[0], text(i).map(Value::Text).unwrap_or(Value::Null), "v2 {v2} {page_bytes:?} row {i}");
