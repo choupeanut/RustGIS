@@ -55,6 +55,8 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+/// The value after `name`. A flag that takes one is in [`VALUE_FLAGS`], which [`check_values`]
+/// checks before anything runs, so the value is there and isn't another option.
 fn opt<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
 }
@@ -208,6 +210,72 @@ fn run_strict(s: &mut Session, strict: Option<&Strict>, id: &str, p: Value) -> R
 
 fn is_project(path: &str) -> bool {
     rustgis_engine::project::opens_as_project(path)
+}
+
+/// The options that take one value and have no check of their own: `--allow` ([`Strict::from_args`]),
+/// `--threads`, `--image` ([`ask_pictures`]) and `mcp-register`'s `--client`, `--name` and `--port`
+/// do, and `--attach` takes an optional port.
+const VALUE_FLAGS: &[&str] = &[
+    "--project",
+    "--data",
+    "--cmd",
+    "--save",
+    "--plugin",
+    "--registry",
+    "--worldview",
+    "--worldview-detail",
+    "--basemap",
+    "--tiles",
+    "--width",
+    "--height",
+    "--dpi",
+    "--provider",
+    "--model",
+    "--base-url",
+    "--trace",
+    "--account",
+    "--remove-account",
+    "--size",
+    "--canvas",
+    "--at",
+    "--token-file",
+    "--timeout",
+];
+
+/// Refuses an option from [`VALUE_FLAGS`] with no value, an empty one, or another option where the
+/// value goes (`run --save --cmd x` would save a project named `--cmd`), and a `render` size that
+/// isn't a finite number above 0. Every occurrence is checked, as `--data` and `--cmd` repeat.
+fn check_values(cmd: &str, args: &[String]) -> Result<(), String> {
+    for (i, flag) in args.iter().enumerate() {
+        if !VALUE_FLAGS.contains(&flag.as_str()) {
+            continue;
+        }
+        let value = match args.get(i + 1).map(String::as_str) {
+            None | Some("") => return Err(format!("{cmd} {flag}: expected a value")),
+            Some(next) if next.starts_with("--") => return Err(format!("{cmd} {flag}: expected a value, found the option {next}")),
+            Some(value) => value,
+        };
+        if cmd == "render"
+            && matches!(flag.as_str(), "--width" | "--height" | "--dpi")
+            && !value.parse::<f64>().is_ok_and(|v| v.is_finite() && v > 0.0)
+        {
+            return Err(format!("{cmd} {flag} {value}: expected a positive number"));
+        }
+    }
+    Ok(())
+}
+
+/// A `render` size in pixels: `--width` or `--height`, else `default`, kept within 16 to 8000 and
+/// said when it was moved. [`check_values`] has seen that a given one is a positive number.
+fn side(args: &[String], name: &str, default: f64) -> f64 {
+    let (Some(given), Some(text)) = (num(args, name), opt(args, name)) else { return default };
+    let kept = given.clamp(16.0, 8000.0);
+    if kept > given {
+        eprintln!("rustgis-cli: {name} {text}: using {kept}, the least a side takes (16 to 8000)");
+    } else if kept < given {
+        eprintln!("rustgis-cli: {name} {text}: using {kept}, the most a side takes (16 to 8000)");
+    }
+    kept
 }
 
 fn num(args: &[String], name: &str) -> Option<f64> {
@@ -846,6 +914,11 @@ fn cli() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Before plugins load or anything is read or downloaded.
+    if let Err(e) = check_values(cmd, &args) {
+        eprintln!("rustgis-cli: {e}");
+        return ExitCode::from(2);
+    }
     if !args.iter().any(|a| a == "--no-plugins") {
         for e in rustgis_engine::cmd::plugins::load_installed() {
             eprintln!("rustgis-cli: warning: {e}");
@@ -1028,8 +1101,8 @@ fn cli() -> ExitCode {
             if let Some(u) = opt(&args, "--tiles") {
                 run(&mut s, "map.addTiles", json!({"url": u}))?;
             }
-            let w = num(&args, "--width").unwrap_or(1600.0).clamp(16.0, 8000.0);
-            let h = num(&args, "--height").unwrap_or(900.0).clamp(16.0, 8000.0);
+            let w = side(&args, "--width", 1600.0);
+            let h = side(&args, "--height", 900.0);
             s.view_size = (w, h);
             if !is_project(input) {
                 run(&mut s, "map.zoomFull", Value::Null)?;
@@ -1164,6 +1237,56 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn check_values_refuses_a_missing_value_an_option_in_its_place_and_a_bad_size() {
+        let check = |list: &[&str]| check_values(list.first().copied().unwrap_or(""), &args(list));
+        for (list, said) in [
+            (&["run", "--save"][..], "run --save: expected a value"),
+            (&["run", "--save", ""], "run --save: expected a value"),
+            (&["run", "--save", "--cmd", "x"], "run --save: expected a value, found the option --cmd"),
+            (&["run", "--data", "a.geojson", "--data"], "run --data: expected a value"),
+            (&["run", "--plugin"], "run --plugin: expected a value"),
+            (&["mcp", "--attach", "5000", "--timeout"], "mcp --timeout: expected a value"),
+            (&["render", "a", "b.png", "--width", "abc"], "render --width abc: expected a positive number"),
+            (&["render", "a", "b.png", "--height", "1e400"], "render --height 1e400: expected a positive number"),
+            (&["render", "a", "b.png", "--dpi", "0"], "render --dpi 0: expected a positive number"),
+            (&["render", "a", "b.png", "--dpi", "-5"], "render --dpi -5: expected a positive number"),
+            (&["render", "a", "b.png", "--width", "NaN"], "render --width NaN: expected a positive number"),
+        ] {
+            assert_eq!(check(list).unwrap_err(), said);
+        }
+        // Well-formed input, an option that isn't this check's, a lone `--attach`, a value with one dash,
+        // and a size where the subcommand doesn't read one.
+        for list in [
+            &["run", "--save", "out.rgis", "--cmd", "gp.threads", "--cmd", "gp.threads"][..],
+            &["render", "a", "b.png", "--width", "64.5", "--dpi", "96"],
+            &["logo", "l.png", "--canvas", "10x10", "--at", "-5,-5"],
+            &["mcp", "--attach"],
+            &["run", "--threads"],
+            &["run", "--allow"],
+            &["run", "--width", "abc"],
+        ] {
+            assert_eq!(check(list), Ok(()), "{list:?}");
+        }
+    }
+
+    #[test]
+    fn every_option_read_with_opt_is_checked_by_check_values() {
+        // These have a check of their own (see `VALUE_FLAGS`).
+        let own = ["--threads", "--client", "--name", "--port"];
+        let source = include_str!("main.rs");
+        let mut missing = Vec::new();
+        for call in ["opt(&args, \"", "opt(args, \""] {
+            for part in source.split(call).skip(1) {
+                let flag = format!("--{}", part.trim_start_matches('-').split('"').next().unwrap_or(""));
+                if !VALUE_FLAGS.contains(&flag.as_str()) && !own.contains(&flag.as_str()) {
+                    missing.push(flag);
+                }
+            }
+        }
+        assert!(missing.is_empty(), "read with opt but not in VALUE_FLAGS: {missing:?}");
     }
 
     /// An environment with no keys.
