@@ -70,6 +70,31 @@ fn a_flag_without_its_value_is_refused_not_ignored() {
 }
 
 #[test]
+fn the_flags_with_a_check_further_on_are_refused_up_front_too() {
+    let dir = TempDir::new("flag-values-late");
+    // These once passed the up-front check: `mcp-register` refused them with status 1 after
+    // plugins loaded, and `--threads` and `--image` only after plugins loaded and a worldview
+    // may have been downloaded.
+    let cases: [(&[&str], &str); 9] = [
+        (&["mcp-register", "--client"], "mcp-register --client: expected a value"),
+        (&["mcp-register", "--name"], "mcp-register --name: expected a value"),
+        (&["mcp-register", "--port"], "mcp-register --port: expected a value"),
+        (&["mcp-register", "--client", "--name", "x"], "mcp-register --client: expected a value, found the option --name"),
+        (&["run", "--threads"], "run --threads: expected a value"),
+        (&["render", "a.geojson", "o.png", "--threads"], "render --threads: expected a value"),
+        (&["ask", "hello", "--threads", "--yes"], "ask --threads: expected a value, found the option --yes"),
+        (&["ask", "hello", "--image"], "ask --image: expected a value"),
+        (&["mcp", "--attach", "5000", "--threads"], "mcp --threads: expected a value"),
+    ];
+    for (args, want) in cases {
+        let out = cli(&dir, args);
+        let err = said(&out);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains(want), "{args:?}: {err}");
+    }
+}
+
+#[test]
 fn a_dimension_that_is_not_a_positive_number_is_refused() {
     let dir = TempDir::new("dimensions");
     for flag in ["--width", "--height", "--dpi"] {
