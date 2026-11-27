@@ -1601,7 +1601,7 @@ fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool], budget: &Budg
             (Some(i), None) => Value::Int(i),
         }
     };
-    let values = if let Some(binary) = read_binary(rg, col, take, budget)? {
+    let values = if let Some(binary) = read_binary(rg, col, take, budget, text_len)? {
         binary.into_iter().map(|v| v.map(|b| Value::Text(String::from_utf8_lossy(b.data()).into_owned())).unwrap_or_default()).collect()
     } else {
         match column_reader(rg, col)? {
@@ -1673,18 +1673,32 @@ fn binary_dictionary_max(bytes: &[u8], count: u32) -> Result<u64> {
 
 /// Reads a binary column (the WKB geometry), for the rows `take` marks, in order, within `budget`.
 fn read_bytes(rg: &dyn RowGroupReader, col: usize, take: &[bool], budget: &Budget) -> Result<Vec<Option<Vec<u8>>>> {
-    match read_binary(rg, col, take, budget)? {
+    match read_binary(rg, col, take, budget, <[u8]>::len)? {
         Some(values) => Ok(values.into_iter().map(|v| v.map(|b| b.data().to_vec())).collect()),
         None => Err(DataError::Format("GeoParquet: the geometry column is not binary".into())),
     }
 }
 
+/// The bytes `bytes` takes as a `String` made by [`String::from_utf8_lossy`], counted without
+/// building it: valid text keeps its length, and each invalid sequence becomes the 3 bytes of
+/// U+FFFD, which can be more than it held.
+fn text_len(bytes: &[u8]) -> usize {
+    bytes.utf8_chunks().map(|c| c.valid().len() + if c.invalid().is_empty() { 0 } else { 3 }).sum()
+}
+
 /// The rows `take` marks of a BYTE_ARRAY column, charging `budget` for each value as it is read,
-/// before any is copied (`None` for a column of another type). Only the rows taken count, not the
+/// as `size` counts what the caller makes of its bytes, before any is copied (`None` for a column
+/// of another type). Only the rows taken count, not the
 /// column chunk's size; a page of more than the budget is refused, as the `parquet` crate makes
 /// room for a whole page. A column with DELTA_BYTE_ARRAY pages, whose values the decoder builds
 /// one by one, is read at the [`Pace`] its page size and the budget left allow.
-fn read_binary(rg: &dyn RowGroupReader, col: usize, take: &[bool], budget: &Budget) -> Result<Option<Vec<Option<ByteArray>>>> {
+fn read_binary(
+    rg: &dyn RowGroupReader,
+    col: usize,
+    take: &[bool],
+    budget: &Budget,
+    size: fn(&[u8]) -> usize,
+) -> Result<Option<Vec<Option<ByteArray>>>> {
     let chunk = rg.metadata().column(col);
     if chunk.column_descr().physical_type() != Physical::BYTE_ARRAY {
         return Ok(None);
@@ -1694,7 +1708,7 @@ fn read_binary(rg: &dyn RowGroupReader, col: usize, take: &[bool], budget: &Budg
     let ColumnReader::ByteArrayColumnReader(mut r) = reader else { return Ok(None) };
     let delta = chunk.encodings().any(|e| e == Encoding::DELTA_BYTE_ARRAY);
     let pace = Pace { watch: delta.then_some((&*note, budget)) };
-    read_column_with(&mut r, take, chunk.column_descr().max_def_level(), &pace, &mut |b: &ByteArray| budget.charge(b.len(), &name))
+    read_column_with(&mut r, take, chunk.column_descr().max_def_level(), &pace, &mut |b: &ByteArray| budget.charge(size(b.data()), &name))
         .map(Some)
 }
 
@@ -2412,6 +2426,16 @@ mod tests {
             };
             assert!(pages.get_next_page().unwrap().is_some());
             assert_eq!((note.page.load(Ordering::Relaxed), note.in_page.load(Ordering::Relaxed)), (40, 1));
+        }
+    }
+
+    /// The length of text as `from_utf8_lossy` makes it, for any bytes.
+    #[test]
+    fn text_len_is_the_length_of_the_lossy_string() {
+        for bytes in
+            [&b""[..], b"abc", "h\u{e9}llo \u{4e2d}".as_bytes(), b"\xff", b"a\xffb\xfe\xfec", b"\xe2\x82", b"ok\xe2\x82", b"\xf0\x9f\x98"]
+        {
+            assert_eq!(text_len(bytes), String::from_utf8_lossy(bytes).len(), "{bytes:?}");
         }
     }
 
