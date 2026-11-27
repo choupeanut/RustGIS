@@ -212,9 +212,10 @@ fn is_project(path: &str) -> bool {
     rustgis_engine::project::opens_as_project(path)
 }
 
-/// The options that take one value and have no check of their own: `--allow` ([`Strict::from_args`]),
-/// `--threads`, `--image` ([`ask_pictures`]) and `mcp-register`'s `--client`, `--name` and `--port`
-/// do, and `--attach` takes an optional port.
+/// The options that take exactly one value. Left out: `--allow` (checked by [`Strict::from_args`],
+/// just before), `--attach` (its port is optional) and the `--threads=N` form, which has no separate
+/// value. `--threads`, `--image` ([`ask_pictures`]) and `mcp-register`'s `--client`, `--name` and
+/// `--port` keep their checks further on, as guards for what a value may be.
 const VALUE_FLAGS: &[&str] = &[
     "--project",
     "--data",
@@ -240,6 +241,11 @@ const VALUE_FLAGS: &[&str] = &[
     "--at",
     "--token-file",
     "--timeout",
+    "--threads",
+    "--image",
+    "--client",
+    "--name",
+    "--port",
 ];
 
 /// Refuses an option from [`VALUE_FLAGS`] with no value, an empty one, or another option where the
@@ -1250,6 +1256,11 @@ mod tests {
             (&["run", "--save", "--cmd", "x"], "run --save: expected a value, found the option --cmd"),
             (&["run", "--data", "a.geojson", "--data"], "run --data: expected a value"),
             (&["run", "--plugin"], "run --plugin: expected a value"),
+            (&["run", "--threads"], "run --threads: expected a value"),
+            (&["ask", "x", "--image"], "ask --image: expected a value"),
+            (&["mcp-register", "--client", "--name", "x"], "mcp-register --client: expected a value, found the option --name"),
+            (&["mcp-register", "--name"], "mcp-register --name: expected a value"),
+            (&["mcp-register", "--port"], "mcp-register --port: expected a value"),
             (&["mcp", "--attach", "5000", "--timeout"], "mcp --timeout: expected a value"),
             (&["render", "a", "b.png", "--width", "abc"], "render --width abc: expected a positive number"),
             (&["render", "a", "b.png", "--height", "1e400"], "render --height 1e400: expected a positive number"),
@@ -1266,7 +1277,7 @@ mod tests {
             &["render", "a", "b.png", "--width", "64.5", "--dpi", "96"],
             &["logo", "l.png", "--canvas", "10x10", "--at", "-5,-5"],
             &["mcp", "--attach"],
-            &["run", "--threads"],
+            &["run", "--threads=4"],
             &["run", "--allow"],
             &["run", "--width", "abc"],
         ] {
@@ -1276,14 +1287,12 @@ mod tests {
 
     #[test]
     fn every_option_read_with_opt_is_checked_by_check_values() {
-        // These have a check of their own (see `VALUE_FLAGS`).
-        let own = ["--threads", "--client", "--name", "--port"];
         let source = include_str!("main.rs");
         let mut missing = Vec::new();
         for call in ["opt(&args, \"", "opt(args, \""] {
             for part in source.split(call).skip(1) {
                 let flag = format!("--{}", part.trim_start_matches('-').split('"').next().unwrap_or(""));
-                if !VALUE_FLAGS.contains(&flag.as_str()) && !own.contains(&flag.as_str()) {
+                if !VALUE_FLAGS.contains(&flag.as_str()) {
                     missing.push(flag);
                 }
             }
