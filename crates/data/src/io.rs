@@ -3116,7 +3116,7 @@ pub(crate) fn read_rows(
         })
         .collect();
     let mut report = ReadReport { skipped: malformed, ..ReadReport::default() };
-    report.columns_lacking = lacking;
+    report.columns_lacking = lacking.map(Box::new);
     if xy.is_none()
         && wkt.is_none()
         && let Some(note) = unmatched_coordinates_note(headers)
@@ -4078,7 +4078,7 @@ fn read_zip_layers_budget(file_name: &str, bytes: &[u8], opts: &CsvOptions, budg
                     layer.dataset.source = Some(format!("{file_name}/{n}"));
                     if table && columns_given {
                         tables_given += 1;
-                        if let Some((what, column)) = layer.report.columns_lacking.take() {
+                        if let Some((what, column)) = layer.report.columns_lacking.take().map(|b| *b) {
                             tables_lacking.push(format!("{n} (no {what} column '{column}')"));
                         }
                     }
