@@ -5542,10 +5542,10 @@ fn write_encoded_parquet_fixture(ds: &Dataset, path: &Path, rows: usize, diction
         .set_max_row_group_row_count(Some(rows))
         .set_dictionary_enabled(dictionary)
         .set_key_value_metadata(Some(vec![::parquet::file::metadata::KeyValue::new("geo".into(), geo.to_string())]));
-    if pages.delta {
-        for field in ds.fields.iter().filter(|f| f.ty == FieldType::Text) {
-            props = props.set_column_encoding(field.name.as_str().into(), ::parquet::basic::Encoding::DELTA_BYTE_ARRAY);
-        }
+    // Left alone, version 2 writes text as DELTA_BYTE_ARRAY, so the plain case says so.
+    let encoding = if pages.delta { ::parquet::basic::Encoding::DELTA_BYTE_ARRAY } else { ::parquet::basic::Encoding::PLAIN };
+    for field in ds.fields.iter().filter(|f| f.ty == FieldType::Text) {
+        props = props.set_column_encoding(field.name.as_str().into(), encoding);
     }
     if pages.v2 {
         props = props.set_writer_version(::parquet::file::properties::WriterVersion::PARQUET_2_0);
