@@ -170,10 +170,22 @@ impl Count {
         }
         #[cfg(not(test))]
         crate::work_off_frame("rustgis-select-count", &slot, work);
-        // A thread the system refused costs speed, not the answer: counted here, as the browser
-        // does, rather than leaving the clause to be called invalid (or never counted).
-        let refused = matches!(&*slot.lock().unwrap_or_else(|e| e.into_inner()), Some(Err(_)));
-        self.state = Some(if refused { State::Done(now(text, ds)) } else { State::Counting(slot) });
+        // A thread the system refused is said as it is: counting here would hold the frame for as
+        // long as the layer is large, with no Cancel to reach.
+        let refused = match &*slot.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(Err(e)) => Some(e.clone()),
+            _ => None,
+        };
+        self.state = Some(match refused {
+            Some(e) => State::Done(Answer::Failed(e)),
+            None => State::Counting(slot),
+        });
+    }
+
+    /// The flag that stops the count on its way (a test watches it).
+    #[cfg(test)]
+    pub(crate) fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
     }
 
     /// Whether a count is on its way.
@@ -190,7 +202,7 @@ fn guarded(f: impl FnOnce() -> Option<Answer>) -> Option<Answer> {
         .unwrap_or_else(|_| Some(Answer::Failed(tl!("Counting the matching rows failed unexpectedly").to_string())))
 }
 
-/// The count at once, here (the browser's, on its one thread, and a thread the system refused).
+/// The count at once, here (the browser's, on its one thread).
 fn now(text: &str, ds: &Dataset) -> Answer {
     let never = AtomicBool::new(false);
     guarded(|| count(text, ds, &never)).unwrap_or_else(|| Answer::Failed(tl!("Counting the matching rows failed unexpectedly").to_string()))
@@ -292,17 +304,18 @@ mod tests {
         assert_eq!(guarded(|| Some(Answer::Rows(3))), Some(Answer::Rows(3)), "an answer passes through");
     }
 
-    /// A thread the system refuses leaves the clause counted here, not called invalid or left
-    /// counting.
+    /// A thread the system refuses is said, not counted on the frame's thread (a large layer would
+    /// freeze the window), and not called invalid or left counting.
     #[test]
-    fn a_refused_thread_counts_here() {
+    fn a_refused_thread_is_said_not_counted_here() {
         let ds = layer(100);
         let mut c = Count::default();
         c.refuse = true;
         let ctx = egui::Context::default();
-        assert_eq!(c.of(&ctx, "n >= 90", "t", &ds, true), Shown::Rows(10));
+        let shown = c.of(&ctx, "n >= 90", "t", &ds, true);
+        assert!(matches!(&shown, Shown::Failed(e) if e.contains("no threads left")), "{shown:?}");
         assert!(!c.counting());
-        assert_eq!(c.of(&ctx, "n >= 90", "t", &ds, true), Shown::Rows(10), "kept");
+        assert_eq!(c.of(&ctx, "n >= 90", "t", &ds, true), shown, "kept");
         assert_eq!(c.starts, 1);
     }
 
