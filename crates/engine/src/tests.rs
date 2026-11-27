@@ -100,6 +100,15 @@ mod layout_files;
 #[path = "tests/layout_title.rs"]
 mod layout_title;
 
+#[path = "tests/layout_removed_layer.rs"]
+mod layout_removed_layer;
+
+#[path = "tests/layout_edge.rs"]
+mod layout_edge;
+
+#[path = "tests/layout_publication_parts.rs"]
+mod layout_publication_parts;
+
 #[path = "tests/sde_connections.rs"]
 mod sde_connections;
 
@@ -1074,7 +1083,7 @@ fn undo_steps_share_the_layers_they_leave_alone() {
     for (snap, ..) in &s.undo {
         let old = snap.maps.iter().flat_map(|m| &m.layers).find(|l| l.id == id).unwrap();
         assert!(old.dataset.features.shares(&live.dataset.features), "the snapshot copied the features");
-        assert_eq!(old.projected_cache().as_ptr(), live.projected_cache().as_ptr(), "the snapshot copied the projected geometry");
+        assert!(old.projected_cache().same(live.projected_cache()), "the snapshot copied the projected geometry");
     }
     // An edit copies the layer it changes, once, and leaves the snapshot as it was.
     let before = s.map().layer_by_name("Cities").unwrap().dataset.features.len();
@@ -2275,7 +2284,7 @@ fn a_streamed_layer_says_its_view_reads_notes_once() {
         };
         let expected: &[&str] = if nan {
             &[
-                "roads: 1 shape(s) have a coordinate that isn't a number under a bounding box that is one: they're left out of the read, but the layer's extent and its index still take in their stored boxes",
+                "roads: 1 shape(s) have a coordinate that isn't a number under a bounding box that is one: they have no geometry, so the read leaves them out, but the layer's extent and its index still take in their stored boxes",
             ]
         } else {
             &[]
@@ -4301,6 +4310,50 @@ fn qgis_raster_image_markers_read_their_files_from_the_style_folder() {
     }
 }
 
+/// A QGIS style's and project's SVG markers draw their file through the importer's one reader, and
+/// saving asks for `svg-markers`; one whose colours the style sets is a circle, noted.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn qgis_svg_markers_draw_their_file_and_saving_requires_svg_markers() {
+    use base64::Engine;
+    use rustgis_map::{Marker, Picture};
+    let dir = std::env::temp_dir().join(format!("rustgis-qgis-svg-markers-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 4"><rect width="8" height="4" fill="#c81e1e"/></svg>"##;
+    std::fs::write(dir.join("pin.svg"), svg).unwrap();
+    std::fs::write(dir.join("tinted.svg"), svg.replace("#c81e1e", "param(fill) #c81e1e")).unwrap();
+    let qml = |file: &str| {
+        format!(
+            r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="marker" name="0" alpha="1">
+            <layer class="SvgMarker" enabled="1"><Option type="Map"><Option name="name" value="{file}"/><Option name="size" value="6"/>
+            <Option name="size_unit" value="Point"/></Option></layer></symbol></symbols></renderer-v2></qgis>"#
+        )
+    };
+    let marker = |s: &Session| s.map().layer_by_name("Cities").unwrap().symbol(0).marker;
+    let notes =
+        |r: &serde_json::Value| r["notes"].as_array().unwrap().iter().map(|n| n["text"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(svg);
+    let path = dir.join("pins.qml");
+    // From its file beside the style, and embedded in the text with no folder.
+    for params in
+        [json!({"layer": "Cities", "path": path.to_string_lossy()}), json!({"layer": "Cities", "text": qml(&format!("base64:{b64}"))})]
+    {
+        std::fs::write(&path, qml("pin.svg")).unwrap();
+        let mut s = world();
+        let r = s.run("style.importQgis", &params).unwrap();
+        assert_eq!(marker(&s), Marker::Picture(Picture::new(&b64)), "{params}");
+        assert!(notes(&r).is_empty(), "{:?}", notes(&r));
+        assert_eq!(serde_json::to_value(&s.project).unwrap()["requires"], json!(["picture-markers", "svg-markers"]));
+    }
+    std::fs::write(&path, qml("tinted.svg")).unwrap();
+    let mut s = world();
+    let r = s.run("style.importQgis", &json!({"layer": "Cities", "path": path.to_string_lossy()})).unwrap();
+    assert_eq!(marker(&s), Marker::Circle);
+    assert_eq!(notes(&r), ["SVG markers whose colours the style sets, which RustGIS doesn't apply yet, drawn as circles"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A QGIS style's file and its raster image markers' images are read on a thread before the
 /// command lands (#2620): the landing needs neither file, says what the inline import says, can be
 /// undone, and a style read for a layer that was renamed meanwhile is refused. A cancelled read
@@ -5252,6 +5305,45 @@ fn qgis_import_notices_group_layers_and_bound_the_sample_without_dropping_return
     );
     assert!(!said[0].text.contains(notes[9]["layer"].as_str().unwrap()));
     assert!(said[0].text.len() < 4096);
+}
+
+#[test]
+fn qgis_import_codes_only_the_notes_that_lose_data() {
+    use rustgis_data::loss::LossCode;
+    let mut s = world();
+    let layer = |name: &str, provider: &str, source: &str| {
+        format!(
+            r#"<maplayer type="vector"><id>{name}</id><layername>{name}</layername><provider>{provider}</provider><datasource>{source}</datasource></maplayer>"#
+        )
+    };
+    let layers = [
+        layer("Unsupported", "not-a-provider", "x"),
+        r#"<maplayer type="vector"><id>Unnamed</id><layername>Unnamed</layername><datasource>x</datasource></maplayer>"#.to_string(),
+        layer("Heights", "memory", "PointZ?crs=EPSG:4326&amp;field=a:string"),
+        layer("Arcs", "memory", "CompoundCurve?crs=EPSG:4326&amp;field=a:string"),
+    ]
+    .concat();
+    let text = format!(r#"<qgis><projectlayers>{layers}</projectlayers><Layouts><Layout name="page"/></Layouts></qgis>"#);
+    let mark = s.notice_mark();
+    let result = s.run("project.importQgis", &json!({"text": text})).unwrap();
+    let notes = result["notes"].as_array().unwrap();
+    let json_loss = |layer: &str, text: &str| {
+        notes.iter().find(|n| n["layer"] == layer && n["text"].as_str().unwrap().contains(text)).map(|n| n["loss"].as_str())
+    };
+    assert_eq!(json_loss("Unsupported", "RustGIS doesn't read"), Some(Some("dropped.feature")));
+    assert_eq!(json_loss("Unnamed", "RustGIS doesn't read"), Some(Some("dropped.feature")), "a vector layer naming no provider");
+    // A memory layer opens empty, so its Z values and curves held no data: plain.
+    assert_eq!(json_loss("Heights", "Z and M"), Some(None));
+    assert_eq!(json_loss("Arcs", "curves read as lines"), Some(None));
+    assert_eq!(json_loss("", "print layouts"), Some(None), "a layout is drawing, not data: no code");
+    let said = s.notices_since(mark);
+    let with = |code| said.iter().filter(|n| n.loss() == Some(code)).collect::<Vec<_>>();
+    assert!(with(LossCode::DroppedFeature)[0].text.contains("Unsupported"), "{said:?}");
+    assert!(with(LossCode::DroppedZm).is_empty() && with(LossCode::ApproximatedCurve).is_empty(), "{said:?}");
+    let layouts: Vec<_> = said.iter().filter(|n| n.text.contains("print layouts")).collect();
+    assert_eq!(layouts.len(), 1);
+    assert_eq!(layouts[0].loss(), None);
+    assert!(said.iter().filter(|n| n.loss().is_some()).all(|n| !n.text.contains("print layouts")), "no coded notice holds a plain note");
 }
 
 /// A QGIS categorized renderer by an expression classes by it where the expression reads on the
@@ -6408,7 +6500,7 @@ fn a_qgis_project_opens_as_a_map_and_a_qgis_style_styles_a_layer() {
         <maplayer type="raster" hasScaleBasedVisibilityFlag="1" minScale="100000" maxScale="1000"><id>w</id><datasource>url=https://wms.example/wms&amp;layers=a</datasource><layername>Web</layername><provider>wms</provider>
         <pipe><rasterrenderer opacity="0.5" type="singlebandcolordata"/></pipe><blendMode>6</blendMode></maplayer></projectlayers></qgis>"#;
     let mut report = rustgis_map::qgis::Report::default();
-    let project = rustgis_map::qgis::read_project(web, "", &mut |_| Err("whose image file doesn't open"), &mut report).unwrap();
+    let project = rustgis_map::qgis::read_project(web, "", &mut |_| Err(rustgis_map::qgis::IMAGE_UNOPENED), &mut report).unwrap();
     let mut w = world();
     let before = w.active_layer;
     w.active_layer = w.map().layers.iter().map(|l| l.id).find(|id| Some(*id) != before);
@@ -15561,6 +15653,8 @@ fn a_veil_panel_groups_the_surrounds_by_the_bands_shape() {
     let (l, locator, _, b) = veil_panel((0.0, 0.0, 90.0, 130.0), legend, Some(40.0), arrow, scale, 3.0).unwrap();
     assert!(l.1 >= b.1 + b.3 && locator.unwrap().0 == b.0, "under it: {l:?} {b:?}");
     assert!(veil_panel((0.0, 0.0, 60.0, 60.0), legend, Some(40.0), arrow, scale, 3.0).is_none());
+    // With nothing to group beside it, a legend the size of the band fits it: no gap is kept.
+    assert!(veil_panel((0.0, 0.0, legend.0, legend.1), legend, None, None, (0.0, 0.0), 3.0).is_some());
     assert!(veil_panel((0.0, 0.0, 160.0, 70.0), legend, None, arrow, scale, 3.0).unwrap().1.is_none());
     // With no north arrow (a continental extent, #1379), the locator stands alone over the scale bar.
     let (_, locator, a, b) = veil_panel((0.0, 0.0, 160.0, 70.0), legend, Some(40.0), None, scale, 3.0).unwrap();
@@ -49887,8 +49981,14 @@ fn raster_projection_failures_are_reported_for_zonal_statistics_and_clipping() {
 
     let mut s = world();
     let gt = GeoTransform { origin_x: 500_000.0, origin_y: 4_500_000.0, pixel_width: 1_000.0, pixel_height: -1_000.0 };
-    let raster = Raster::new("utm", 10, 10, vec![vec![7.0; 100]], gt, Crs::Epsg(32617), None, ColorHint::Gray, "Float32").unwrap();
+    let mut raster = Raster::new("utm", 10, 10, vec![vec![7.0; 100]], gt, Crs::Epsg(32617), None, ColorHint::Gray, "Float32").unwrap();
+    // What reading the raster left out, said when it was read, isn't said again of its clip.
+    raster.lost.push(rustgis_data::loss::Note::loss(rustgis_data::loss::LossCode::DroppedValue, "3 values past the range were left out"));
     let ring: Vec<_> = [(1.0, 1.0), (9.0, 1.0), (9.0, 9.0), (1.0, 9.0)]
+        .into_iter()
+        .map(|(x, y)| raster.transformer().to_lonlat(gt.to_world(x, y)).unwrap())
+        .collect();
+    let small: Vec<_> = [(2.0, 2.0), (4.0, 2.0), (4.0, 4.0), (2.0, 4.0)]
         .into_iter()
         .map(|(x, y)| raster.transformer().to_lonlat(gt.to_world(x, y)).unwrap())
         .collect();
@@ -49906,8 +50006,32 @@ fn raster_projection_failures_are_reported_for_zonal_statistics_and_clipping() {
     assert_eq!(out.value(0, out.field_index("utm_count").unwrap()), &rustgis_data::Value::Int(64));
     assert_eq!(out.value(0, out.field_index("utm_mean").unwrap()), &rustgis_data::Value::Float(7.0));
 
+    use rustgis_data::loss::LossCode;
+    let mark = s.notice_mark();
     let clip = s.run("raster.process", &json!({"layer": "utm", "operation": "clip", "polygon": "parts", "name": "clipped"})).unwrap();
     assert!(clip["messages"].to_string().contains("skipped 1 polygon part(s)"), "{clip}");
+    // The same failures are said as notices with their codes; the raster's own loss isn't repeated.
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| (n.loss(), n.text.clone())).collect();
+    assert!(said.iter().any(|(code, t)| *code == Some(LossCode::DroppedGeometry) && t.contains("skipped 1 polygon part(s)")), "{said:?}");
+    assert!(!said.iter().any(|(_, t)| t.contains("3 values past the range")), "{said:?}");
+    // Features with no polygon to clip by are skipped, counted and said as dropped features.
+    let mut mixed = Dataset::new("mixed", GeometryType::Polygon, vec![]);
+    mixed.push(Some(Geometry::Polygon(vec![vec![small.clone()]])), vec![]);
+    mixed.push(None, vec![]);
+    s.map_mut().add_layer(rustgis_map::Layer::new(0, mixed));
+    let mark = s.notice_mark();
+    let clip = s.run("raster.process", &json!({"layer": "utm", "operation": "clip", "polygon": "mixed", "name": "clipped2"})).unwrap();
+    assert!(clip["messages"].to_string().contains("skipped 1 feature(s)"), "{clip}");
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| (n.loss(), n.text.clone())).collect();
+    assert!(said.iter().any(|(c, t)| *c == Some(LossCode::DroppedFeature) && t.contains("skipped 1 feature(s)")), "{said:?}");
+    // A clean clip says nothing of a skip.
+    let mut clean = Dataset::new("clean", GeometryType::Polygon, vec![]);
+    clean.push(Some(Geometry::Polygon(vec![vec![small.clone()]])), vec![]);
+    s.map_mut().add_layer(rustgis_map::Layer::new(0, clean));
+    let mark = s.notice_mark();
+    let clip = s.run("raster.process", &json!({"layer": "utm", "operation": "clip", "polygon": "clean", "name": "clipped3"})).unwrap();
+    assert!(clip.get("messages").is_none(), "{clip}");
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("skipped")), "{:?}", s.notices_since(mark));
     let data = s.map().layer_by_name("clipped").unwrap().raster.as_ref().unwrap().data.as_ref().unwrap();
     assert_eq!((data.width, data.height), (8, 8));
 }
@@ -51882,9 +52006,28 @@ fn a_window_read_for_another_raster_says_what_its_header_left_out() {
     // A change says what each year's file left out, by its year, and once for both when both left
     // it out; the read, the same for both, once.
     use crate::cmd::embeddings::two_years_notes;
-    let lossy = read_window_raster(&WindowAsked::of(&format!("{lossy}/lossy.tif"), [10.0, 45.0, 10.5, 45.5], None, 1), &stop).unwrap();
+    let lossy_url = lossy;
+    let lossy = read_window_raster(&WindowAsked::of(&format!("{lossy_url}/lossy.tif"), [10.0, 45.0, 10.5, 45.5], None, 1), &stop).unwrap();
     let said = two_years_notes(&w, &lossy, (2017, 2025));
     assert!(said.iter().any(|n| n.starts_with("the 2025 file: its colour table has 384 entries")), "{said:?}");
+    // A loss the header's reader codes keeps its code through both reads' notes and the year prefix.
+    use rustgis_data::loss::{LossCode, Note};
+    let mut lossy_coded =
+        read_window_raster(&WindowAsked::of(&format!("{lossy_url}/lossy.tif"), [10.0, 45.0, 10.5, 45.5], None, 1), &stop).unwrap();
+    lossy_coded.raster.lost.push(Note::loss(LossCode::ChangedRounded, "values past f32's range were rounded"));
+    assert!(lossy_coded.notes().iter().any(|n| n.loss == Some(LossCode::ChangedRounded) && n.text.contains("rounded")));
+    assert!(w.notes().iter().all(|n| n.loss.is_none()), "a clean file codes nothing");
+    let said_coded = two_years_notes(&w, &lossy_coded, (2017, 2025));
+    assert!(
+        said_coded.iter().any(|n| n.loss == Some(LossCode::ChangedRounded) && n.text.starts_with("the 2025 file: values past")),
+        "{said_coded:?}"
+    );
+    assert!(said_coded.iter().filter(|n| n.loss.is_some()).count() == 1, "{said_coded:?}");
+    let both = two_years_notes(&lossy_coded, &lossy_coded, (2017, 2025));
+    assert!(
+        both.iter().any(|n| n.loss == Some(LossCode::ChangedRounded) && n.text.starts_with("the 2017 and 2025 files: values past")),
+        "{both:?}"
+    );
     assert!(!said.iter().any(|n| n.starts_with("the 2017")), "{said:?}");
     assert_eq!(said.iter().filter(|n| n.contains("window of the full image")).count(), 1, "{said:?}");
     let said = two_years_notes(&lossy, &w, (2017, 2025));
@@ -60517,10 +60660,24 @@ fn a_zarr_series_says_its_notes_though_the_read_fails() {
     let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
     assert!(err.as_ref().is_err_and(|e| e.contains("outside")), "{err:?}");
     assert!(said.iter().any(|n| n.contains("WGS 84")), "the grid note is said: {said:?}");
+    // The assumption is a loss with its code, said as one by the script's command.
+    let coded: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("WGS 84")).map(|n| n.loss()).collect();
+    assert_eq!(coded, [Some(rustgis_data::loss::LossCode::AssumedCrs)]);
     let (read, notes) = crate::cmd::zarr::series_start(&s, &outside).unwrap().run(&rustgis_analysis::control::Control::stoppable());
     let _ = std::fs::remove_dir_all(dir);
     assert!(read.as_ref().is_err_and(|e| e.contains("outside")), "{read:?}");
     assert!(notes.iter().any(|n| n.contains("WGS 84")), "the pane gets the note too: {notes:?}");
+    // The pane gets the code with the text, and says it as a loss.
+    assert!(notes.iter().all(|n| n.loss == Some(rustgis_data::loss::LossCode::AssumedCrs)), "{notes:?}");
+    let mark = s.notice_mark();
+    for n in notes {
+        s.say_warning(n);
+    }
+    assert_eq!(s.notices_since(mark).iter().map(|n| n.loss()).collect::<Vec<_>>(), [Some(rustgis_data::loss::LossCode::AssumedCrs)]);
+    // A plain note stays a warning with no code.
+    s.say_warning(rustgis_data::loss::Note::plain("just so"));
+    let last = s.notices_since(mark).last().cloned().unwrap();
+    assert!(last.loss().is_none() && last.text == "just so", "{last:?}");
 }
 
 /// A point's series read off the window (opengeos/RustGIS#2282): `SeriesRun::run` gives what
@@ -60561,7 +60718,7 @@ fn a_zarr_series_read_off_the_window_stops_between_batches() {
     assert_eq!(series["dates"], answer["dates"]);
     assert_eq!(series["values"][129], json!(12908.0));
     // What reading it said, for the app to say as the command does: the grid taken as WGS 84.
-    assert!(notes.iter().any(|n| n.contains("WGS 84")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("WGS 84") && n.loss == Some(rustgis_data::loss::LossCode::AssumedCrs)), "{notes:?}");
     assert_eq!(control.progress(), Some((130, 130)));
     // Its looks at Cancel, counted on a whole run.
     let (p, _log) = serve();
@@ -61701,12 +61858,12 @@ fn a_save_refuses_coordinates_that_arent_numbers_and_keeps_the_file() {
     assert_eq!(t.map().layer_by_name("ways").unwrap().dataset.features.len(), 3);
 }
 
-/// A Shapefile read in place (streamed) leaves out a shape with a coordinate that isn't a number,
-/// counted, as one it can't convert (#1985): nothing NaN reaches the map. Read whole, the feature
-/// keeps its attributes without geometry. Either way the project saves and opens again.
+/// A Shapefile shape with a coordinate that isn't a number keeps its attributes without geometry,
+/// counted, read whole or in place (streamed; before #2032 C2f the streamed read left it out):
+/// nothing NaN reaches the map, and the project saves and opens again.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
-fn a_shapefile_coordinate_that_isnt_a_number_reaches_no_layer() {
+fn a_shapefile_coordinate_that_isnt_a_number_keeps_its_feature_without_geometry() {
     use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
     // Removed however the test ends.
     struct Dir(std::path::PathBuf);
@@ -61738,15 +61895,12 @@ fn a_shapefile_coordinate_that_isnt_a_number_reaches_no_layer() {
             t.run("layer.loadAll", &json!({"layer": id})).unwrap();
         }
         let notices: Vec<String> = t.notices_since(mark).iter().map(|n| n.text.clone()).collect();
-        let said = if stream {
-            "pts: 1 row couldn't be read and was left out"
-        } else {
-            "pts: 1 shape(s) have a coordinate that isn't a number (NaN or infinite): their features are kept without geometry"
-        };
-        assert!(notices.iter().any(|n| n == said), "stream {stream}: {notices:?}");
+        let said = "1 shape(s) have a coordinate that isn't a number (NaN or infinite): their features are kept without geometry";
+        assert_eq!(notices.iter().filter(|n| n.contains(said)).count(), 1, "stream {stream}: {notices:?}");
+        assert!(!notices.iter().any(|n| n.contains("couldn't be read")), "stream {stream}: {notices:?}");
         let geometries: Vec<_> = t.map().layer(id).unwrap().dataset.features.iter().map(|f| f.geometry.clone()).collect();
         let kept = Some(Geometry::Point(Coord::new(11.0, 21.0)));
-        assert_eq!(geometries, if stream { vec![kept] } else { vec![None, kept] }, "stream {stream}");
+        assert_eq!(geometries, vec![None, kept], "stream {stream}");
         let saved = dir.join(format!("p-{stream}.rgis"));
         t.run("project.saveAs", &json!({"path": saved})).unwrap();
         Session::new(Project::default()).run("project.open", &json!({"path": saved})).unwrap();

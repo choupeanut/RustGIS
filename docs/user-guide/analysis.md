@@ -32,6 +32,26 @@ deletes the selection, adds or calculates a field, and calculates geometry attri
 The first column, **Feature ID**, shows each feature's identifier, not its current row position
 after sorting or filtering. It is not a dataset field: do not use it as a geoprocessing field name.
 
+The cell last clicked is the current cell, shown with an outline. After a click or a scroll in the
+table, the **arrow keys** move it: up and down through the rows as the table sorts and filters them,
+left and right through the columns shown, **Feature ID** first. It stops at the edges, the table
+scrolls to keep it in view, and a held key keeps moving. With no current cell, or with its row or
+column no longer shown, an arrow starts at the first row or column shown. Moving it doesn't change
+the selection. **Enter** edits it, as a double-click does (Feature ID can't be edited). While the
+table is in use the arrow keys don't pan, turn or tilt the map or nudge a layout element; click or
+scroll the map or layout and they do again. While you type in a cell or in **Filter rows…**, the
+keys are the text box's. A shortcut you give an arrow key or Enter still runs its command.
+
+Right-click a row for **Zoom To**, **Remove from Selection**, **Copy** (the feature, as
+**Copy** in the ribbon does), **Copy Value** (the text of the cell clicked; a number is copied in
+full and a picture gives its stored data) and **Delete** (Undo brings the rows back; greyed while
+editing is off and on a layer read in place from its file). A right-click on a row that isn't selected selects it alone first, as a click
+on it does. One on a selected row keeps the selection, and Zoom To, Copy and Delete then act on the
+layer's whole selection, as their labels count it and as the table's toolbar does (selected rows a
+filter hides are among them); choosing one of them clears any selection in other layers.
+**Remove from Selection** takes out only the row clicked. In a standalone table only Copy Value
+can be chosen; the other rows are greyed.
+
 Right-click a column header for **Hide Column**, **Move Left**, **Move Right** and **Show All
 Columns**. A hidden column is only left out of the table: export, selection, expressions and the
 map are unchanged. The toolbar says how many columns are hidden, and clicking it shows them all.
@@ -1613,6 +1633,7 @@ click them on the map:
 | Raster Functions | Slope in degrees or percent, aspect, hillshade (8-bit shades from 1 to 255, with 0 for no data), NDVI, band math (`(b4-b3)/(b4+b3)`), remapping, thresholds, resampling |
 | Function Editor | Chains raster functions, each on the previous output |
 | Process | Clips a raster to the view or to a polygon layer, or resamples it ([below](#zonal-statistics-and-polygon-clipping)) |
+| Mosaic Rasters | Joins tiles of one grid into one raster, in the order listed, and can write it to a GeoTIFF ([under Imagery](#imagery)) |
 | Suitability Modeler | Scores rasters 1–10 and adds them with weights |
 | Visibility Analysis | A viewshed from a point on an elevation raster, with the Earth's curvature and the refraction of visible light (1/7, as `gdal_viewshed`). The ground along each ray is the cell each point falls in by default; `heights: "bilinear"` (**Ground heights › Between cells (bilinear)** in the Workflows pane) reads it between the cells' centres instead. Both are estimates of the ground between cell centres; between cells is closer on ground that bulges (a hill seen from its top), where the nearest cell can hide cells just inside the horizon. With no radius, or one longer than the raster's diagonal, the viewshed covers the whole raster. The map's **Viewshed N km Here** reads the ground as the Workflows pane's **Ground heights** says. On a raster round the whole Earth the rays don't cross its east–west edge, which the analysis says when the radius reaches it and the way across is shorter: the ground just across the edge is left out, worked out the long way round where the radius reaches the far edge through the raster too (always with no radius), or partly both, near the observer's row and not farther from it. The observer's height must be from 0 to 10,000 m. Ground with no data hides nothing, and next to it bilinear heights take the nearest cell's height; the analysis says how many cells this touched, in a notice. The answer gives both counts (0 when there is nothing to say): `acrossNoData` counts the visible cells whose rays crossed ground with no data (a hidden cell stays hidden whatever that ground is, so it isn't counted, and 0 doesn't mean no ray crossed any); `readNearest` counts every cell, visible or hidden, whose ray took a nearest height next to no data in bilinear mode |
 | Exploratory 3D Analysis | A line of sight between two points, split into seen and hidden parts, with the same curvature and refraction |
@@ -2084,9 +2105,16 @@ commands described here aren't on the tab or part of the extension, and run whet
   EVI) and the **Pixel Editor** (set the pixels inside a polygon).
 - **Mosaic Rasters** (`raster.mosaic`) merges tiles of one grid, such as the 1 km tiles of a state
   elevation model, into one raster in their own coordinate system and cell size, optionally
-  written to a GeoTIFF: `{"inputs": ["dgm_1.tif", "dgm_2.tif", …], "path": "dem.tif"}`. It has no
-  pane yet: run it from the Script pane, the AI Assistant, the command line or Python. Inputs
-  are layers or file paths; where they overlap, the first one with data wins. Tiles in different
+  written to a GeoTIFF: `{"inputs": ["dgm_1.tif", "dgm_2.tif", …], "path": "dem.tif"}`. Inputs
+  are layers or file paths; where they overlap, the first one with data wins. Its section in the
+  Workflows pane (Analyze › Workflows, or Command Search) lists them in that order: **Add** puts a
+  raster layer at the end, **Add File…** a file read as the mosaic runs and not added to the map,
+  and ↑ and ↓ move one. **Name** is the new layer's (by default the first input's, with
+  `_mosaic`), and **GeoTIFF › Choose…** writes the file too (none by default). In the desktop app
+  it runs on a thread of its own, its progress and Cancel in the pane, and a GeoTIFF it writes
+  replaces the file only once it is done (Cancel leaves the file as it was). The web app's section
+  joins layers only. From the Script pane, the AI Assistant, the command line or Python it runs in
+  place. Tiles in different
   coordinate systems or cell sizes, or opened from an overview, are refused rather than quietly
   resampled, as are tiles whose cells don't line up; the mosaic has to fit in memory (120 million
   values, cells times bands, or more on a computer with more memory: see Environments).
