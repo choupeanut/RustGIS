@@ -790,6 +790,25 @@ mod tests {
     }
 
     #[test]
+    fn one_huge_write_is_taken_a_buffer_at_a_time() {
+        let prefix = b"/data/picked".to_vec();
+        let (first, last) = (b"/1/0/a.shp".to_vec(), b"/22/0/b.gpkg".to_vec());
+        let cancelled = AtomicBool::new(false);
+        let mut names = Names::new(prefix.clone(), HashSet::from([first.clone(), last.clone()]), &cancelled);
+        let bound = prefix.len() + names.reach;
+        // A thumbnail or a long text is written whole, in one call. A path in it is cut where the
+        // scan takes it in pieces, and another is at its end.
+        let mut big = vec![b'x'; 8 * 1024 * 1024];
+        for (path, at) in [(b"/data/picked/1/0/a.shp".as_slice(), WRITE - 5), (b"/data/picked/22/0/b.gpkg".as_slice(), big.len() - 24)] {
+            big[at..at + path.len()].copy_from_slice(path);
+        }
+        names.write_all(&big).unwrap();
+        names.look(true);
+        assert_eq!(names.found, HashSet::from([first, last]));
+        assert!(names.carry.capacity() <= 2 * WRITE + bound, "{} bytes reserved for one write", names.carry.capacity());
+    }
+
+    #[test]
     fn the_scan_answers_as_the_text_search_did() {
         let (unix, windows) = ("/data/picked", r"C:\data\picked");
         let a = "/data/picked/1/0/a.shp";
