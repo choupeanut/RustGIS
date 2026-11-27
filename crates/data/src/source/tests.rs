@@ -5278,14 +5278,7 @@ fn parquet_delta_byte_array_reads_within_the_decoded_budget() {
         ds.push(Some(Geometry::Point(Coord::new(-81.0, 0.0))), vec![Value::Text(format!("{}{i:02}", "x".repeat(1024)))]);
     }
     write_encoded_parquet_fixture(&ds, &p, 100, false, FixturePages { delta: true, ..FixturePages::default() });
-    let footer = ::parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&p).unwrap()).unwrap();
-    let encodings: Vec<_> = ::parquet::file::reader::FileReader::metadata(&footer)
-        .row_group(0)
-        .columns()
-        .iter()
-        .filter(|c| c.column_path().string() == "label")
-        .flat_map(|c| c.encodings())
-        .collect();
+    let encodings = text_encodings(&p, "label");
     assert!(encodings.contains(&::parquet::basic::Encoding::DELTA_BYTE_ARRAY), "{encodings:?}");
     let whole = Request { extent: None, limit: 100, own: None };
     // 20 values of 1,026 bytes: a budget of 32 KiB reads them all, a smaller one stops.
@@ -5296,6 +5289,18 @@ fn parquet_delta_byte_array_reads_within_the_decoded_budget() {
     let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_decoded_bytes(16 << 10);
     let error = source.read(&whole).unwrap_err().to_string();
     assert!(error.contains("decoded-column budget"), "{error}");
+}
+
+/// The encodings the footer lists for the column chunks of the field `name`.
+fn text_encodings(path: &Path, name: &str) -> Vec<::parquet::basic::Encoding> {
+    let footer = ::parquet::file::reader::SerializedFileReader::new(std::fs::File::open(path).unwrap()).unwrap();
+    ::parquet::file::reader::FileReader::metadata(&footer)
+        .row_group(0)
+        .columns()
+        .iter()
+        .filter(|c| c.column_path().string() == name)
+        .flat_map(|c| c.encodings())
+        .collect()
 }
 
 /// A column that isn't delta encoded skips a run of rows it doesn't take in one call, so the
@@ -5328,6 +5333,10 @@ fn parquet_version_two_pages_read_within_the_decoded_budget() {
     for delta in [false, true] {
         let pages = FixturePages { delta, v2: true, page_bytes: Some(2 << 10) };
         write_encoded_parquet_fixture(&ds, &p, 100, false, pages);
+        // The writer's own choice for version 2 text is DELTA_BYTE_ARRAY, so each case says its own.
+        let encodings = text_encodings(&p, "label");
+        assert_eq!(encodings.contains(&::parquet::basic::Encoding::DELTA_BYTE_ARRAY), delta, "{encodings:?}");
+        assert_eq!(encodings.contains(&::parquet::basic::Encoding::PLAIN), !delta, "{encodings:?}");
         let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
         let batch = source.read(&whole).unwrap();
         assert_eq!(batch.features.len(), 20, "delta {delta}");
