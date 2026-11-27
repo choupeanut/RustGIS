@@ -5426,6 +5426,8 @@ fn parquet_page_over_the_budget_is_refused() {
     let one = Request { extent: None, limit: 1, own: None };
     let error = source.read(&one).unwrap_err().to_string();
     assert!(error.contains("decoded-column budget"), "{error}");
+    // A page's refusal names the row group and the column, as the budget's does.
+    assert!(error.contains("row group 0") && error.contains("column 'label'"), "{error}");
 }
 
 /// The same small file must remain readable with plain or dictionary-encoded binary columns.

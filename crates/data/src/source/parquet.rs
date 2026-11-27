@@ -2523,6 +2523,106 @@ mod tests {
         }
     }
 
+    /// A DELTA_BINARY_PACKED stream of `count` values, with `blocks` blocks of 128 values in 4
+    /// miniblocks, all of bit width 0 (a run of equal values).
+    fn delta_stream(count: u32, first: u8, blocks: usize) -> Vec<u8> {
+        let mut out = vec![0x80, 0x01, 0x04];
+        let mut n = count;
+        loop {
+            let low = (n & 0x7f) as u8;
+            n >>= 7;
+            if n == 0 {
+                out.push(low);
+                break;
+            }
+            out.push(low | 0x80);
+        }
+        out.push(first);
+        for _ in 0..blocks {
+            // min delta 0, then four miniblock widths of 0.
+            out.extend_from_slice(&[0, 0, 0, 0, 0]);
+        }
+        out
+    }
+
+    fn delta_page(levels: usize, values: Vec<u8>, num_values: u32, encoding: Encoding, v2: bool) -> Page {
+        let mut buf = vec![0xAAu8; levels];
+        buf.extend(values);
+        let buf = Bytes::from(buf);
+        if v2 {
+            Page::DataPageV2 {
+                buf,
+                num_values,
+                encoding,
+                num_nulls: 0,
+                num_rows: num_values,
+                def_levels_byte_len: u32::try_from(levels).unwrap_or(0),
+                rep_levels_byte_len: 0,
+                is_compressed: false,
+                statistics: None,
+            }
+        } else {
+            Page::DataPage {
+                buf,
+                num_values,
+                encoding,
+                def_level_encoding: Encoding::RLE,
+                rep_level_encoding: Encoding::RLE,
+                statistics: None,
+            }
+        }
+    }
+
+    /// A delta page whose count is more than its values, or more than its bytes can hold, or whose
+    /// header is cut off or malformed, is refused before the crate's decoder sizes an array from the
+    /// count (a few bytes can say two billion values), and a sound one is handed over.
+    #[test]
+    fn checked_pages_refuse_a_delta_page_with_a_count_its_bytes_cannot_hold() {
+        let huge = delta_stream(i32::MAX as u32, 0, 0);
+        let mut sound = delta_stream(3, 0, 1);
+        sound.extend(delta_stream(3, 4, 1));
+        sound.extend_from_slice(b"ababab");
+        for v2 in [false, true] {
+            // The two streams of DELTA_BYTE_ARRAY (levels first, in version 2 and in version 1 of a required column: none).
+            for levels in [0, 2] {
+                if !v2 && levels > 0 {
+                    continue;
+                }
+                let page = |values: Vec<u8>, n: u32, e| delta_page(levels, values, n, e, v2);
+                let refused = |values: Vec<u8>, n: u32, e| checked(page(values, n, e), None, 1 << 30, true).unwrap_err().to_string();
+                let delta = Encoding::DELTA_BYTE_ARRAY;
+                let lengths = Encoding::DELTA_LENGTH_BYTE_ARRAY;
+                let error = refused(huge.clone(), 3, delta);
+                assert!(error.contains("more than the page's 3 values"), "v2 {v2} {levels}: {error}");
+                let error = refused(huge.clone(), 3, lengths);
+                assert!(error.contains("more than the page's 3 values"), "v2 {v2} {levels}: {error}");
+                // A count the page's own value count allows, but its few bytes can't hold.
+                let error = refused(delta_stream(1000, 0, 1), 1000, delta);
+                assert!(error.contains("bytes can't hold"), "v2 {v2} {levels}: {error}");
+                // The decoder's array of that count, more than the budget allows.
+                let error = checked(page(delta_stream(1 << 20, 0, 1), 1 << 20, delta), None, 1 << 10, true).unwrap_err().to_string();
+                assert!(error.contains("decoded-column budget"), "v2 {v2} {levels}: {error}");
+                // Cut off in its header, a miniblock width or its data, or not a header at all.
+                for cut in [0, 1, 2, 4, 6, 7] {
+                    let error = refused(delta_stream(3, 0, 1)[..cut].to_vec(), 3, delta);
+                    assert!(error.contains("delta"), "v2 {v2} {levels} cut {cut}: {error}");
+                }
+                let error = refused(vec![0x80; 12], 3, delta);
+                assert!(error.contains("delta"), "v2 {v2} {levels}: {error}");
+                let error = refused(vec![0x81, 0x01, 0x04, 0x03, 0x00], 3, delta);
+                assert!(error.contains("delta"), "a block size that is not a multiple of 128: {error}");
+                // The second stream's count must be the first's.
+                let mut odd = delta_stream(3, 0, 1);
+                odd.extend(delta_stream(2, 4, 1));
+                let error = refused(odd, 3, delta);
+                assert!(error.contains("delta"), "v2 {v2} {levels}: {error}");
+                // Sound pages go through.
+                assert!(checked(page(sound.clone(), 3, delta), None, 1 << 30, true).unwrap().is_some(), "v2 {v2} {levels}");
+                assert!(checked(page(delta_stream(3, 4, 1), 3, lengths), None, 1 << 30, true).unwrap().is_some(), "v2 {v2} {levels}");
+            }
+        }
+    }
+
     /// Headers handed out one by one, as a file's pages would be peeked at and skipped.
     struct Headers(Vec<PageMetadata>);
 
