@@ -8422,6 +8422,44 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The desktop reads a zip ahead, off the UI thread, with the columns given as Add Data does (#3062).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_read_ahead_of_a_zip_gives_its_tables_the_columns_given() {
+        let dir = std::env::temp_dir().join(format!("rustgis-read-ahead-zip-columns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.zip");
+        let zip = rustgis_data::zip::write(&[
+            ("a.csv".into(), b"id,LongitudeOR,LatitudeOR\n1,10,20\n2,11,21\n".to_vec()),
+            ("notes.csv".into(), b"id,name\n5,x\n".to_vec()),
+        ])
+        .unwrap();
+        std::fs::write(&path, zip).unwrap();
+        let path = path.display().to_string();
+        let (_, reads) = super::read_layers_file(&json!({"path": path, "x": "LongitudeOR", "y": "LatitudeOR"}), &path).unwrap();
+        let points: Vec<(String, usize)> = reads
+            .iter()
+            .filter(|r| r.dataset.geometry_type == rustgis_data::GeometryType::Point)
+            .map(|r| (r.dataset.name.clone(), r.dataset.features.len()))
+            .collect();
+        assert_eq!(points, [("a".to_string(), 2)]);
+        assert!(
+            reads
+                .iter()
+                .flat_map(|r| r.report.messages.iter())
+                .any(|m| m.as_str().contains("used by 1 of 2 tables") && m.as_str().contains("notes.csv")),
+            "the notice stays"
+        );
+        // With a coordinate system too, and without any option, a zip reads as before.
+        let (_, with_crs) =
+            super::read_layers_file(&json!({"path": path, "x": "LongitudeOR", "y": "LatitudeOR", "crs": "EPSG:4326"}), &path).unwrap();
+        assert!(with_crs.iter().any(|r| r.dataset.geometry_type == rustgis_data::GeometryType::Point));
+        let (_, plain) = super::read_layers_file(&json!({"path": path}), &path).unwrap();
+        assert!(plain.iter().all(|r| r.dataset.geometry_type == rustgis_data::GeometryType::None));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A URL a web document restricted to public addresses stays restricted when a later request
     /// comes from a local origin: its blocking download goes through the public agent, which
     /// refuses a local address before connecting (#2055).

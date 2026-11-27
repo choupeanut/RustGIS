@@ -25253,7 +25253,9 @@ fn add_url_of_a_zip_gives_its_tables_the_columns_given() {
     assert!(s.project.tables.iter().any(|t| t.dataset.name == "notes"));
     let said = s.notices_since(mark);
     assert!(
-        said.iter().any(|n| n.text.contains("notes: no x column 'LongitudeOR'; read without the x, y or WKT columns given")),
+        said.iter().any(|n| n.text.contains(
+            "used by 2 of 3 tables; the rest were read without them, lacking a column named: notes.csv (no x column 'LongitudeOR')"
+        )),
         "{said:?}"
     );
 }

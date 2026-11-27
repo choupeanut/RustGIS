@@ -82,10 +82,13 @@ fn a_zips_csv_and_workbook_members_take_the_columns_given() {
         let (layers, tables) = shape(&s);
         assert_eq!(layers.iter().map(|(_, n)| *n).collect::<Vec<_>>(), [2, 1, 1], "{route}: {layers:?}");
         assert_eq!(tables, ["notes"], "{route}");
-        let lacking: Vec<_> = said.iter().filter(|t| t.contains("no x column 'LongitudeOR'")).collect();
+        // One notice for the zip, with how many tables took the columns and the one that didn't.
+        let lacking: Vec<_> = said.iter().filter(|t| t.contains("lacking a column named")).collect();
         assert_eq!(lacking.len(), 1, "{route}: {said:?}");
         assert!(
-            lacking.iter().all(|t| t.contains("notes: no x column 'LongitudeOR'; read without the x, y or WKT columns given")),
+            lacking.iter().all(|t| t.contains(
+                "the x, y or WKT columns given were used by 3 of 4 tables; the rest were read without them, lacking a column named: notes.csv (no x column 'LongitudeOR')"
+            )),
             "{route}: {said:?}"
         );
     }
@@ -95,13 +98,13 @@ fn a_zips_csv_and_workbook_members_take_the_columns_given() {
 fn a_zip_whose_members_all_have_the_columns_says_nothing_about_them() {
     let (s, said) = add("path", &members(false), columns());
     assert_eq!(shape(&s).0.len(), 3);
-    assert!(!said.iter().any(|t| t.contains("read without the")), "{said:?}");
+    assert!(!said.iter().any(|t| t.contains("lacking a column named")), "{said:?}");
     // Without the columns given, the zip reads as before: tables only, and nothing new said.
     let (s, said) = add("path", &members(true), json!({}));
     let (layers, tables) = shape(&s);
     assert!(layers.is_empty(), "{layers:?}");
     assert_eq!(tables.len(), 4, "{tables:?}");
-    assert!(!said.iter().any(|t| t.contains("read without the")), "{said:?}");
+    assert!(!said.iter().any(|t| t.contains("lacking a column named")), "{said:?}");
 }
 
 #[test]
@@ -125,12 +128,24 @@ fn a_zips_wkt_column_and_delimiter_reach_its_tables() {
 }
 
 #[test]
-fn a_zips_other_members_and_skipped_members_keep_their_notices() {
-    let mut entries = vec![("a.csv".to_string(), b"id,LongitudeOR,LatitudeOR\n1,10,20\n".to_vec())];
-    entries.push(("junk.txt".to_string(), b"just some prose".to_vec()));
-    let (s, said) = add("path", &zip::write(&entries).unwrap(), columns());
-    assert_eq!(shape(&s).0.len(), 1);
+fn a_zips_other_members_ignore_the_columns_and_keep_their_notices() {
+    let kml = br#"<?xml version="1.0"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document><Placemark><name>p</name><Point><coordinates>1,2</coordinates></Point></Placemark><GroundOverlay><name>o</name><Icon><href>p.png</href></Icon><LatLonBox><north>1</north><south>0</south><east>1</east><west>0</west></LatLonBox></GroundOverlay></Document></kml>"#;
+    let entries = vec![
+        ("a.csv".to_string(), b"id,LongitudeOR,LatitudeOR\n1,10,20\n".to_vec()),
+        ("o.kml".to_string(), kml.to_vec()),
+        ("junk.txt".to_string(), b"just some prose".to_vec()),
+    ];
+    let bytes = zip::write(&entries).unwrap();
+    let (s, said) = add("path", &bytes, columns());
+    assert!(s.map().layers.iter().any(|l| l.dataset.name == "a" && l.dataset.features.len() == 1));
+    assert!(s.map().layers.len() >= 2, "the KML's own layer stays");
     assert!(said.iter().any(|t| t.contains("skipped") && t.contains("junk.txt")), "{said:?}");
+    assert!(said.iter().any(|t| t.contains("1 ground overlays (pictures) aren't drawn from inside a zip, in o.kml (1)")), "{said:?}");
+    // Every notice but the columns' (there is none here) is what the zip says without the columns given.
+    let (_, before) = add("path", &bytes, json!({}));
+    let strip =
+        |said: &[String]| said.iter().map(|t| t.rsplit_once(": ").map_or(t.clone(), |(_, rest)| rest.to_string())).collect::<Vec<_>>();
+    assert_eq!(strip(&said), strip(&before));
 }
 
 #[test]
@@ -157,4 +172,11 @@ fn a_zip_given_x_without_y_or_both_kinds_of_geometry_is_refused_or_said() {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ran.is_err(), "{ran:?}");
     }
+}
+
+#[test]
+fn a_zips_columns_notice_goes_with_a_picked_layer_that_is_not_the_first() {
+    let (s, said) = add("path", &members(true), json!({"x": "LongitudeOR", "y": "LatitudeOR", "layer": "2024"}));
+    assert_eq!(shape(&s).0, [("2024".to_string(), 1)]);
+    assert!(said.iter().any(|t| t.contains("used by 3 of 4 tables") && t.contains("notes.csv")), "{said:?}");
 }
