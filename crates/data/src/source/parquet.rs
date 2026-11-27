@@ -18,7 +18,7 @@ use crate::{DataError, Feature, Field, FieldType, GeometryType, Result, Value, w
 use bytes::Bytes;
 use parquet::basic::{ConvertedType, Encoding, LogicalType, Type as Physical};
 use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
-use parquet::data_type::DataType as PqType;
+use parquet::data_type::{ByteArray, DataType as PqType};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::{FileReader, RowGroupReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
@@ -36,6 +36,47 @@ const MAX_GROUP_ROWS: usize = if cfg!(target_arch = "wasm32") { 1 << 21 } else {
 
 /// Conservative decoded-column budget for one group scanned without native view bounds.
 const MAX_SCAN_BYTES: u64 = if cfg!(target_arch = "wasm32") { 64 << 20 } else { 256 << 20 };
+
+/// The least [`max_decoded_bytes`] allows, and its limit in the browser.
+const DECODED_FLOOR: usize = if cfg!(target_arch = "wasm32") { 128 << 20 } else { 512 << 20 };
+/// The most [`max_decoded_bytes`] allows, however much the computer has.
+const DECODED_CEILING: usize = 3 << 30;
+
+/// Most bytes of text and geometry one row group's read may decode into owned values, whatever the
+/// view: on the desktop a quarter of the computer's memory, from [`DECODED_FLOOR`] up to
+/// [`DECODED_CEILING`]; less once RustGIS holds more than half of it ([`crate::memory::planned`], #2431).
+/// A file's sizes don't bound it: one long dictionary entry used by every row is copied for each.
+fn max_decoded_bytes() -> u64 {
+    u64::try_from(crate::memory::planned(DECODED_FLOOR, DECODED_CEILING, 1)).unwrap_or(u64::MAX)
+}
+
+/// What one row group's read may still decode into owned values ([`max_decoded_bytes`]), shared
+/// by the columns decoded together.
+struct Budget {
+    left: std::cell::Cell<u64>,
+    limit: u64,
+    group: usize,
+}
+
+impl Budget {
+    fn new(limit: u64, group: usize) -> Self {
+        Budget { left: std::cell::Cell::new(limit), limit, group }
+    }
+
+    /// Takes `bytes` of the budget for a value of `column`, or refuses the group.
+    fn charge(&self, bytes: usize, column: &str) -> Result<()> {
+        let left = self.left.get().checked_sub(u64::try_from(bytes).unwrap_or(u64::MAX)).ok_or_else(|| self.refusal(column))?;
+        self.left.set(left);
+        Ok(())
+    }
+
+    fn refusal(&self, column: &str) -> DataError {
+        DataError::Format(format!(
+            "GeoParquet: row group {} exceeds the {} byte decoded-column budget in column '{column}'; rewrite the file with smaller row groups",
+            self.group, self.limit
+        ))
+    }
+}
 
 /// What a GeoParquet source's reads are attributed to ([`ParquetSource::attribute`]).
 #[derive(Clone, Debug)]
@@ -74,6 +115,8 @@ pub struct ParquetSource {
     group_rows: usize,
     /// Decoded-column budget for an unbounded spatial scan; lowered by tests.
     scan_bytes: u64,
+    /// Decoded bytes one row group's text and geometry values may take in any read; lowered by tests.
+    decoded_bytes: u64,
     /// Declared after `reader`: Windows must close its file before removing the workspace.
     #[cfg(not(target_arch = "wasm32"))]
     _workspace: Option<Arc<super::duckdb::ReloadWorkspace>>,
@@ -343,6 +386,7 @@ impl ParquetSource {
             exact: false,
             group_rows: MAX_GROUP_ROWS,
             scan_bytes: MAX_SCAN_BYTES,
+            decoded_bytes: max_decoded_bytes(),
             #[cfg(not(target_arch = "wasm32"))]
             _workspace: None,
         };
@@ -373,7 +417,7 @@ impl ParquetSource {
         }
         let rows = usize::try_from(md.row_group(0).num_rows()).unwrap_or(0).min(16);
         let rg = self.reader.get_row_group(0).ok()?;
-        let geoms = read_bytes(rg.as_ref(), self.geom_col, &vec![true; rows]).ok()?;
+        let geoms = read_bytes(rg.as_ref(), self.geom_col, &vec![true; rows], &Budget::new(self.decoded_bytes, 0)).ok()?;
         Some(geoms.iter().filter_map(|b| b.as_deref()).any(wkb::has_zm))
     }
 }
@@ -390,6 +434,13 @@ impl ParquetSource {
     #[cfg(test)]
     pub(crate) fn with_scan_bytes(mut self, bytes: u64) -> Self {
         self.scan_bytes = bytes;
+        self
+    }
+
+    /// A lower decoded-byte budget for any read, for tests without large allocations.
+    #[cfg(test)]
+    pub(crate) fn with_decoded_bytes(mut self, bytes: u64) -> Self {
+        self.decoded_bytes = bytes;
         self
     }
 
@@ -691,8 +742,10 @@ impl FeatureSource for ParquetSource {
                 self.check_scan_bytes(md, g, true)?;
             }
             let rg = self.reader.get_row_group(g).map_err(err)?;
-            let geoms = read_bytes(rg.as_ref(), self.geom_col, take)?;
-            let attrs: Vec<ColumnValues> = self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, take)).collect::<Result<_>>()?;
+            let budget = Budget::new(self.decoded_bytes, g);
+            let geoms = read_bytes(rg.as_ref(), self.geom_col, take, &budget)?;
+            let attrs: Vec<ColumnValues> =
+                self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, take, &budget)).collect::<Result<_>>()?;
             // A column shorter than its row group (a truncated or corrupt file) would pair values
             // with the wrong rows: refuse it.
             let wanted = take.iter().filter(|&&t| t).count();
@@ -807,8 +860,10 @@ impl FeatureSource for ParquetSource {
                 continue;
             }
             let rg = self.reader.get_row_group(g).map_err(err)?;
-            let geoms = read_bytes(rg.as_ref(), self.geom_col, &take)?;
-            let attrs: Vec<ColumnValues> = self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &take)).collect::<Result<_>>()?;
+            let budget = Budget::new(self.decoded_bytes, g);
+            let geoms = read_bytes(rg.as_ref(), self.geom_col, &take, &budget)?;
+            let attrs: Vec<ColumnValues> =
+                self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &take, &budget)).collect::<Result<_>>()?;
             let wanted = take.iter().filter(|&&t| t).count();
             if geoms.len() != wanted || attrs.iter().any(|a| a.values.len() != wanted) {
                 return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
@@ -979,17 +1034,29 @@ fn column_reader(rg: &dyn RowGroupReader, col: usize) -> Result<ColumnReader> {
         Physical::INT96 => 96,
         Physical::FIXED_LEN_BYTE_ARRAY => u64::try_from(desc.type_length()).unwrap_or(0).max(1) * 8,
     };
-    let pages = CheckedPages { pages: rg.get_column_page_reader(col).map_err(err)?, bits };
+    let chunk = rg.metadata().column(col);
+    let pages = CheckedPages {
+        pages: rg.get_column_page_reader(col).map_err(err)?,
+        bits,
+        chunk_bytes: u64::try_from(chunk.uncompressed_size()).unwrap_or(0),
+        delta_declared: chunk.encodings().any(|e| e == Encoding::DELTA_BYTE_ARRAY),
+    };
     Ok(parquet::column::reader::get_column_reader(desc, Box::new(pages)))
 }
 
 /// A column's pages, a dictionary page refused when it says it holds more values than its bytes
 /// can: the `parquet` crate makes room for the count it is told before decoding any (a few bytes
-/// of header can ask for tens of gigabytes).
+/// of header can ask for tens of gigabytes). A page bigger than the column chunk it belongs to, and
+/// a data page in the DELTA_BYTE_ARRAY encoding that the chunk doesn't list, are refused too: the
+/// batch sizes of [`read_binary`] rest on both.
 struct CheckedPages {
     pages: Box<dyn parquet::column::page::PageReader>,
     /// The fewest bits one value of the column takes in a dictionary page (plain encoded).
     bits: u64,
+    /// The bytes the column chunk's footer says its pages hold decoded, `0` when it says none.
+    chunk_bytes: u64,
+    /// The footer lists the DELTA_BYTE_ARRAY encoding for the chunk.
+    delta_declared: bool,
 }
 
 impl Iterator for CheckedPages {
@@ -1013,6 +1080,23 @@ impl parquet::column::page::PageReader for CheckedPages {
                 "a dictionary page says it holds {num_values} values, more than its {} bytes can",
                 buf.len()
             )));
+        }
+        if let Some(page) = &page {
+            let len = page.buffer().len() as u64;
+            if self.chunk_bytes > 0 && len > self.chunk_bytes {
+                return Err(parquet::errors::ParquetError::General(format!(
+                    "a page holds {len} bytes, more than the {} its column chunk says it holds",
+                    self.chunk_bytes
+                )));
+            }
+            if !self.delta_declared
+                && let parquet::column::page::Page::DataPage { encoding: Encoding::DELTA_BYTE_ARRAY, .. }
+                | parquet::column::page::Page::DataPageV2 { encoding: Encoding::DELTA_BYTE_ARRAY, .. } = page
+            {
+                return Err(parquet::errors::ParquetError::General(
+                    "a page uses the DELTA_BYTE_ARRAY encoding, which its column chunk doesn't list".into(),
+                ));
+            }
         }
         Ok(page)
     }
@@ -1242,6 +1326,18 @@ fn field_type(c: &ColumnDescPtr) -> Option<FieldType> {
 /// rows not taken are skipped without being decoded into values, so a sample of a large row
 /// group doesn't hold all of it.
 fn read_column<T: PqType>(r: &mut ColumnReaderImpl<T>, take: &[bool], max_def: i16) -> Result<Vec<Option<T::T>>> {
+    read_column_with(r, take, max_def, &|| BATCH, &mut |_| Ok(()))
+}
+
+/// [`read_column`] asking `batch` for the most values to read at once and `charge` about each value
+/// it keeps, before the caller copies any: a read that passes its budget stops there.
+fn read_column_with<T: PqType>(
+    r: &mut ColumnReaderImpl<T>,
+    take: &[bool],
+    max_def: i16,
+    batch: &dyn Fn() -> usize,
+    charge: &mut dyn FnMut(&T::T) -> Result<()>,
+) -> Result<Vec<Option<T::T>>> {
     let wanted = take.iter().filter(|&&t| t).count();
     let mut out: Vec<Option<T::T>> = Vec::with_capacity(wanted.min(1 << 24));
     let mut defs = Vec::new();
@@ -1264,17 +1360,24 @@ fn read_column<T: PqType>(r: &mut ColumnReaderImpl<T>, take: &[bool], max_def: i
         while left > 0 {
             defs.clear();
             values.clear();
-            let (records, _, levels) = r.read_records(left.min(BATCH), Some(&mut defs), None, &mut values).map_err(err)?;
+            let (records, _, levels) = r.read_records(left.min(batch().max(1)), Some(&mut defs), None, &mut values).map_err(err)?;
             if records == 0 {
                 return Ok(out);
             }
             left = left.saturating_sub(records);
             if max_def == 0 {
-                out.extend(values.drain(..).map(Some));
+                for v in values.drain(..) {
+                    charge(&v)?;
+                    out.push(Some(v));
+                }
             } else {
                 let mut it = values.drain(..);
                 for d in defs.iter().take(levels) {
-                    out.push(if *d == max_def { it.next() } else { None });
+                    let v = if *d == max_def { it.next() } else { None };
+                    if let Some(v) = &v {
+                        charge(v)?;
+                    }
+                    out.push(v);
                 }
             }
         }
@@ -1338,7 +1441,7 @@ impl ColumnValues {
 }
 
 /// Reads a field column for the selected rows, keeping date flags for the final filter.
-fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<ColumnValues> {
+fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool], budget: &Budget) -> Result<ColumnValues> {
     let desc = rg.metadata().column(col).column_descr_ptr();
     let max_def = desc.max_def_level();
     let scale = decimal_scale(&desc).map(|s| 10f64.powi(-s));
@@ -1384,48 +1487,50 @@ fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Col
             (Some(i), None) => Value::Int(i),
         }
     };
-    let values = match column_reader(rg, col)? {
-        ColumnReader::BoolColumnReader(mut r) => {
-            read_column(&mut r, take, max_def)?.into_iter().map(|v| v.map(Value::Bool).unwrap_or_default()).collect()
-        }
-        ColumnReader::Int32ColumnReader(mut r) => read_column(&mut r, take, max_def)?.into_iter().map(|v| int(v.map(i64::from))).collect(),
-        ColumnReader::Int64ColumnReader(mut r) => read_column(&mut r, take, max_def)?.into_iter().map(int).collect(),
-        ColumnReader::Int96ColumnReader(mut r) => read_column(&mut r, take, max_def)?
-            .into_iter()
-            .map(|v| {
-                flags.push(0u8);
-                v.map(|v| {
-                    let words = v.data();
-                    let ns = u64::from(words.first().copied().unwrap_or(0)) | (u64::from(words.get(1).copied().unwrap_or(0)) << 32);
-                    let day = i64::from(words.get(2).copied().unwrap_or(0)) - 2_440_588;
-                    let (rounded, cut, lossy) = nanos_to_micros(ns as i64);
-                    let at = |us: Option<i64>| day.checked_mul(86_400_000_000)?.checked_add(us?).and_then(crate::DateTime::local);
-                    let t = if ns < 86_400_000_000_000 { at(rounded).or_else(|| at(cut)) } else { None };
-                    if let Some(flag) = flags.last_mut() {
-                        *flag = if t.is_none() {
-                            INVALID
-                        } else if lossy {
-                            ROUNDED
-                        } else {
-                            0
-                        };
-                    }
-                    t.map(Value::DateTime).unwrap_or_default()
+    let values = if let Some(binary) = read_binary(rg, col, take, budget)? {
+        binary.into_iter().map(|v| v.map(|b| Value::Text(String::from_utf8_lossy(b.data()).into_owned())).unwrap_or_default()).collect()
+    } else {
+        match column_reader(rg, col)? {
+            ColumnReader::BoolColumnReader(mut r) => {
+                read_column(&mut r, take, max_def)?.into_iter().map(|v| v.map(Value::Bool).unwrap_or_default()).collect()
+            }
+            ColumnReader::Int32ColumnReader(mut r) => {
+                read_column(&mut r, take, max_def)?.into_iter().map(|v| int(v.map(i64::from))).collect()
+            }
+            ColumnReader::Int64ColumnReader(mut r) => read_column(&mut r, take, max_def)?.into_iter().map(int).collect(),
+            ColumnReader::Int96ColumnReader(mut r) => read_column(&mut r, take, max_def)?
+                .into_iter()
+                .map(|v| {
+                    flags.push(0u8);
+                    v.map(|v| {
+                        let words = v.data();
+                        let ns = u64::from(words.first().copied().unwrap_or(0)) | (u64::from(words.get(1).copied().unwrap_or(0)) << 32);
+                        let day = i64::from(words.get(2).copied().unwrap_or(0)) - 2_440_588;
+                        let (rounded, cut, lossy) = nanos_to_micros(ns as i64);
+                        let at = |us: Option<i64>| day.checked_mul(86_400_000_000)?.checked_add(us?).and_then(crate::DateTime::local);
+                        let t = if ns < 86_400_000_000_000 { at(rounded).or_else(|| at(cut)) } else { None };
+                        if let Some(flag) = flags.last_mut() {
+                            *flag = if t.is_none() {
+                                INVALID
+                            } else if lossy {
+                                ROUNDED
+                            } else {
+                                0
+                            };
+                        }
+                        t.map(Value::DateTime).unwrap_or_default()
+                    })
+                    .unwrap_or_default()
                 })
-                .unwrap_or_default()
-            })
-            .collect(),
-        ColumnReader::FloatColumnReader(mut r) => {
-            read_column(&mut r, take, max_def)?.into_iter().map(|v| v.map(|f| Value::Float(f64::from(f))).unwrap_or_default()).collect()
+                .collect(),
+            ColumnReader::FloatColumnReader(mut r) => {
+                read_column(&mut r, take, max_def)?.into_iter().map(|v| v.map(|f| Value::Float(f64::from(f))).unwrap_or_default()).collect()
+            }
+            ColumnReader::DoubleColumnReader(mut r) => {
+                read_column(&mut r, take, max_def)?.into_iter().map(|v| v.map(Value::Float).unwrap_or_default()).collect()
+            }
+            _ => Vec::new(),
         }
-        ColumnReader::DoubleColumnReader(mut r) => {
-            read_column(&mut r, take, max_def)?.into_iter().map(|v| v.map(Value::Float).unwrap_or_default()).collect()
-        }
-        ColumnReader::ByteArrayColumnReader(mut r) => read_column(&mut r, take, max_def)?
-            .into_iter()
-            .map(|v| v.map(|b| Value::Text(String::from_utf8_lossy(b.data()).into_owned())).unwrap_or_default())
-            .collect(),
-        _ => Vec::new(),
     };
     Ok(ColumnValues { values, flags })
 }
@@ -1452,15 +1557,35 @@ fn binary_dictionary_max(bytes: &[u8], count: u32) -> Result<u64> {
     Ok(longest)
 }
 
-/// Reads a binary column (the WKB geometry), for the rows `take` marks, in order.
-fn read_bytes(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Vec<Option<Vec<u8>>>> {
-    let max_def = rg.metadata().column(col).column_descr().max_def_level();
-    match column_reader(rg, col)? {
-        ColumnReader::ByteArrayColumnReader(mut r) => {
-            Ok(read_column(&mut r, take, max_def)?.into_iter().map(|v| v.map(|b| b.data().to_vec())).collect())
-        }
-        _ => Err(DataError::Format("GeoParquet: the geometry column is not binary".into())),
+/// Reads a binary column (the WKB geometry), for the rows `take` marks, in order, within `budget`.
+fn read_bytes(rg: &dyn RowGroupReader, col: usize, take: &[bool], budget: &Budget) -> Result<Vec<Option<Vec<u8>>>> {
+    match read_binary(rg, col, take, budget)? {
+        Some(values) => Ok(values.into_iter().map(|v| v.map(|b| b.data().to_vec())).collect()),
+        None => Err(DataError::Format("GeoParquet: the geometry column is not binary".into())),
     }
+}
+
+/// The rows `take` marks of a BYTE_ARRAY column, charging `budget` for each value as it is read,
+/// before any is copied (`None` for a column of another type). The column chunk's own bytes may not
+/// pass the budget either: no honest page is bigger than its chunk, and the `parquet` crate makes
+/// room for a page from its header. A column with DELTA_BYTE_ARRAY pages, whose values the
+/// decoder builds one by one, reads no more values at once than the budget left holds at the most
+/// a page's size each.
+fn read_binary(rg: &dyn RowGroupReader, col: usize, take: &[bool], budget: &Budget) -> Result<Option<Vec<Option<ByteArray>>>> {
+    let chunk = rg.metadata().column(col);
+    if chunk.column_descr().physical_type() != Physical::BYTE_ARRAY {
+        return Ok(None);
+    }
+    let name = chunk.column_path().string();
+    let bytes = u64::try_from(chunk.uncompressed_size()).unwrap_or(u64::MAX);
+    if bytes > budget.limit {
+        return Err(budget.refusal(&name));
+    }
+    let ColumnReader::ByteArrayColumnReader(mut r) = column_reader(rg, col)? else { return Ok(None) };
+    let delta = chunk.encodings().any(|e| e == Encoding::DELTA_BYTE_ARRAY);
+    let batch = || if delta { usize::try_from(budget.left.get() / bytes.max(1)).unwrap_or(BATCH).clamp(1, BATCH) } else { BATCH };
+    read_column_with(&mut r, take, chunk.column_descr().max_def_level(), &batch, &mut |b: &ByteArray| budget.charge(b.len(), &name))
+        .map(Some)
 }
 
 /// Reads every one of `n` rows of a float or double column as doubles (the covering).
@@ -1523,7 +1648,7 @@ pub fn read_vectors(file: &Arc<Remote>, extent: &Extent, column: &str, max_group
     for &g in &groups {
         let rg = reader.get_row_group(g).map_err(err)?;
         let rows = usize::try_from(rg.metadata().num_rows()).unwrap_or(0).min(MAX_GROUP_ROWS);
-        let geoms = read_bytes(rg.as_ref(), geom, &vec![true; rows])?;
+        let geoms = read_bytes(rg.as_ref(), geom, &vec![true; rows], &Budget::new(max_decoded_bytes(), g))?;
         let inside: Vec<(usize, (f64, f64))> = geoms
             .iter()
             .enumerate()
@@ -1864,7 +1989,7 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
     feed: &mut dyn FnMut(&mut dyn FnMut(&[Feature]) -> Result<()>) -> Result<()>,
 ) -> Result<(W, Vec<usize>, Vec<crate::loss::Note>)> {
     use parquet::basic::{Compression, Encoding, Repetition, ZstdLevel};
-    use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
+    use parquet::data_type::{BoolType, ByteArrayType, DoubleType, Int32Type, Int64Type};
     use parquet::file::metadata::KeyValue;
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
@@ -2054,4 +2179,69 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
     }
     // Without a target: the caller says the path the export is written to.
     Ok((w.into_inner().map_err(err)?, unfit_counts, layout.notes(fields, "")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parquet::column::page::{Page, PageMetadata, PageReader};
+
+    /// Pages handed out one by one, as a file's would be.
+    struct Pages(std::vec::IntoIter<Page>);
+
+    impl Iterator for Pages {
+        type Item = parquet::errors::Result<Page>;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.0.next().map(Ok)
+        }
+    }
+
+    impl PageReader for Pages {
+        fn get_next_page(&mut self) -> parquet::errors::Result<Option<Page>> {
+            Ok(self.0.next())
+        }
+        fn peek_next_page(&mut self) -> parquet::errors::Result<Option<PageMetadata>> {
+            Ok(None)
+        }
+        fn skip_next_page(&mut self) -> parquet::errors::Result<()> {
+            Ok(())
+        }
+        fn at_record_boundary(&mut self) -> parquet::errors::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn data_page(bytes: usize, encoding: Encoding) -> Page {
+        Page::DataPage {
+            buf: Bytes::from(vec![0u8; bytes]),
+            num_values: 1,
+            encoding,
+            def_level_encoding: Encoding::RLE,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        }
+    }
+
+    fn checked(page: Page, chunk_bytes: u64, delta_declared: bool) -> parquet::errors::Result<Option<Page>> {
+        CheckedPages { pages: Box::new(Pages(vec![page].into_iter())), bits: 32, chunk_bytes, delta_declared }.get_next_page()
+    }
+
+    /// A page can't hold more than the column chunk it belongs to says it does.
+    #[test]
+    fn checked_pages_refuse_a_page_larger_than_its_chunk() {
+        let error = checked(data_page(11, Encoding::PLAIN), 10, false).unwrap_err().to_string();
+        assert!(error.contains("a page holds 11 bytes, more than the 10 its column chunk says it holds"), "{error}");
+        assert!(checked(data_page(10, Encoding::PLAIN), 10, false).unwrap().is_some());
+        // A footer that gives no size says nothing to check against.
+        assert!(checked(data_page(11, Encoding::PLAIN), 0, false).unwrap().is_some());
+    }
+
+    /// A page in the one encoding that builds its values one by one must be in the chunk's list.
+    #[test]
+    fn checked_pages_refuse_an_undeclared_delta_page() {
+        let error = checked(data_page(4, Encoding::DELTA_BYTE_ARRAY), 10, false).unwrap_err().to_string();
+        assert!(error.contains("the DELTA_BYTE_ARRAY encoding, which its column chunk doesn't list"), "{error}");
+        assert!(checked(data_page(4, Encoding::DELTA_BYTE_ARRAY), 10, true).unwrap().is_some());
+        assert!(checked(data_page(4, Encoding::PLAIN), 10, false).unwrap().is_some());
+    }
 }
