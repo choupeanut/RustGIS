@@ -1044,6 +1044,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         app.dialogs.open = None;
         // Its values read are dropped with the dialog.
         app.dialogs.values = Default::default();
+        // And so is a count still on its way (dropping it stops the worker).
+        app.dialogs.matching = Default::default();
         if which == "addDxf" {
             app.dialogs.dxf = None;
         }
@@ -3924,6 +3926,21 @@ mod tests {
         h.step();
         assert!(h.query_by_label_contains("Counting matching rows…").is_some(), "says it is counting");
         assert!(h.query_by_label_contains("Valid expression").is_none(), "no count in the frame that starts it");
+    }
+
+    /// Closing the dialog while it counts stops the count (#2946): the worker is not left reading
+    /// the layer's rows for a dialog that is gone.
+    #[test]
+    fn cancelling_select_by_attributes_stops_its_count() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = sba_ready();
+        let stop = h.state().dialogs.matching.stop_flag();
+        assert!(!stop.load(std::sync::atomic::Ordering::Relaxed), "counting for the open dialog");
+        h.get_by_role_and_label(Role::Button, "Cancel").click();
+        h.run();
+        assert_eq!(h.state().dialogs.open, None, "Cancel closed it");
+        assert!(stop.load(std::sync::atomic::Ordering::Relaxed), "and the count was told to stop");
     }
 
     /// Enter on a focused Cancel cancels: the dialog closes and selects nothing (#2599).
