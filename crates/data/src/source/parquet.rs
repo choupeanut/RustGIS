@@ -1181,6 +1181,10 @@ impl parquet::column::page::PageReader for CheckedPages {
             if let parquet::column::page::Page::DataPage { num_values, .. } | parquet::column::page::Page::DataPageV2 { num_values, .. } =
                 page
             {
+                #[cfg(test)]
+                if self.delta_declared {
+                    DELTA_PAGES.with(|pages| pages.set(pages.get() + 1));
+                }
                 self.note.page.store(len, Ordering::Relaxed);
                 self.note.in_page.store(usize::try_from(*num_values).unwrap_or(usize::MAX), Ordering::Relaxed);
             }
@@ -1432,6 +1436,21 @@ pub(crate) fn largest_skip() -> usize {
 thread_local! {
     /// The most values one `skip_records` call was asked to skip on this thread, for tests.
     static LARGEST_SKIP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The DELTA_BYTE_ARRAY data pages the crate fetched (and so set a decoder up for) on this
+    /// thread, for tests.
+    static DELTA_PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Forgets the delta pages this thread has fetched, for tests.
+#[cfg(test)]
+pub(crate) fn reset_delta_pages() {
+    DELTA_PAGES.with(|pages| pages.set(0));
+}
+
+/// The DELTA_BYTE_ARRAY data pages the crate fetched on this thread, for tests.
+#[cfg(test)]
+pub(crate) fn delta_pages() -> usize {
+    DELTA_PAGES.with(std::cell::Cell::get)
 }
 
 /// [`read_column`] reading as `pace` says and asking `charge` about each value

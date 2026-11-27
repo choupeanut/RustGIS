@@ -5321,6 +5321,38 @@ fn parquet_sampled_read_skips_a_long_run_in_one_call() {
     assert!(parquet::largest_skip() > 8192, "{}", parquet::largest_skip());
 }
 
+/// A sampled read of a DELTA_BYTE_ARRAY column passes over the pages it takes no row of without
+/// fetching them, as it does a column of another encoding, so the crate sets no decoder up for a
+/// page it only skips (its decoder sizes arrays from a count in the page) (#2913).
+#[test]
+fn parquet_sampled_delta_read_does_not_fetch_the_pages_it_skips() {
+    let p = dir().join("decoded-delta-skip.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("label", FieldType::Text)]);
+    for i in 0..20 {
+        ds.push(
+            Some(Geometry::Point(Coord::new(-81.0 + f64::from(i) * 0.01, 0.0))),
+            vec![Value::Text(format!("{i:02}{}", "x".repeat(1024)))],
+        );
+    }
+    for v2 in [false, true] {
+        let pages = FixturePages { delta: true, v2, page_bytes: Some(2 << 10), ..FixturePages::default() };
+        write_encoded_parquet_fixture(&ds, &p, 100, false, pages);
+        let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
+        // Values that start differently share no prefix, so pages of 2 KiB hold about two each.
+        let everything = Request { extent: None, limit: 100, own: None };
+        parquet::reset_delta_pages();
+        assert_eq!(source.read(&everything).unwrap().features.len(), 20, "v2 {v2}");
+        assert!(parquet::delta_pages() >= 5, "v2 {v2}: {} pages", parquet::delta_pages());
+        // Only the last point is in the extent: the rows before it, in pages of two or so, are skipped.
+        let last = Request { extent: Some(Extent::new(-80.815, -1.0, -80.805, 1.0)), limit: 100, own: None };
+        parquet::reset_delta_pages();
+        let batch = source.read(&last).unwrap();
+        assert_eq!(batch.features.len(), 1, "v2 {v2}");
+        assert_eq!(batch.features[0].attrs[0], Value::Text(format!("19{}", "x".repeat(1024))), "v2 {v2}");
+        assert_eq!(parquet::delta_pages(), 1, "v2 {v2}: only the page holding the row is fetched");
+    }
+}
+
 /// Data pages of version 2 read as version 1 do, with and without a budget that stops them.
 #[test]
 fn parquet_version_two_pages_read_within_the_decoded_budget() {
