@@ -129,8 +129,8 @@ pub(crate) fn folder() -> Option<PathBuf> {
 pub(crate) type WriteProject<'a> = &'a dyn Fn(&mut dyn Write) -> Result<(), serde_json::Error>;
 
 /// The picks in `picked` none of whose files the project names, looking for `cancelled` between
-/// picks and as the project is written out. The project is scanned as it is written and never
-/// held as text (see [`Names`]).
+/// picks and as the project is written out. The project is scanned as it is written: only a
+/// buffer of its text is held at a time, never all of it (see [`Names`]).
 pub(crate) fn unused(picked: &Path, project: WriteProject, cancelled: &AtomicBool) -> Result<Unused, String> {
     let entries = std::fs::read_dir(picked).map_err(|e| format!("{}: {e}", picked.display()))?;
     let mut found = Unused::default();
@@ -164,13 +164,14 @@ pub(crate) fn unused(picked: &Path, project: WriteProject, cancelled: &AtomicBoo
         }
         candidates.push((pick, files));
     }
-    // Nothing to judge: the project isn't written out at all.
+    // Nothing to judge: the project isn't written out at all (nor when no path is left to look for).
     if candidates.is_empty() {
         return Ok(found);
     }
     let prefix = escaped(&picked.to_string_lossy()).into_bytes();
-    let rests = candidates.iter().flat_map(|(_, files)| files).filter_map(|(file, _)| rest_of(&prefix, file)).collect();
-    let named = scan(project, Names::new(prefix.clone(), rests, cancelled))?;
+    let rests: HashSet<Vec<u8>> = candidates.iter().flat_map(|(_, files)| files).filter_map(|(file, _)| rest_of(&prefix, file)).collect();
+    // No file to look for (none of their paths can be told from the folder's): all are kept.
+    let named = if rests.is_empty() { HashSet::new() } else { scan(project, Names::new(prefix.clone(), rests, cancelled))? };
     for (pick, files) in candidates {
         // A file whose path can't be told apart from the folder's is kept, never judged unused.
         if files.iter().any(|(file, _)| rest_of(&prefix, file).is_none_or(|rest| named.contains(&rest))) {
@@ -242,12 +243,14 @@ fn rest_of(prefix: &[u8], file: &Path) -> Option<Vec<u8>> {
 const WRITE: usize = 64 * 1024;
 
 /// Finds the files the project names in its JSON as it is written to it, holding none of that
-/// text. A file is named when its path, written as JSON writes it, is anywhere in the text. Every
+/// text but a buffer of it at a time. A file is named when its path, written as JSON writes it, is anywhere in the text. Every
 /// such path starts with the folder of the picks, so the scan looks for that alone (a byte search,
 /// linear in the text) and, where it finds it, asks whether what follows is the rest of a path it
 /// is looking for. What it keeps is the end of what it was given, as long as a path can be cut
 /// in two writes: the folder and the longest rest, together; and one string for each file found.
-/// Cancel is looked at on every write.
+/// A write larger than [`WRITE`] is taken that much at a time, and Cancel is looked at before
+/// each. Once every path looked for is found it refuses the rest of the text, which ends the
+/// writing.
 struct Names<'a> {
     prefix: Vec<u8>,
     /// What follows the folder in each path looked for.
@@ -311,16 +314,27 @@ impl<'a> Names<'a> {
     }
 }
 
+impl Names<'_> {
+    /// Whether every path looked for has been found: the rest of the text can't change the answer.
+    fn all_found(&self) -> bool {
+        self.found.len() == self.rests.len()
+    }
+}
+
 impl Write for Names<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Not `Interrupted`: `write_all` and `BufWriter` try again after that, for good.
-        if self.cancelled.load(Ordering::Relaxed) {
-            return Err(std::io::Error::other("stopped"));
+        // A write as large as the `BufWriter`'s buffer (a thumbnail, a long text) comes whole:
+        // taken a buffer at a time, so `carry` never holds more of it than that.
+        for piece in buf.chunks(WRITE) {
+            // Not `Interrupted`: `write_all` and `BufWriter` try again after that, for good.
+            if self.cancelled.load(Ordering::Relaxed) || self.all_found() {
+                return Err(std::io::Error::other("stopped"));
+            }
+            // A machine short of memory gets an error, not an abort.
+            self.carry.try_reserve(piece.len()).map_err(|_| std::io::Error::other("out of memory"))?;
+            self.carry.extend_from_slice(piece);
+            self.look(false);
         }
-        // A machine short of memory gets an error, not an abort.
-        self.carry.try_reserve(buf.len()).map_err(|_| std::io::Error::other("out of memory"))?;
-        self.carry.extend_from_slice(buf);
-        self.look(false);
         Ok(buf.len())
     }
 
@@ -330,16 +344,21 @@ impl Write for Names<'_> {
 }
 
 /// Writes the project out through `names` and returns the rests it found named. Stopped, if
-/// `names`' `cancelled` was set while it wrote.
+/// `names`' `cancelled` was set while it wrote or by the end of it. The writing ends early, with
+/// the answer, once every path looked for is found.
 fn scan(project: WriteProject, names: Names) -> Result<HashSet<Vec<u8>>, String> {
     let cancelled = names.cancelled;
     let mut out = BufWriter::with_capacity(WRITE, names);
     let written = project(&mut out).map_err(|e| e.to_string()).and_then(|()| out.flush().map_err(|e| e.to_string()));
-    if written.is_err() && cancelled.load(Ordering::Relaxed) {
-        return Err(tl!("Stopped.").to_string());
+    // What the buffer still holds isn't needed once every path is found, and has been written
+    // otherwise: taken out unwritten.
+    let (mut names, _) = out.into_parts();
+    if !names.all_found() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(tl!("Stopped.").to_string());
+        }
+        written?;
     }
-    written?;
-    let mut names = out.into_inner().map_err(|e| e.to_string())?;
     names.look(true);
     Ok(names.found)
 }
@@ -747,7 +766,7 @@ mod tests {
         std::fs::write(picked.join("1/0/a.gpkg"), b"a").unwrap();
         let cancelled = AtomicBool::new(false);
         let written = std::cell::Cell::new(0usize);
-        // A project that never ends, and Cancel pressed a thousand strings in.
+        // A project of two million strings, and Cancel pressed a thousand strings in.
         let endless = |out: &mut dyn Write| -> Result<(), serde_json::Error> {
             for n in 0..2_000_000usize {
                 serde_json::to_writer(&mut *out, "abcdefgh")?;
@@ -809,6 +828,47 @@ mod tests {
     }
 
     #[test]
+    fn the_writing_ends_once_every_path_is_found() {
+        let root = std::env::temp_dir().join(format!("rustgis-copies-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let picked = root.join("picked");
+        let file = picked.join("1").join("0").join("a.gpkg");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"a").unwrap();
+        let written = std::cell::Cell::new(0usize);
+        // The path first, then two million strings: all but a few buffers are never written.
+        let project = |out: &mut dyn Write| -> Result<(), serde_json::Error> {
+            serde_json::to_writer(&mut *out, &file.to_string_lossy())?;
+            for n in 0..2_000_000usize {
+                serde_json::to_writer(&mut *out, "abcdefgh")?;
+                written.set(n + 1);
+            }
+            Ok(())
+        };
+        let found = unused(&picked, &project, &AtomicBool::new(false)).unwrap();
+        assert!(found.picks.is_empty());
+        assert!(written.get() < 100_000, "{} strings written after the path", written.get());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cancel_pressed_in_the_last_write_still_stops() {
+        let root = std::env::temp_dir().join(format!("rustgis-copies-last-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let picked = root.join("picked");
+        std::fs::create_dir_all(picked.join("1/0")).unwrap();
+        std::fs::write(picked.join("1/0/a.gpkg"), b"a").unwrap();
+        let cancelled = AtomicBool::new(false);
+        let project = |out: &mut dyn Write| -> Result<(), serde_json::Error> {
+            serde_json::to_writer(&mut *out, "short")?;
+            cancelled.store(true, Ordering::Relaxed);
+            Ok(())
+        };
+        assert_eq!(unused(&picked, &project, &cancelled), Err("Stopped.".to_string()));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn the_scan_answers_as_the_text_search_did() {
         let (unix, windows) = ("/data/picked", r"C:\data\picked");
         let a = "/data/picked/1/0/a.shp";
@@ -861,6 +921,17 @@ mod tests {
                 names.look(true);
                 let named = rest_of(&prefix, &file).is_some_and(|rest| names.found.contains(&rest));
                 assert_eq!(named, *expected, "the scan of {text} for {} in writes of {step}", file.display());
+            }
+            // And in two writes, cut at every place.
+            for at in 0..=text.len() {
+                let cancelled = AtomicBool::new(false);
+                let mut names = Names::new(prefix.clone(), rests.clone(), &cancelled);
+                let (before, after) = text.as_bytes().split_at(at);
+                names.write_all(before).unwrap();
+                names.write_all(after).unwrap();
+                names.look(true);
+                let named = rest_of(&prefix, &file).is_some_and(|rest| names.found.contains(&rest));
+                assert_eq!(named, *expected, "the scan of {text} for {} in two writes cut at {at}", file.display());
             }
         }
     }
