@@ -1067,21 +1067,47 @@ fn column_reader_within(rg: &dyn RowGroupReader, col: usize, limit: u64) -> Resu
 }
 
 /// What a column's [`CheckedPages`] have seen of its data pages, for [`Pace`].
-#[derive(Default)]
 struct PageNote {
     /// The bytes of the data page being read, decoded.
     page: std::sync::atomic::AtomicU64,
     /// The values of that page not yet read or skipped (`0`: the next read fetches a page).
     in_page: std::sync::atomic::AtomicUsize,
+    /// While a `skip_records` call may pass over whole pages undecoded: the values of the run it is
+    /// asked for that are still to skip ([`NOT_SKIPPING`] outside such a call).
+    skip_left: std::sync::atomic::AtomicUsize,
+    /// The values of the whole pages that call has passed over.
+    passed: std::sync::atomic::AtomicUsize,
+    /// The values of the data page last peeked at in such a call.
+    peeked: std::sync::atomic::AtomicUsize,
+    /// Such a call was stopped at a page it would only have skipped part of.
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+/// [`PageNote::skip_left`] when no skip is passing over whole pages.
+const NOT_SKIPPING: usize = usize::MAX;
+
+impl Default for PageNote {
+    fn default() -> Self {
+        Self {
+            page: Default::default(),
+            in_page: Default::default(),
+            skip_left: std::sync::atomic::AtomicUsize::new(NOT_SKIPPING),
+            passed: Default::default(),
+            peeked: Default::default(),
+            stopped: Default::default(),
+        }
+    }
 }
 
 /// How many values of a column one `read_records` or `skip_records` call takes. The `parquet`
 /// crate builds the values of a DELTA_BYTE_ARRAY page one by one in the call, each up to the page's
-/// size, so the call takes no more than the budget left holds at that size, and none that reach
-/// into a page it hasn't seen: at a page's start it takes one value, which fetches the page. That
-/// makes the crate decode each page of such a column, where a skip of the whole page would have
-/// passed over it undecoded; a column of another encoding keeps that, as its skips take the whole
-/// run, and its reads take [`BATCH`] values, as before.
+/// size, so a call that reads or skips into a page takes no more than the budget left holds at
+/// that size, and none that reach past the page; at a page it hasn't seen it takes one value, which
+/// fetches the page. A skip that starts at such a page is asked for its whole run instead, so the
+/// crate passes over the pages the run covers undecoded (fetching one sets its decoder up, and the
+/// decoder sizes arrays from a count the page holds), and [`CheckedPages`] stops it at a page it
+/// would only skip part of, which the one-value pace then takes. A column of another encoding
+/// skips its whole runs, and its reads take [`BATCH`] values, as before.
 struct Pace<'a> {
     watch: Option<(&'a PageNote, &'a Budget)>,
 }
@@ -1101,9 +1127,28 @@ impl Pace<'_> {
     }
 
     /// The values of the next `skip_records` call, of the `left` still to skip (more than `0`): the
-    /// whole run unless the column is paced, so the crate can pass over whole pages undecoded.
+    /// whole run unless the column is paced and the call is inside a page, or follows a stop at one.
     fn skip(&self, left: usize) -> usize {
-        if self.watch.is_none() { left } else { self.take(left) }
+        let Some((note, _)) = self.watch else { return left };
+        if note.in_page.load(Ordering::Relaxed) > 0 || note.stopped.swap(false, Ordering::Relaxed) {
+            return self.take(left);
+        }
+        note.passed.store(0, Ordering::Relaxed);
+        note.skip_left.store(left, Ordering::Relaxed);
+        left
+    }
+
+    /// Ends a skip call that [`skip`](Self::skip) asked for, which `result` is the outcome of: the
+    /// values it skipped, whether it was stopped at a page it would only have skipped part of (the
+    /// whole pages before that count).
+    fn skipped(&self, result: parquet::errors::Result<usize>) -> Result<(usize, bool)> {
+        let Some((note, _)) = self.watch else { return result.map(|n| (n, false)).map_err(err) };
+        note.skip_left.store(NOT_SKIPPING, Ordering::Relaxed);
+        match result {
+            Ok(n) => Ok((n, false)),
+            Err(_) if note.stopped.load(Ordering::Relaxed) => Ok((note.passed.load(Ordering::Relaxed), true)),
+            Err(e) => Err(err(e)),
+        }
     }
 
     /// Notes that a call read or skipped `values` of the page.
@@ -1192,14 +1237,34 @@ impl parquet::column::page::PageReader for CheckedPages {
         Ok(page)
     }
 
-    /// The next page's header, unchecked: a peek decodes no values.
+    /// The next page's header, unchecked: a peek decodes no values. While a skip is passing over
+    /// whole pages, a data page the skip would only pass over part of is refused (the skip would
+    /// set its decoder up first): [`Pace`] takes that page at its own pace.
     fn peek_next_page(&mut self) -> parquet::errors::Result<Option<parquet::column::page::PageMetadata>> {
-        self.pages.peek_next_page()
+        let meta = self.pages.peek_next_page()?;
+        let left = self.note.skip_left.load(Ordering::Relaxed);
+        if left != NOT_SKIPPING
+            && let Some(meta) = &meta
+        {
+            let rows = if meta.is_dict { Some(0) } else { meta.num_rows.or(meta.num_levels) };
+            if rows.is_none_or(|rows| rows > left) {
+                self.note.stopped.store(true, Ordering::Relaxed);
+                return Err(parquet::errors::ParquetError::General("a skip stops at a page it would only partly pass over".into()));
+            }
+            self.note.peeked.store(rows.unwrap_or(0), Ordering::Relaxed);
+        }
+        Ok(meta)
     }
 
     /// Skips the next page unchecked: a skipped page is never decoded.
     fn skip_next_page(&mut self) -> parquet::errors::Result<()> {
-        self.pages.skip_next_page()
+        self.pages.skip_next_page()?;
+        if self.note.skip_left.load(Ordering::Relaxed) != NOT_SKIPPING {
+            let rows = self.note.peeked.swap(0, Ordering::Relaxed);
+            self.note.skip_left.store(self.note.skip_left.load(Ordering::Relaxed).saturating_sub(rows), Ordering::Relaxed);
+            self.note.passed.store(self.note.passed.load(Ordering::Relaxed).saturating_add(rows), Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Whether the next page starts a record, as the column's own pages say.
@@ -1480,10 +1545,10 @@ fn read_column_with<T: PqType>(
                 let asked = pace.skip(left);
                 #[cfg(test)]
                 LARGEST_SKIP.with(|largest| largest.set(largest.get().max(asked)));
-                let skipped = r.skip_records(asked).map_err(err)?;
+                let (skipped, stopped) = pace.skipped(r.skip_records(asked))?;
                 pace.used(skipped);
                 left = left.saturating_sub(skipped);
-                if skipped < asked {
+                if skipped < asked && !stopped {
                     return Ok(out);
                 }
             }
@@ -2458,6 +2523,71 @@ mod tests {
         }
     }
 
+    /// Headers handed out one by one, as a file's pages would be peeked at and skipped.
+    struct Headers(Vec<PageMetadata>);
+
+    impl Iterator for Headers {
+        type Item = parquet::errors::Result<Page>;
+        fn next(&mut self) -> Option<Self::Item> {
+            None
+        }
+    }
+
+    impl PageReader for Headers {
+        fn get_next_page(&mut self) -> parquet::errors::Result<Option<Page>> {
+            Ok(None)
+        }
+        fn peek_next_page(&mut self) -> parquet::errors::Result<Option<PageMetadata>> {
+            Ok(self.0.first().cloned())
+        }
+        fn skip_next_page(&mut self) -> parquet::errors::Result<()> {
+            self.0.remove(0);
+            Ok(())
+        }
+        fn at_record_boundary(&mut self) -> parquet::errors::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// A skip passes over the whole pages its run covers, and is stopped (an error, with the values
+    /// it passed over noted) at a data page it would only skip part of, whose decoder it would set up.
+    #[test]
+    fn checked_pages_stop_a_skip_at_a_page_it_would_only_partly_pass_over() {
+        let page = |rows| PageMetadata { num_rows: Some(rows), num_levels: Some(rows), is_dict: false };
+        let dictionary = PageMetadata { num_rows: None, num_levels: None, is_dict: true };
+        let note = Arc::new(PageNote::default());
+        let mut pages = CheckedPages {
+            pages: Box::new(Headers(vec![dictionary, page(4), page(4), page(4)])),
+            bits: 32,
+            limit: u64::MAX,
+            chunk_bytes: None,
+            delta_declared: true,
+            note: note.clone(),
+        };
+        let budget = Budget::new(1 << 20, 0);
+        let pace = Pace { watch: Some((&note, &budget)) };
+        // Not skipping: a peek is a peek.
+        assert!(pages.peek_next_page().unwrap().is_some_and(|m| m.is_dict));
+        assert_eq!(pace.skip(10), 10, "a run from a page's start is asked for whole");
+        assert!(pages.peek_next_page().unwrap().is_some_and(|m| m.is_dict), "a dictionary page is left to the crate");
+        pages.skip_next_page().unwrap();
+        for _ in 0..2 {
+            assert_eq!(pages.peek_next_page().unwrap().and_then(|m| m.num_rows), Some(4));
+            pages.skip_next_page().unwrap();
+        }
+        // 2 values of the run are left, the next page holds 4: the skip stops there.
+        assert!(pages.peek_next_page().is_err());
+        let (skipped, stopped) = pace.skipped(Err(parquet::errors::ParquetError::General("stop".into()))).unwrap();
+        assert_eq!((skipped, stopped), (8, true));
+        assert_eq!(note.skip_left.load(Ordering::Relaxed), NOT_SKIPPING);
+        assert_eq!(pages.peek_next_page().unwrap().and_then(|m| m.num_rows), Some(4), "nothing was fetched");
+        assert_eq!(pace.skip(2), 1, "the page is then taken a value at a time");
+        // Another error is the caller's.
+        assert_eq!(pace.skip(3), 3);
+        assert!(pace.skipped(Err(parquet::errors::ParquetError::General("other".into()))).is_err());
+        assert_eq!(pace.skipped(Ok(3)).unwrap(), (3, false));
+    }
+
     /// A DELTA_BYTE_ARRAY column takes one value at a page's start, then no more than its page
     /// and what the budget left holds at that page's size; other columns take a batch.
     #[test]
@@ -2483,7 +2613,10 @@ mod tests {
         assert_eq!(Pace { watch: None }.take(1 << 20), BATCH);
         assert_eq!(Pace { watch: None }.take(7), 7);
         assert_eq!(Pace { watch: None }.skip(1 << 20), 1 << 20, "a skip of another encoding is one call");
+        note.in_page.store(100, Ordering::Relaxed);
+        assert_eq!(pace.skip(1 << 20), 100, "a skip inside a page takes no more than the page's rest");
         note.in_page.store(0, Ordering::Relaxed);
-        assert_eq!(pace.skip(1 << 20), 1, "a delta column's skip starts a page with one value");
+        assert_eq!(pace.skip(1 << 20), 1 << 20, "a delta column's skip starts a page with its whole run");
+        assert_eq!(note.skip_left.load(Ordering::Relaxed), 1 << 20, "so the pages it covers pass undecoded");
     }
 }

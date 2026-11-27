@@ -5335,7 +5335,7 @@ fn parquet_sampled_delta_read_does_not_fetch_the_pages_it_skips() {
         );
     }
     for v2 in [false, true] {
-        let pages = FixturePages { delta: true, v2, page_bytes: Some(2 << 10), ..FixturePages::default() };
+        let pages = FixturePages { delta: true, v2, page_bytes: Some(2 << 10) };
         write_encoded_parquet_fixture(&ds, &p, 100, false, pages);
         let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
         // Values that start differently share no prefix, so pages of 2 KiB hold about two each.
@@ -5349,7 +5349,9 @@ fn parquet_sampled_delta_read_does_not_fetch_the_pages_it_skips() {
         let batch = source.read(&last).unwrap();
         assert_eq!(batch.features.len(), 1, "v2 {v2}");
         assert_eq!(batch.features[0].attrs[0], Value::Text(format!("19{}", "x".repeat(1024))), "v2 {v2}");
-        assert_eq!(parquet::delta_pages(), 1, "v2 {v2}: only the page holding the row is fetched");
+        // The page holding the row, and for version 2 the one of the geometry column, which is delta
+        // encoded too: no page before them.
+        assert_eq!(parquet::delta_pages(), 1 + usize::from(v2), "v2 {v2}: only the pages holding the row are fetched");
     }
 }
 
