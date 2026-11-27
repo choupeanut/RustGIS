@@ -425,8 +425,9 @@ impl ParquetSource {
 }
 
 impl ParquetSource {
-    /// The decoded bytes a row group may take in the read starting now: asked once a read, as the
-    /// memory the process holds changes between reads ([`crate::memory::planned`]).
+    /// The decoded bytes a row group may take in the read starting now: asked once a read, when it
+    /// first reads a row group (a read that reads none never asks), as the memory the process holds
+    /// changes between reads ([`crate::memory::planned`]).
     fn decoded_limit(&self) -> u64 {
         self.decoded_bytes.unwrap_or_else(max_decoded_bytes)
     }
@@ -599,7 +600,7 @@ impl FeatureSource for ParquetSource {
     /// and fields before sampling matches; a refused view therefore scans the selected file.
     fn read(&self, req: &Request) -> Result<Batch> {
         self.attribute();
-        let decoded = self.decoded_limit();
+        let decoded = std::cell::LazyCell::new(|| self.decoded_limit());
         let limit = clamp_limit(req.limit);
         let md = self.reader.metadata();
         let native = self.reproject.request_box(req);
@@ -751,7 +752,7 @@ impl FeatureSource for ParquetSource {
                 self.check_scan_bytes(md, g, true)?;
             }
             let rg = self.reader.get_row_group(g).map_err(err)?;
-            let budget = Budget::new(decoded, g);
+            let budget = Budget::new(*decoded, g);
             let geoms = read_bytes(rg.as_ref(), self.geom_col, take, &budget)?;
             let attrs: Vec<ColumnValues> =
                 self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, take, &budget)).collect::<Result<_>>()?;
@@ -819,7 +820,7 @@ impl FeatureSource for ParquetSource {
     /// before the next check. An unbounded view also checks the decoded-column budget first.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         self.attribute();
-        let decoded = self.decoded_limit();
+        let decoded = std::cell::LazyCell::new(|| self.decoded_limit());
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         if self.remote.is_some() {
             return Err(DataError::Unsupported("a whole GeoParquet by its web address read a chunk at a time".into()));
@@ -870,7 +871,7 @@ impl FeatureSource for ParquetSource {
                 continue;
             }
             let rg = self.reader.get_row_group(g).map_err(err)?;
-            let budget = Budget::new(decoded, g);
+            let budget = Budget::new(*decoded, g);
             let geoms = read_bytes(rg.as_ref(), self.geom_col, &take, &budget)?;
             let attrs: Vec<ColumnValues> =
                 self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &take, &budget)).collect::<Result<_>>()?;
@@ -1077,8 +1078,10 @@ struct PageNote {
 /// How many values of a column one `read_records` or `skip_records` call takes. The `parquet`
 /// crate builds the values of a DELTA_BYTE_ARRAY page one by one in the call, each up to the page's
 /// size, so the call takes no more than the budget left holds at that size, and none that reach
-/// into a page it hasn't seen: at a page's start it takes one value, which fetches the page.
-/// A column of another encoding takes [`BATCH`] values, as before.
+/// into a page it hasn't seen: at a page's start it takes one value, which fetches the page. That
+/// makes the crate decode each page of such a column, where a skip of the whole page would have
+/// passed over it undecoded; a column of another encoding keeps that, as its skips take the whole
+/// run, and its reads take [`BATCH`] values, as before.
 struct Pace<'a> {
     watch: Option<(&'a PageNote, &'a Budget)>,
 }
@@ -1095,6 +1098,12 @@ impl Pace<'_> {
         let page = note.page.load(Ordering::Relaxed).max(1);
         let fit = usize::try_from(budget.left.get() / page).unwrap_or(BATCH);
         most.min(in_page).min(fit.max(1))
+    }
+
+    /// The values of the next `skip_records` call, of the `left` still to skip (more than `0`): the
+    /// whole run unless the column is paced, so the crate can pass over whole pages undecoded.
+    fn skip(&self, left: usize) -> usize {
+        if self.watch.is_none() { left } else { self.take(left) }
     }
 
     /// Notes that a call read or skipped `values` of the page.
@@ -1407,6 +1416,24 @@ fn read_column<T: PqType>(r: &mut ColumnReaderImpl<T>, take: &[bool], max_def: i
     read_column_with(r, take, max_def, &Pace { watch: None }, &mut |_| Ok(()))
 }
 
+/// Forgets the longest skip this thread has made, for tests.
+#[cfg(test)]
+pub(crate) fn reset_largest_skip() {
+    LARGEST_SKIP.with(|largest| largest.set(0));
+}
+
+/// The most values one `skip_records` call was asked to skip on this thread, for tests.
+#[cfg(test)]
+pub(crate) fn largest_skip() -> usize {
+    LARGEST_SKIP.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The most values one `skip_records` call was asked to skip on this thread, for tests.
+    static LARGEST_SKIP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// [`read_column`] reading as `pace` says and asking `charge` about each value
 /// it keeps, before the caller copies any: a read that passes its budget stops there.
 fn read_column_with<T: PqType>(
@@ -1431,7 +1458,9 @@ fn read_column_with<T: PqType>(
         i = j;
         if !on {
             while left > 0 {
-                let asked = pace.take(left);
+                let asked = pace.skip(left);
+                #[cfg(test)]
+                LARGEST_SKIP.with(|largest| largest.set(largest.get().max(asked)));
                 let skipped = r.skip_records(asked).map_err(err)?;
                 pace.used(skipped);
                 left = left.saturating_sub(skipped);
@@ -1723,14 +1752,14 @@ pub fn read_vectors(file: &Arc<Remote>, extent: &Extent, column: &str, max_group
         return Err(remote::need());
     }
     // The points in the extent, by row group.
-    let decoded = max_decoded_bytes();
+    let decoded = std::cell::LazyCell::new(max_decoded_bytes);
     let mut found: Vec<(usize, Vec<(usize, (f64, f64))>)> = Vec::new();
     let mut total = 0usize;
     let mut hit = 0usize;
     for &g in &groups {
         let rg = reader.get_row_group(g).map_err(err)?;
         let rows = usize::try_from(rg.metadata().num_rows()).unwrap_or(0).min(MAX_GROUP_ROWS);
-        let geoms = read_bytes(rg.as_ref(), geom, &vec![true; rows], &Budget::new(decoded, g))?;
+        let geoms = read_bytes(rg.as_ref(), geom, &vec![true; rows], &Budget::new(*decoded, g))?;
         let inside: Vec<(usize, (f64, f64))> = geoms
             .iter()
             .enumerate()
@@ -2410,5 +2439,8 @@ mod tests {
         assert_eq!(note.in_page.load(Ordering::Relaxed), 0);
         assert_eq!(Pace { watch: None }.take(1 << 20), BATCH);
         assert_eq!(Pace { watch: None }.take(7), 7);
+        assert_eq!(Pace { watch: None }.skip(1 << 20), 1 << 20, "a skip of another encoding is one call");
+        note.in_page.store(0, Ordering::Relaxed);
+        assert_eq!(pace.skip(1 << 20), 1, "a delta column's skip starts a page with one value");
     }
 }

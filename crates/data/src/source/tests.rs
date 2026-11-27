@@ -5298,6 +5298,24 @@ fn parquet_delta_byte_array_reads_within_the_decoded_budget() {
     assert!(error.contains("decoded-column budget"), "{error}");
 }
 
+/// A column that isn't delta encoded skips a run of rows it doesn't take in one call, so the
+/// `parquet` crate can pass over whole pages without decoding them (#2913).
+#[test]
+fn parquet_sampled_read_skips_a_long_run_in_one_call() {
+    let p = dir().join("sampled-skip.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+    for i in 0..30_000 {
+        ds.push(Some(Geometry::Point(Coord::new(-82.0 + f64::from(i) / 30_000.0, 0.0))), vec![]);
+    }
+    write_projected_parquet_fixture(&ds, &p, 30_000, false);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
+    parquet::reset_largest_skip();
+    let one = Request { extent: None, limit: 1, own: None };
+    assert_eq!(source.read(&one).unwrap().features.len(), 1);
+    // Most of the 30,000 rows aren't taken: one run of well over a batch of 8,192.
+    assert!(parquet::largest_skip() > 8192, "{}", parquet::largest_skip());
+}
+
 /// Data pages of version 2 read as version 1 do, with and without a budget that stops them.
 #[test]
 fn parquet_version_two_pages_read_within_the_decoded_budget() {
