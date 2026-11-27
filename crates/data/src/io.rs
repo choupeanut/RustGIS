@@ -293,7 +293,7 @@ pub fn read_layers(file_name: &str, bytes: &[u8]) -> Result<Vec<LayerRead>> {
     let plain =
         |v: Vec<(Dataset, ReadReport)>| v.into_iter().map(|(dataset, report)| LayerRead { dataset, report, styles: Vec::new() }).collect();
     let mut out: Vec<LayerRead> = match ext.as_str() {
-        "zip" => read_zip_layers(file_name, bytes, None)?,
+        "zip" => read_zip_layers(file_name, bytes, &CsvOptions::default())?,
         "kml" | "kmz" => crate::kml::read(file_name, bytes)?
             .into_iter()
             .map(|l| LayerRead { dataset: l.dataset, report: l.report, styles: l.styles })
@@ -2530,6 +2530,9 @@ pub struct CsvOptions {
     pub crs: Option<crate::raster::Crs>,
     /// The field separator (otherwise the most common of `,`, `;`, tab and `|` in the header).
     pub delimiter: Option<u8>,
+    /// For a zip's members, which don't all hold the columns named: a table that lacks a named `x`, `y` or `wkt` column is read as it would be
+    /// without them, and says so, instead of being refused. Set by the zip reader; false elsewhere, where a column that isn't there is an error.
+    pub columns_optional: bool,
 }
 
 /// The separator of a delimited text file: the most common of `,`, `;`, tab and `|` in its first
@@ -3065,6 +3068,18 @@ pub(crate) fn read_rows(
             None => Ok(None),
         }
     };
+    // A zip's members don't all hold the columns the caller named: one that lacks any is read as it would be without them, and says which.
+    let lacking = opts
+        .columns_optional
+        .then(|| [("x", &opts.x), ("y", &opts.y), ("WKT", &opts.wkt)].into_iter().find(|(what, n)| named(n, what).is_err()))
+        .flatten();
+    let without;
+    let opts = if lacking.is_some() {
+        without = CsvOptions { x: None, y: None, wkt: None, ..opts.clone() };
+        &without
+    } else {
+        opts
+    };
     let (x, y) = (named(&opts.x, "x")?, named(&opts.y, "y")?);
     let wkt_given = named(&opts.wkt, "WKT")?;
     if wkt_given.is_some() && (x.is_some() || y.is_some()) {
@@ -3096,6 +3111,9 @@ pub(crate) fn read_rows(
         })
         .collect();
     let mut report = ReadReport { skipped: malformed, ..ReadReport::default() };
+    if let Some((what, Some(column))) = lacking {
+        report.messages.push(format!("{name}: no {what} column '{}'; read without the x, y or WKT columns given", column.trim()));
+    }
     if xy.is_none()
         && wkt.is_none()
         && let Some(note) = unmatched_coordinates_note(headers)
@@ -3836,7 +3854,7 @@ pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadRepor
 }
 
 /// Reads a ZIP, optionally overriding the source CRS of its Shapefiles, delimited text, workbooks
-/// and LandXML.
+/// and LandXML (the columns and separator of its tables are [`read_zip_layers`]'s).
 /// Other formats retain their own coordinate systems; a CityJSON model takes it only when it names none RustGIS
 /// knows. The override is applied before reading any shapes. Cancellation is checked between
 /// archive members and records; inflating one member cannot be interrupted mid-decompression.
@@ -3844,19 +3862,29 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
     read_zip_budget(file_name, bytes, crs, &mut csv_memory_budget())
 }
 
-/// [`read_zip_in`] with each layer's KML styles, for adding the layers drawn as their files say.
-pub fn read_zip_layers(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Vec<LayerRead>> {
-    read_zip_layers_budget(file_name, bytes, crs, &mut csv_memory_budget())
+/// [`read_zip_in`] with each layer's KML styles, for adding the layers drawn as their files say,
+/// and with `opts` for the zip's delimited members and its workbooks' first sheets: the `x`, `y`
+/// and `wkt` columns and the `delimiter` apply as when the member is added by itself, and `crs`
+/// as [`read_zip_in`] says. A table that lacks a column named is read without them, with a notice
+/// naming it and the column; other members ignore the columns and the delimiter.
+pub fn read_zip_layers(file_name: &str, bytes: &[u8], opts: &CsvOptions) -> Result<Vec<LayerRead>> {
+    read_zip_layers_budget(file_name, bytes, opts, &mut csv_memory_budget())
 }
 
 /// [`read_zip_layers_budget`] without the styles.
 fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut usize) -> Result<Vec<(Dataset, ReadReport)>> {
-    Ok(read_zip_layers_budget(file_name, bytes, crs, budget)?.into_iter().map(|l| (l.dataset, l.report)).collect())
+    Ok(read_zip_layers_budget(file_name, bytes, &CsvOptions { crs, ..Default::default() }, budget)?
+        .into_iter()
+        .map(|l| (l.dataset, l.report))
+        .collect())
 }
 
 /// Delimited, dBASE and workbook members share one allowance, including gzip members whose text
 /// is nested in ZIP.
-fn read_zip_layers_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut usize) -> Result<Vec<LayerRead>> {
+fn read_zip_layers_budget(file_name: &str, bytes: &[u8], opts: &CsvOptions, budget: &mut usize) -> Result<Vec<LayerRead>> {
+    let crs = opts.crs;
+    // The tables' options: not every member holds the columns given.
+    let member = CsvOptions { columns_optional: true, ..opts.clone() };
     let max = max_bytes();
     if bytes.len() as u64 > max {
         return Err(DataError::Format(file_size_error(file_name, max)));
@@ -3988,12 +4016,11 @@ fn read_zip_layers_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budge
         } else if is_city_model(leaf, &b) {
             read_city_member(leaf, &b, crs).map(plain)
         } else if is_delimited_name(leaf) {
-            read_delimited_bytes_budget(leaf, &b, &CsvOptions { crs, ..Default::default() }, budget).map(|r| plain(vec![r]))
+            read_delimited_bytes_budget(leaf, &b, &member, budget).map(|r| plain(vec![r]))
         } else if crate::sheets::is_sheet_name(leaf) {
             // A workbook's first sheet, as a workbook added by itself is read, within the allowance.
             let name = Path::new(leaf).file_stem().and_then(|s| s.to_str()).unwrap_or("sheet");
-            crate::sheets::read(&b, name, None, &CsvOptions { crs, ..Default::default() })
-                .and_then(|r| charge_retained([&r.0], leaf, budget).map(|()| plain(vec![r])))
+            crate::sheets::read(&b, name, None, &member).and_then(|r| charge_retained([&r.0], leaf, budget).map(|()| plain(vec![r])))
         } else if let Some(crs) = crs.filter(|_| {
             crate::landxml::is_landxml_name(leaf)
                 || (ext_of(&n) == "xml"
@@ -9395,6 +9422,98 @@ mod tests {
         // Without overlays, nothing is said.
         let plain = crate::zip::write(&[("a.gpx".into(), br#"<?xml version="1.0"?><gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1"><wpt lat="1" lon="2"/></gpx>"#.to_vec())]).unwrap();
         assert!(read_zip("p.zip", &plain).unwrap().iter().all(|(_, r)| r.messages.is_empty()));
+    }
+
+    /// A zip's tables read as they do by themselves with the same options, on edge values too.
+    #[test]
+    fn a_zips_tables_read_as_they_do_alone_with_the_options() {
+        let csv = "id,LongitudeOR,LatitudeOR\n1,10,20\n2,1e400,5\n3,NaN,5\n4,,5\n5,12,22\n";
+        let opts = CsvOptions { x: Some("LongitudeOR".into()), y: Some(" latitudeor ".into()), ..Default::default() };
+        let book = crate::sheets::xlsx(&[("ALL", &[&["id", "LongitudeOR", "LatitudeOR"], &["1", "10", "20"], &["2", "1e400", "5"]])]);
+        let zip = crate::zip::write(&[
+            ("a.csv".into(), csv.as_bytes().to_vec()),
+            ("b.csv.gz".into(), gzip_csv(csv.as_bytes())),
+            ("c.xlsx".into(), book.clone()),
+            ("empty.csv".into(), b"id,LongitudeOR,LatitudeOR\n".to_vec()),
+        ])
+        .unwrap();
+        let read = read_zip_layers("t.zip", &zip, &opts).unwrap();
+        assert_eq!(read.len(), 4);
+        let alone = [
+            read_delimited_bytes("a.csv", csv.as_bytes(), &opts).unwrap(),
+            read_delimited_bytes("b.csv.gz", &gzip_csv(csv.as_bytes()), &opts).unwrap(),
+            crate::sheets::read(&book, "c", None, &opts).unwrap(),
+        ];
+        for (layer, (ds, report)) in read.iter().zip(&alone) {
+            assert_eq!(layer.dataset.features, ds.features, "{}", layer.dataset.name);
+            assert_eq!(layer.dataset.fields, ds.fields);
+            assert_eq!(layer.report.messages, report.messages);
+            assert_eq!(layer.report.skipped, report.skipped);
+        }
+        // The rows at 1e400 (infinity), NaN and the empty cell stay without a point, and are counted.
+        let first = read.first();
+        assert_eq!(first.map(|l| l.dataset.features.iter().filter(|f| f.geometry.is_some()).count()), Some(2));
+        assert_eq!(first.map(|l| l.report.skipped), Some(3));
+        // A header with the columns and no rows gives no point and nothing to say about columns.
+        assert!(
+            read.last().is_some_and(|l| l.dataset.features.is_empty() && !l.report.messages.iter().any(|m| m.contains("read without")))
+        );
+    }
+
+    /// A table without the column named is read without the columns given, and says so; the
+    /// others take them. Clean input says nothing.
+    #[test]
+    fn a_zip_member_lacking_a_column_given_is_read_without_the_columns_and_says_so() {
+        let have = b"id,LongitudeOR,LatitudeOR\n1,10,20\n".to_vec();
+        let only_x = b"id,longitude,latitude,LongitudeOR\n1,10,20,30\n".to_vec();
+        let zip =
+            crate::zip::write(&[("a.csv".into(), have.clone()), ("b.csv".into(), only_x), ("c.csv".into(), b"id,name\n1,x\n".to_vec())])
+                .unwrap();
+        let opts = CsvOptions { x: Some("LongitudeOR".into()), y: Some("LatitudeOR".into()), ..Default::default() };
+        let read = read_zip_layers("t.zip", &zip, &opts).unwrap();
+        let said = |name: &str| {
+            read.iter()
+                .find(|l| l.dataset.name == name)
+                .map(|l| l.report.messages.iter().map(|m| m.as_str().to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(said("a"), Some(vec![]));
+        let b = said("b").unwrap_or_default();
+        assert!(b.iter().any(|m| m == "b: no y column 'LatitudeOR'; read without the x, y or WKT columns given"), "{b:?}");
+        let c = said("c").unwrap_or_default();
+        assert!(c.iter().any(|m| m == "c: no x column 'LongitudeOR'; read without the x, y or WKT columns given"), "{c:?}");
+        // By detection `b` is still points, as it is without the columns given.
+        assert_eq!(read.iter().find(|l| l.dataset.name == "b").map(|l| l.dataset.geometry_type), Some(GeometryType::Point));
+        assert_eq!(read.iter().find(|l| l.dataset.name == "c").map(|l| l.dataset.geometry_type), Some(GeometryType::None));
+        // Alone, a missing column is still an error.
+        assert!(read_delimited_bytes("c.csv", b"id,name\n1,x\n", &opts).is_err());
+        // The same zip without the columns given reads as before.
+        let plain = read_zip("t.zip", &zip).unwrap();
+        assert!(plain.iter().all(|(_, r)| !r.messages.iter().any(|m| m.contains("read without"))));
+    }
+
+    /// `wkt` and `delimiter` reach a zip's tables; the other members ignore them.
+    #[test]
+    fn a_zips_wkt_and_delimiter_reach_its_tables() {
+        let zip = crate::zip::write(&[
+            ("a.csv".into(), b"id,footprint\n1,POINT (1 2)\n".to_vec()),
+            ("b.csv".into(), b"a,b\tc\n1,2\t3\n".to_vec()),
+        ])
+        .unwrap();
+        let wkt = CsvOptions { wkt: Some("footprint".into()), delimiter: Some(b','), ..Default::default() };
+        let read = read_zip_layers("t.zip", &zip, &wkt).unwrap();
+        assert_eq!(read.iter().find(|l| l.dataset.name == "a").map(|l| l.dataset.features.len()), Some(1));
+        assert_eq!(read.iter().find(|l| l.dataset.name == "a").map(|l| l.dataset.geometry_type), Some(GeometryType::Point));
+        let tab = CsvOptions { delimiter: Some(b'\t'), ..Default::default() };
+        let read = read_zip_layers("t.zip", &zip, &tab).unwrap();
+        let names = |name: &str| {
+            read.iter().find(|l| l.dataset.name == name).map(|l| l.dataset.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>())
+        };
+        assert_eq!(names("b"), Some(vec!["a,b".to_string(), "c".to_string()]));
+        // `x` without `y` skips a table that has it, and names it, rather than reading it as something else.
+        let lone = CsvOptions { x: Some("id".into()), ..Default::default() };
+        let read = read_zip_layers("t.zip", &zip, &lone).unwrap_or_default();
+        let said: Vec<String> = read.iter().flat_map(|l| l.report.messages.iter().map(|m| m.as_str().to_string())).collect();
+        assert!(said.iter().any(|m| m.contains("a.csv") && m.contains("give both the x and the y column")), "{said:?}");
     }
 
     /// A zipped LandXML file is read in the system the zip is given, as it is by itself.

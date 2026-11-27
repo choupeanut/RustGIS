@@ -21,7 +21,7 @@ pub const MAX_LAYER_NAME: usize = 200;
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addData", "Add Data", "Home › Add", add_data).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
-            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer, or a PDF's page number (the first when left out or blank)", "paperSpace"?: "bool: a DXF's layout entities too", "blocks"?: "bool: a DXF's block (图块) contents, true by default", "stream"?: "bool: true links the file instead of copying it (read in place, a view at a time; the project keeps its path, not its features), false copies it into the project; left out, decided by its size or feature count", "as"?: "scan" (a TIFF, PNG, JPEG or PDF page, even a photo, a GeoTIFF or a GeoPDF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a DXF (which never says), a CityJSON or CityGML model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say (GDAL takes an authority code such as EPSG:2263 or the exact names WGS84, WGS72, NAD27, NAD83, not WKT or a file)", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
+            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer, or a PDF's page number (the first when left out or blank)", "paperSpace"?: "bool: a DXF's layout entities too", "blocks"?: "bool: a DXF's block (图块) contents, true by default", "stream"?: "bool: true links the file instead of copying it (read in place, a view at a time; the project keeps its path, not its features), false copies it into the project; left out, decided by its size or feature count", "as"?: "scan" (a TIFF, PNG, JPEG or PDF page, even a photo, a GeoTIFF or a GeoPDF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a DXF (which never says), a CityJSON or CityGML model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say (GDAL takes an authority code such as EPSG:2263 or the exact names WGS84, WGS72, NAD27, NAD83, not WKT or a file)", "x"?: "CSV or workbook x/longitude column (in a zip, for each CSV and workbook member that has it)", "y"?: "CSV or workbook y/latitude column (as x)", "wkt"?: "CSV or workbook WKT geometry column (as x)", "delimiter"?: ","|";"|"\\t"|"|"}"#),
         C::new("layer.addPhotos", "Add Photos", "Home › Add", add_photos).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"paths"?: [JPEG photo files], "folder"?: "a folder of photos (every JPEG in it)", "name"?: "the layer (default Photos; photos join it when it exists)"}"#,
         ),
@@ -2347,8 +2347,9 @@ fn read_layers_file(p: &Value, path: &str) -> LayersRead {
     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty());
     let reads = match crs {
-        Some(text) if full.to_ascii_lowercase().ends_with(".zip") => {
-            rustgis_data::io::read_zip_layers(&full, &bytes, Some(rustgis_data::raster::Crs::parse(text)?)).map_err(|e| e.to_string())?
+        _ if full.to_ascii_lowercase().ends_with(".zip") => {
+            let crs = crs.map(rustgis_data::raster::Crs::parse).transpose()?;
+            rustgis_data::io::read_zip_layers(&full, &bytes, &zip_options(p, crs)?).map_err(|e| e.to_string())?
         }
         Some(text) if rustgis_data::io::is_city_model(&full, &bytes) => {
             city_reads(&full, &bytes, Some(rustgis_data::raster::Crs::parse(text)?))?
@@ -2833,9 +2834,9 @@ pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u
     // A DXF drawing: its coordinate system (it never says) and one of its own layers.
     let dxf = rustgis_data::dxf::is_dxf_name(file_name);
     let reads = match crs.filter(|_| landxml) {
-        _ if lower.ends_with(".zip") && crs.is_some() => {
+        _ if lower.ends_with(".zip") => {
             let crs = crs.map(|text| super::parse_crs(s, text)).transpose()?;
-            rustgis_data::io::read_zip_layers(file_name, bytes, crs).map_err(|e| e.to_string())?
+            rustgis_data::io::read_zip_layers(file_name, bytes, &zip_options(p, crs)?).map_err(|e| e.to_string())?
         }
         // A city model (CityJSON or CityGML) with a coordinate system given, which takes the place
         // of any it names.
@@ -4850,7 +4851,13 @@ pub(crate) fn csv_options(p: &Value) -> Result<Option<rustgis_data::io::CsvOptio
     }
     let crs = crs.map(|c| rustgis_data::raster::Crs::parse(&c)).transpose()?;
     let delimiter = parse_delimiter(delimiter)?;
-    Ok(Some(rustgis_data::io::CsvOptions { x, y, wkt, crs, delimiter }))
+    Ok(Some(rustgis_data::io::CsvOptions { x, y, wkt, crs, delimiter, ..Default::default() }))
+}
+
+/// What a zip's delimited and workbook members are read with: the `x`, `y`, `wkt` and `delimiter`
+/// given (as [`csv_options`]), and the coordinate system `crs`.
+fn zip_options(p: &Value, crs: Option<rustgis_data::raster::Crs>) -> Result<rustgis_data::io::CsvOptions, String> {
+    Ok(rustgis_data::io::CsvOptions { crs, ..csv_options(p)?.unwrap_or_default() })
 }
 
 /// A `delimiter` parameter: one character, or `\t`/`tab`.

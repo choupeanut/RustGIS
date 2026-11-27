@@ -13,6 +13,7 @@ and its limits are listed in `user-guide/data-formats.md`.
 - **CSV / TSV:** points come from `"x"` and `"y"` columns, or a `"wkt"` column. When the
   coordinates aren't longitude/latitude, give their `"crs"` (`"EPSG:2271"`). Without it, projected
   coordinates land in the wrong place. Use `"delimiter"` when it isn't a comma.
+  In a zip, its CSVs and workbooks that have those columns take them too.
 - **A web address:** `layer.addUrl` `{"url": U}` for GeoJSON, CSV, GeoParquet, FlatGeobuf,
   GeoPackage, zipped Shapefiles, KML/KMZ, GPX, GeoTIFF, GRIB or a PMTiles archive. This uses the
   network, so the user is asked first. One record of a large GRIB file: `"bytes": [first, last]`,

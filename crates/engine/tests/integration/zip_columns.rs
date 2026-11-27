@@ -22,7 +22,11 @@ fn members(with_notes: bool) -> Vec<u8> {
 /// A folder of its own for each read: the tests run side by side.
 fn unique_dir() -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    std::env::temp_dir().join(format!("rustgis-zip-columns-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+    std::env::temp_dir().join(format!(
+        "rustgis-zip-columns-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
 }
 
 /// Adds `bytes` named `x.zip` by `route` with `extra` parameters; the session and its notices.
@@ -102,15 +106,17 @@ fn a_zip_whose_members_all_have_the_columns_says_nothing_about_them() {
 
 #[test]
 fn a_zips_wkt_column_and_delimiter_reach_its_tables() {
-    let entries = vec![
-        ("a.csv".to_string(), b"id,footprint\n1,POINT (1 2)\n".to_vec()),
-        ("b.csv".to_string(), b"a,b\tc\n1,2\t3\n".to_vec()),
-    ];
+    let entries =
+        vec![("a.csv".to_string(), b"id,footprint\n1,POINT (1 2)\n".to_vec()), ("b.csv".to_string(), b"a,b\tc\n1,2\t3\n".to_vec())];
     let bytes = zip::write(&entries).unwrap();
     let (s, said) = add("path", &bytes, json!({"wkt": "footprint", "delimiter": "tab"}));
     // `a.csv` has no tab, so it is one column without `footprint`: read without the column given.
     let fields = |name: &str| {
-        s.project.tables.iter().find(|t| t.dataset.name == name).map(|t| t.dataset.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>())
+        s.project
+            .tables
+            .iter()
+            .find(|t| t.dataset.name == name)
+            .map(|t| t.dataset.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>())
     };
     assert_eq!(fields("b"), Some(vec!["a,b".to_string(), "c".to_string()]), "{said:?}");
     // Read by commas, `a.csv`'s footprint becomes geometry.
