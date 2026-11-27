@@ -331,13 +331,18 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
     for (i, f) in table.fields.iter().enumerate() {
         let ty = match f.kind {
             Kind::Geometry if Some(i) == geometry_at => continue,
-            Kind::Geometry | Kind::Binary | Kind::Raster => {
-                let kind = match f.kind {
-                    Kind::Geometry => "geometry",
-                    Kind::Binary => "binary",
-                    _ => "raster",
-                };
-                left_out.push((f.name.clone(), kind.to_string()));
+            // A raster field is never read here (`Table::parse` refuses the table), but a kind that
+            // is left out is named whatever the parser does.
+            Kind::Geometry => {
+                left_out.push((f.name.clone(), "geometry".to_string()));
+                continue;
+            }
+            Kind::Binary => {
+                left_out.push((f.name.clone(), "binary".to_string()));
+                continue;
+            }
+            Kind::Raster => {
+                left_out.push((f.name.clone(), "raster".to_string()));
                 continue;
             }
             Kind::Int16 | Kind::Int32 | Kind::Int64 | Kind::ObjectId => FieldType::Integer,
