@@ -754,15 +754,71 @@ impl FeatureSource for ParquetSource {
             let rg = self.reader.get_row_group(g).map_err(err)?;
             let budget = Budget::new(*decoded, g);
             let geoms = read_bytes(rg.as_ref(), self.geom_col, take, &budget)?;
+            let base = starts.get(g).copied().unwrap_or(0);
+            let wanted = take.iter().filter(|&&t| t).count();
+            if late {
+                // The geometry test and the sampler choose the rows first; only their attributes
+                // are decoded, and so charged.
+                if geoms.len() != wanted {
+                    return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
+                }
+                for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
+                    if unbounded {
+                        crate::progress::step(1)?;
+                    }
+                    let geometry = match geoms.get(k).and_then(|b| b.as_deref()) {
+                        Some(bytes) => {
+                            let Some(geometry) = wkb::decode(bytes).and_then(|g| self.reproject.place(g, req)) else {
+                                skipped += 1;
+                                continue;
+                            };
+                            Some(geometry)
+                        }
+                        None => None,
+                    };
+                    if !geometry.as_ref().map_or(req.extent.is_none(), |g| g.inside) || !sample.wants() {
+                        continue;
+                    }
+                    sample.keep(Feature {
+                        id: base.saturating_add(r as u64 + 1),
+                        geometry: geometry.map(|p| p.geometry),
+                        attrs: Vec::new(),
+                    });
+                }
+                // The rows of this group the sample still holds, in order (it may have dropped some).
+                let mut chosen = vec![false; take.len()];
+                let mut mine = Vec::new();
+                for (i, f) in sample.items.iter().enumerate() {
+                    if let Some(r) = f.id.checked_sub(base.saturating_add(1)).and_then(|r| usize::try_from(r).ok())
+                        && let Some(c) = chosen.get_mut(r)
+                    {
+                        *c = true;
+                        mine.push(i);
+                    }
+                }
+                let attrs: Vec<ColumnValues> =
+                    self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &chosen, &budget)).collect::<Result<_>>()?;
+                if attrs.iter().any(|a| a.values.len() != mine.len()) {
+                    return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
+                }
+                for (n, &i) in mine.iter().enumerate() {
+                    if let Some(f) = sample.items.get_mut(i) {
+                        f.attrs = attrs
+                            .iter()
+                            .enumerate()
+                            .map(|(field, col)| col.value(n, field, &mut unread_dates, &mut rounded_dates))
+                            .collect();
+                    }
+                }
+                continue;
+            }
             let attrs: Vec<ColumnValues> =
                 self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, take, &budget)).collect::<Result<_>>()?;
             // A column shorter than its row group (a truncated or corrupt file) would pair values
             // with the wrong rows: refuse it.
-            let wanted = take.iter().filter(|&&t| t).count();
             if geoms.len() != wanted || attrs.iter().any(|a| a.values.len() != wanted) {
                 return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
             }
-            let base = starts.get(g).copied().unwrap_or(0);
             // The columns hold the taken rows only, in order: the k-th is row `r`.
             for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
                 if unbounded {
@@ -780,7 +836,7 @@ impl FeatureSource for ParquetSource {
                     None => None,
                 };
                 let matches_extent = geometry.as_ref().map_or(req.extent.is_none(), |g| g.inside);
-                if !matches_extent || (late && !sample.wants()) {
+                if !matches_extent {
                     continue;
                 }
                 let geometry = geometry.map(|p| p.geometry);
@@ -873,9 +929,53 @@ impl FeatureSource for ParquetSource {
             let rg = self.reader.get_row_group(g).map_err(err)?;
             let budget = Budget::new(*decoded, g);
             let geoms = read_bytes(rg.as_ref(), self.geom_col, &take, &budget)?;
+            let wanted = take.iter().filter(|&&t| t).count();
+            if extent.is_some() {
+                // The geometry test chooses the rows first; only their attributes are decoded, and
+                // so charged.
+                if geoms.len() != wanted {
+                    return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
+                }
+                let mut chosen = vec![false; take.len()];
+                let mut found = Vec::new();
+                for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
+                    crate::progress::step(1)?;
+                    let geometry = match geoms.get(k).and_then(|b| b.as_deref()) {
+                        Some(bytes) => {
+                            let Some(geometry) = wkb::decode(bytes).and_then(|geom| self.reproject.place(geom, &req)) else {
+                                out.skipped += 1;
+                                continue;
+                            };
+                            Some(geometry)
+                        }
+                        None => None,
+                    };
+                    if !geometry.as_ref().map_or(req.extent.is_none(), |g| g.inside) {
+                        continue;
+                    }
+                    if let Some(c) = chosen.get_mut(r) {
+                        *c = true;
+                    }
+                    found.push((r, geometry.map(|p| p.geometry)));
+                }
+                let attrs: Vec<ColumnValues> =
+                    self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &chosen, &budget)).collect::<Result<_>>()?;
+                if attrs.iter().any(|a| a.values.len() != found.len()) {
+                    return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
+                }
+                for (n, (r, geometry)) in found.into_iter().enumerate() {
+                    let values = attrs
+                        .iter()
+                        .enumerate()
+                        .map(|(field, col)| col.value(n, field, &mut out.unread_dates, &mut out.rounded_dates))
+                        .collect();
+                    out.matched += 1;
+                    chunks.push(Feature { id: start.saturating_add(r as u64 + 1), geometry, attrs: values })?;
+                }
+                continue;
+            }
             let attrs: Vec<ColumnValues> =
                 self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &take, &budget)).collect::<Result<_>>()?;
-            let wanted = take.iter().filter(|&&t| t).count();
             if geoms.len() != wanted || attrs.iter().any(|a| a.values.len() != wanted) {
                 return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
             }
@@ -1957,7 +2057,7 @@ fn text_len(bytes: &[u8]) -> usize {
 /// of another type). Only the rows taken count, not the
 /// column chunk's size; a page of more than the budget is refused, as the `parquet` crate makes
 /// room for a whole page. A column with DELTA_BYTE_ARRAY pages, whose values the decoder builds
-/// one by one, is read at the [`Pace`] its page size and the budget left allow.
+/// one by one, or DELTA_LENGTH_BYTE_ARRAY pages, whose length arrays are made as a page is fetched, is read at the [`Pace`] its page size and the budget left allow.
 fn read_binary(
     rg: &dyn RowGroupReader,
     col: usize,
@@ -1972,7 +2072,9 @@ fn read_binary(
     let name = chunk.column_path().string();
     let (reader, note) = column_reader_within(rg, col, budget.limit)?;
     let ColumnReader::ByteArrayColumnReader(mut r) = reader else { return Ok(None) };
-    let delta = chunk.encodings().any(|e| e == Encoding::DELTA_BYTE_ARRAY);
+    // DELTA_LENGTH_BYTE_ARRAY pages are paced too: the decoder makes an array of a page's count
+    // when it is fetched, which must see what the values before it were charged.
+    let delta = chunk.encodings().any(|e| matches!(e, Encoding::DELTA_BYTE_ARRAY | Encoding::DELTA_LENGTH_BYTE_ARRAY));
     let pace = Pace { watch: delta.then_some((&*note, budget)) };
     let place = format!("row group {}, column '{name}'", budget.group);
     note.left.store(budget.left.get(), Ordering::Relaxed);
