@@ -3014,6 +3014,9 @@ fn select_by_attributes(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> 
         Some(crate::matchcount::Shown::Invalid(e)) => {
             ui.label(egui::RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", &e)])).small().color(t.red));
         }
+        Some(crate::matchcount::Shown::Failed(e)) => {
+            ui.label(egui::RichText::new(e).small().color(t.red));
+        }
         Some(crate::matchcount::Shown::Counting) => {
             ui.label(egui::RichText::new(tl!("Counting matching rows…")).small().weak());
         }
@@ -3867,6 +3870,36 @@ mod tests {
         h.run_steps(3);
         assert_eq!(h.state().dialogs.matching.starts, 3, "an empty clause starts nothing");
         assert!(h.query_by_label_contains("matching rows").is_none(), "and says nothing");
+    }
+
+    /// A value edited in place (the rows' number and the fields as before), another layer and a
+    /// layer removed are never answered with the number for what was there before (#2946).
+    #[test]
+    fn select_by_attributes_count_follows_a_value_edit_a_layer_switch_and_a_removal() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::Value;
+        let mut h = sba_ready();
+        counted(&mut h);
+        let (id, pop, row) = {
+            let l = h.state().session.map().layer_by_name("Countries").unwrap();
+            let rows = rustgis_engine::data::query::select("pop_est > 100000000", &l.dataset).unwrap();
+            (l.id, l.dataset.field_index("pop_est").unwrap(), rows[0])
+        };
+        h.state_mut().session.map_mut().layer_mut(id).unwrap().dataset.features.set_value(row, pop, Value::Int(0));
+        counted(&mut h);
+        assert!(h.query_by_label("Valid expression · 13 matching rows").is_some(), "one fewer, the same length");
+        h.state_mut().dialogs.layer = "Cities".into();
+        counted(&mut h);
+        assert!(h.query_by_label_contains("Valid expression · 13").is_none(), "not Countries' number for Cities");
+        assert!(
+            h.query_by_label_contains("matching rows").is_some() || h.query_by_label_contains("Invalid:").is_some(),
+            "Cities has its own answer"
+        );
+        h.state_mut().dialogs.layer = "Countries".into();
+        counted(&mut h);
+        h.state_mut().session.run("layer.remove", &json!({"layer": "Countries"})).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("matching rows").is_none(), "a layer that is gone has no count");
     }
 
     /// A clause that doesn't read is said at once and starts no count (#2946).
