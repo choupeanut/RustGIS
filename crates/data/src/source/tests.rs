@@ -5430,6 +5430,28 @@ fn parquet_delta_pages_of_many_blocks_read_back() {
     }
 }
 
+/// The decoder of a delta page makes arrays of the page's count (8 bytes a value), more than the
+/// values it builds from short text: the read holds them against the budget left, so a page of 3,000
+/// one-letter values is refused with 80,000 bytes (the geometry took 63,000 of them) and read with
+/// 200,000 (#2913).
+#[test]
+fn parquet_delta_page_arrays_count_against_the_budget() {
+    let p = dir().join("decoded-delta-arrays.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("label", FieldType::Text)]);
+    for _ in 0..3000 {
+        ds.push(Some(Geometry::Point(Coord::new(-81.0, 0.0))), vec![Value::Text("a".into())]);
+    }
+    let whole = Request { extent: None, limit: 5000, own: None };
+    for v2 in [false, true] {
+        write_encoded_parquet_fixture(&ds, &p, 3000, false, FixturePages { delta: true, v2, page_bytes: None });
+        let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_decoded_bytes(80_000);
+        let error = source.read(&whole).unwrap_err().to_string();
+        assert!(error.contains("bytes the decoded-column budget has left") && error.contains("column 'label'"), "v2 {v2}: {error}");
+        let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_decoded_bytes(200_000);
+        assert_eq!(source.read(&whole).unwrap().features.len(), 3000, "v2 {v2}");
+    }
+}
+
 /// Data pages of version 2 read as version 1 do, with and without a budget that stops them.
 #[test]
 fn parquet_version_two_pages_read_within_the_decoded_budget() {

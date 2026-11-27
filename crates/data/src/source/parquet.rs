@@ -1035,9 +1035,12 @@ fn err(e: parquet::errors::ParquetError) -> DataError {
     DataError::Format(format!("GeoParquet: {e}"))
 }
 
-/// [`err`] for an error met in `place` (a row group and column, or `""` when not known).
-fn err_in(place: &str, e: parquet::errors::ParquetError) -> DataError {
-    if place.is_empty() { err(e) } else { DataError::Format(format!("GeoParquet: {place}: {e}")) }
+/// [`err`] for an error met in `place` (a row group and column), when it is known.
+fn err_in(place: Option<&str>, e: parquet::errors::ParquetError) -> DataError {
+    match place {
+        Some(place) => DataError::Format(format!("GeoParquet: {place}: {e}")),
+        None => err(e),
+    }
 }
 
 /// The reader of a row group's column, its pages checked by [`CheckedPages`] (a page no bigger
@@ -1068,6 +1071,7 @@ fn column_reader_within(rg: &dyn RowGroupReader, col: usize, limit: u64) -> Resu
         delta_declared: chunk.encodings().any(|e| e == Encoding::DELTA_BYTE_ARRAY),
         max_def: desc.max_def_level(),
         max_rep: desc.max_rep_level(),
+        chunk_values: u64::try_from(chunk.num_values()).ok().filter(|&n| n > 0).unwrap_or(u64::MAX),
         note: note.clone(),
     };
     Ok((parquet::column::reader::get_column_reader(desc, Box::new(pages)), note))
@@ -1088,6 +1092,9 @@ struct PageNote {
     peeked: std::sync::atomic::AtomicUsize,
     /// Such a call was stopped at a page it would only have skipped part of.
     stopped: std::sync::atomic::AtomicBool,
+    /// What the read's budget has left, as the column's values are charged (everything until a read
+    /// says): the decoder's own arrays for a page are held against it.
+    left: std::sync::atomic::AtomicU64,
 }
 
 /// [`PageNote::skip_left`] when no skip is passing over whole pages.
@@ -1102,6 +1109,7 @@ impl Default for PageNote {
             passed: Default::default(),
             peeked: Default::default(),
             stopped: Default::default(),
+            left: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 }
@@ -1148,7 +1156,7 @@ impl Pace<'_> {
     /// Ends a skip call that [`skip`](Self::skip) asked for, which `result` is the outcome of: the
     /// values it skipped, whether it was stopped at a page it would only have skipped part of (the
     /// whole pages before that count).
-    fn skipped(&self, place: &str, result: parquet::errors::Result<usize>) -> Result<(usize, bool)> {
+    fn skipped(&self, place: Option<&str>, result: parquet::errors::Result<usize>) -> Result<(usize, bool)> {
         let Some((note, _)) = self.watch else { return result.map(|n| (n, false)).map_err(|e| err_in(place, e)) };
         note.skip_left.store(NOT_SKIPPING, Ordering::Relaxed);
         match result {
@@ -1185,6 +1193,8 @@ struct CheckedPages {
     /// The most levels the column's values have, for a version 1 page's level streams.
     max_def: i16,
     max_rep: i16,
+    /// The values the column chunk's footer says it holds, when it says (levels included).
+    chunk_values: u64,
     note: Arc<PageNote>,
 }
 
@@ -1200,27 +1210,38 @@ impl Iterator for CheckedPages {
 
 impl CheckedPages {
     /// Refuses a DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY data page whose streams say they hold
-    /// more values than the page does or its bytes can, or can't be read: the crate's decoders make
-    /// an array of that count (4 bytes a value) before decoding a value, and a few bytes can ask for
-    /// gigabytes. See [`delta_stream`] for what is checked.
+    /// more values than the page or the column chunk does, or whose arrays the decoder would make
+    /// for them (4 bytes a value for each stream, `parquet` 60.2.0 `set_data`) are more than the
+    /// budget has left, or can't be read as a stream: the decoders size those arrays from the count
+    /// in the stream before decoding a value, and a few bytes can ask for gigabytes. See
+    /// [`delta_stream`] for what is checked of a stream.
     fn check_delta(&self, page: &parquet::column::page::Page) -> parquet::errors::Result<()> {
         use parquet::column::page::Page;
         let (buf, num_values, encoding, levels) = match page {
             Page::DataPage { buf, num_values, encoding, def_level_encoding, rep_level_encoding, .. } => {
+                if !matches!(encoding, Encoding::DELTA_BYTE_ARRAY | Encoding::DELTA_LENGTH_BYTE_ARRAY) {
+                    return Ok(());
+                }
+                // Each level stream in front of the values, as the crate's `parse_v1_level` sizes it.
                 let mut at = 0usize;
                 for (max, level_encoding) in [(self.max_rep, rep_level_encoding), (self.max_def, def_level_encoding)] {
-                    if max > 0 {
-                        if *level_encoding != Encoding::RLE {
-                            return Err(delta_err("its levels are not RLE, so where its values start can't be told"));
-                        }
-                        let len = buf
-                            .get(at..at.saturating_add(4))
-                            .and_then(|b| <[u8; 4]>::try_from(b).ok())
-                            .map(u32::from_le_bytes)
-                            .and_then(|n| usize::try_from(n).ok())
-                            .ok_or_else(|| delta_err("its levels are cut off"))?;
-                        at = at.saturating_add(4).saturating_add(len);
+                    if max <= 0 {
+                        continue;
                     }
+                    #[expect(deprecated, reason = "BIT_PACKED levels are deprecated but still read")]
+                    let bit_packed = Encoding::BIT_PACKED;
+                    let len = if *level_encoding == Encoding::RLE {
+                        let prefix = buf.get(at..at.saturating_add(4)).and_then(|b| <[u8; 4]>::try_from(b).ok());
+                        let len = prefix.map(u32::from_le_bytes).and_then(|n| usize::try_from(n).ok());
+                        len.and_then(|n| n.checked_add(4)).ok_or_else(|| delta_err("its levels are cut off"))?
+                    } else if *level_encoding == bit_packed {
+                        let bits = u64::from(u64::BITS - u64::try_from(max).unwrap_or(0).leading_zeros());
+                        let bytes = (u64::from(*num_values).saturating_mul(bits)).div_ceil(8);
+                        usize::try_from(bytes).map_err(|_| delta_err("its levels are cut off"))?
+                    } else {
+                        return Err(delta_err(&format!("its levels are in the {level_encoding} encoding, which a page can't have")));
+                    };
+                    at = at.saturating_add(len);
                 }
                 (buf, *num_values, *encoding, at)
             }
@@ -1234,12 +1255,19 @@ impl CheckedPages {
             return Ok(());
         }
         let values = buf.get(levels..).ok_or_else(|| delta_err("its levels are longer than the page"))?;
-        let max = u64::from(num_values);
-        let (count, end) = delta_stream(values, max, self.limit)?;
-        if encoding == Encoding::DELTA_BYTE_ARRAY {
+        let delta = encoding == Encoding::DELTA_BYTE_ARRAY;
+        let bounds = DeltaBounds {
+            page: u64::from(num_values),
+            chunk: self.chunk_values,
+            left: self.limit.min(self.note.left.load(Ordering::Relaxed)),
+            // A DELTA_BYTE_ARRAY page makes an array for its prefix lengths and one for its suffix lengths.
+            per_value: if delta { 8 } else { 4 },
+        };
+        let (count, end) = delta_stream(values, &bounds)?;
+        if delta {
             // The prefix lengths are followed by the suffixes, a DELTA_LENGTH_BYTE_ARRAY stream of as many.
             let rest = values.get(end..).ok_or_else(|| delta_err("its prefix lengths run past the page"))?;
-            let (suffixes, _) = delta_stream(rest, max, self.limit)?;
+            let (suffixes, _) = delta_stream(rest, &bounds)?;
             if suffixes != count {
                 return Err(delta_err(&format!("it has {count} prefix lengths and {suffixes} suffixes")));
             }
@@ -1252,14 +1280,26 @@ fn delta_err(what: &str) -> parquet::errors::ParquetError {
     parquet::errors::ParquetError::General(format!("a delta page is refused: {what}"))
 }
 
+/// What a delta stream's count may be.
+struct DeltaBounds {
+    /// The values of the page (levels included).
+    page: u64,
+    /// The values of the column chunk.
+    chunk: u64,
+    /// What the budget has left.
+    left: u64,
+    /// The bytes the decoders make an array of for each value of a page.
+    per_value: u64,
+}
+
 /// One ULEB128 number at `at` of `data`, moving `at` past it (`None` when it is cut off or longer
-/// than the 10 bytes the crate reads: it stops with a panic at an 11th).
+/// than the 10 bytes the crate reads: it panics at an 11th).
 fn uleb(data: &[u8], at: &mut usize) -> Option<u64> {
     let mut value = 0u64;
-    for i in 0..10u32 {
+    for shift in (0..70).step_by(7) {
         let byte = *data.get(*at)?;
         *at += 1;
-        value |= u64::from(byte & 0x7f).checked_shl(7 * i)?;
+        value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Some(value);
         }
@@ -1268,14 +1308,13 @@ fn uleb(data: &[u8], at: &mut usize) -> Option<u64> {
 }
 
 /// Reads the layout of the DELTA_BINARY_PACKED stream at the start of `data` as the crate's
-/// `DeltaBitPackDecoder` does, without decoding a value: its header (block size, miniblocks per
-/// block, the count of values, the first value), then each block's minimum delta and miniblock bit
-/// widths, to where the stream ends. It returns the count and the end offset. The stream is refused
-/// when the count is more than `max_values` (the page's value count) or more than `limit` bytes
-/// make as 4-byte lengths (what the decoder allocates), when the blocks it needs don't fit in
-/// `data`, or when anything is cut off or the sizes aren't the multiples the format needs. The
-/// crate's decoders trust all of that when they size their arrays, and panic on some of it.
-fn delta_stream(data: &[u8], max_values: u64, limit: u64) -> parquet::errors::Result<(u64, usize)> {
+/// `DeltaBitPackDecoder` does, without decoding a value: the header (block size, miniblocks per
+/// block, count of values, first value), then each block's minimum delta and miniblock bit widths.
+/// It returns the count and the offset where the stream ends. It refuses a stream whose count is
+/// more than `bounds` allow, whose blocks don't fit in `data`, or that is cut off or not the sizes
+/// the format needs: the crate's decoders trust all of that when they size their arrays, and panic
+/// on some of it.
+fn delta_stream(data: &[u8], bounds: &DeltaBounds) -> parquet::errors::Result<(u64, usize)> {
     let mut at = 0usize;
     let cut = || delta_err("a stream header is cut off or malformed");
     let block = uleb(data, &mut at).ok_or_else(cut)?;
@@ -1290,24 +1329,26 @@ fn delta_stream(data: &[u8], max_values: u64, limit: u64) -> parquet::errors::Re
     {
         return Err(delta_err(&format!("its block of {block} values in {mini_blocks} miniblocks is not one the format allows")));
     }
-    if count > max_values {
-        return Err(delta_err(&format!("a stream says it holds {count} values, more than the page's {max_values} values")));
+    if count > bounds.page {
+        return Err(delta_err(&format!("a stream says it holds {count} values, more than the page's {}", bounds.page)));
     }
-    if count.saturating_mul(4) > limit {
-        return Err(parquet::errors::ParquetError::General(format!(
-            "a delta page's stream says it holds {count} values, whose lengths are more than the {limit} byte decoded-column budget"
+    if count > bounds.chunk {
+        return Err(delta_err(&format!("a stream says it holds {count} values, more than the column chunk's {}", bounds.chunk)));
+    }
+    if count.saturating_mul(bounds.per_value) > bounds.left {
+        return Err(delta_err(&format!(
+            "a stream says it holds {count} values, whose arrays of {} bytes each are more than the {} bytes the decoded-column budget has left",
+            bounds.per_value, bounds.left
         )));
     }
     let per_mini = block / mini_blocks;
     let widths = usize::try_from(mini_blocks).map_err(|_| cut())?;
     let mut left = count.saturating_sub(1);
     while left > 0 {
-        uleb(data, &mut at)
-            .ok_or_else(|| delta_err(&format!("its {count} values need more blocks than its {} bytes can hold", data.len())))?;
+        let short = || delta_err(&format!("its {count} values need more blocks than its {} bytes can hold", data.len()));
+        uleb(data, &mut at).ok_or_else(short)?;
         let end = at.checked_add(widths).ok_or_else(cut)?;
-        let bits = data
-            .get(at..end)
-            .ok_or_else(|| delta_err(&format!("its {count} values need more blocks than its {} bytes can hold", data.len())))?;
+        let bits = data.get(at..end).ok_or_else(short)?;
         at = end;
         let mut packed = 0u64;
         for &width in bits {
@@ -1622,7 +1663,7 @@ fn field_type(c: &ColumnDescPtr) -> Option<FieldType> {
 /// rows not taken are skipped without being decoded into values, so a sample of a large row
 /// group doesn't hold all of it.
 fn read_column<T: PqType>(r: &mut ColumnReaderImpl<T>, take: &[bool], max_def: i16) -> Result<Vec<Option<T::T>>> {
-    read_column_with(r, take, max_def, &Pace { watch: None }, "", &mut |_| Ok(()))
+    read_column_with(r, take, max_def, &Pace { watch: None }, None, &mut |_| Ok(()))
 }
 
 /// Forgets the longest skip this thread has made, for tests.
@@ -1665,7 +1706,7 @@ fn read_column_with<T: PqType>(
     take: &[bool],
     max_def: i16,
     pace: &Pace,
-    place: &str,
+    place: Option<&str>,
     charge: &mut dyn FnMut(&T::T) -> Result<()>,
 ) -> Result<Vec<Option<T::T>>> {
     let wanted = take.iter().filter(|&&t| t).count();
@@ -1934,8 +1975,11 @@ fn read_binary(
     let delta = chunk.encodings().any(|e| e == Encoding::DELTA_BYTE_ARRAY);
     let pace = Pace { watch: delta.then_some((&*note, budget)) };
     let place = format!("row group {}, column '{name}'", budget.group);
-    read_column_with(&mut r, take, chunk.column_descr().max_def_level(), &pace, &place, &mut |b: &ByteArray| {
-        budget.charge(size(b.data()), &name)
+    note.left.store(budget.left.get(), Ordering::Relaxed);
+    read_column_with(&mut r, take, chunk.column_descr().max_def_level(), &pace, Some(&place), &mut |b: &ByteArray| {
+        budget.charge(size(b.data()), &name)?;
+        note.left.store(budget.left.get(), Ordering::Relaxed);
+        Ok(())
     })
     .map(Some)
 }
@@ -2599,6 +2643,7 @@ mod tests {
             delta_declared,
             max_def: 0,
             max_rep: 0,
+            chunk_values: u64::MAX,
             note: Arc::new(PageNote::default()),
         }
         .get_next_page()
@@ -2658,6 +2703,7 @@ mod tests {
                 delta_declared: false,
                 max_def: 0,
                 max_rep: 0,
+                chunk_values: u64::MAX,
                 note: note.clone(),
             };
             assert!(pages.get_next_page().unwrap().is_some());
@@ -2753,53 +2799,205 @@ mod tests {
         }
     }
 
+    /// `page` through [`CheckedPages`] of a column with `max_def` levels, in a chunk of `chunk_values`
+    /// values, with `left` bytes of budget.
+    fn checked_in(page: Page, max_def: i16, chunk_values: u64, left: u64) -> parquet::errors::Result<Option<Page>> {
+        let note = Arc::new(PageNote::default());
+        note.left.store(left, Ordering::Relaxed);
+        CheckedPages {
+            pages: Box::new(Pages(vec![page].into_iter())),
+            bits: 32,
+            limit: u64::MAX,
+            chunk_bytes: None,
+            delta_declared: true,
+            max_def,
+            max_rep: 0,
+            chunk_values,
+            note,
+        }
+        .get_next_page()
+    }
+
+    /// A version 1 delta page of a column with a definition level, its levels `levels` in front.
+    fn delta_page_with_levels(levels: Vec<u8>, values: Vec<u8>, num_values: u32, def_level_encoding: Encoding) -> Page {
+        Page::DataPage {
+            buf: Bytes::from([levels, values].concat()),
+            num_values,
+            encoding: Encoding::DELTA_BYTE_ARRAY,
+            def_level_encoding,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        }
+    }
+
+    /// The two streams of a DELTA_BYTE_ARRAY page of `count` values, then `tail` bytes.
+    fn delta_bytes(count: u32, widths: [u8; 4], tail: &[u8]) -> Vec<u8> {
+        [delta_bits(count, 0, widths), delta_bits(count, 4, widths), tail.to_vec()].concat()
+    }
+
     /// A delta page whose count is more than its values, or more than its bytes can hold, or whose
     /// header is cut off or malformed, is refused before the crate's decoder sizes an array from the
-    /// count (a few bytes can say two billion values), and a sound one is handed over.
+    /// count (a few bytes can say two billion values), and a sound one is handed over. Each refusal
+    /// says which of these it is.
     #[test]
     fn checked_pages_refuse_a_delta_page_with_a_count_its_bytes_cannot_hold() {
         let huge = delta_head(i32::MAX as u32, 0);
-        let mut sound = delta_flat(3, 0);
-        sound.extend(delta_flat(3, 4));
-        sound.extend_from_slice(b"ababab");
+        let delta = Encoding::DELTA_BYTE_ARRAY;
+        let lengths = Encoding::DELTA_LENGTH_BYTE_ARRAY;
+        let sound = delta_bytes(3, [0; 4], b"ababab");
+        // Widths that need bits, over several blocks.
+        let wide = delta_bytes(300, [3, 0, 5, 7], b"");
         for v2 in [false, true] {
-            // The two streams of DELTA_BYTE_ARRAY (levels first, in version 2 and in version 1 of a required column: none).
+            // Level bytes in front, in version 2 (a version 1 page of a column without levels has none).
             for levels in [0, 2] {
                 if !v2 && levels > 0 {
                     continue;
                 }
+                let at = format!("v2 {v2} levels {levels}");
                 let page = |values: Vec<u8>, n: u32, e| delta_page(levels, values, n, e, v2);
                 let refused = |values: Vec<u8>, n: u32, e| checked(page(values, n, e), None, 1 << 30, true).unwrap_err().to_string();
-                let delta = Encoding::DELTA_BYTE_ARRAY;
-                let lengths = Encoding::DELTA_LENGTH_BYTE_ARRAY;
-                let error = refused(huge.clone(), 3, delta);
-                assert!(error.contains("more than the page's 3 values"), "v2 {v2} {levels}: {error}");
-                let error = refused(huge.clone(), 3, lengths);
-                assert!(error.contains("more than the page's 3 values"), "v2 {v2} {levels}: {error}");
+                let says = |error: String, what: &str| {
+                    assert!(error.contains(&format!("a delta page is refused: {what}")), "{at}: {error} -- wanted {what}")
+                };
+                says(refused(huge.clone(), 3, delta), "a stream says it holds 2147483647 values, more than the page's 3");
+                says(refused(huge.clone(), 3, lengths), "a stream says it holds 2147483647 values, more than the page's 3");
                 // A count the page's own value count allows, but its few bytes can't hold.
-                let error = refused([delta_head(1000, 0), vec![0; 5]].concat(), 1000, delta);
-                assert!(error.contains("need more"), "v2 {v2} {levels}: {error}");
-                // The decoder's array of that count, more than the budget allows.
-                let error = checked(page(delta_flat(1 << 20, 0), 1 << 20, delta), None, 1 << 10, true).unwrap_err().to_string();
-                assert!(error.contains("decoded-column budget"), "v2 {v2} {levels}: {error}");
-                // Cut off in its header, a miniblock width or its data, or not a header at all.
-                for cut in [0, 1, 2, 4, 6, 7] {
-                    let error = refused(delta_flat(3, 0)[..cut].to_vec(), 3, delta);
-                    assert!(error.contains("delta"), "v2 {v2} {levels} cut {cut}: {error}");
+                says(
+                    refused([delta_head(1000, 0), vec![0; 5]].concat(), 1000, delta),
+                    "its 1000 values need more blocks than its 11 bytes can hold",
+                );
+                // The decoder's arrays for that count, more than the budget has.
+                let error = checked_in(page(delta_flat(1 << 20, 0), 1 << 20, lengths), 0, u64::MAX, 1 << 10).unwrap_err().to_string();
+                says(
+                    error,
+                    "a stream says it holds 1048576 values, whose arrays of 4 bytes each are more than the 1024 bytes the decoded-column budget has left",
+                );
+                // Cut off in its header, a block's minimum delta or widths, or not a header at all.
+                let flat = delta_flat(3, 0);
+                for (cut, what) in [
+                    (0, "a stream header is cut off or malformed"),
+                    (2, "a stream header is cut off or malformed"),
+                    (4, "a stream header is cut off or malformed"),
+                    (5, "its 3 values need more blocks than its 5 bytes can hold"),
+                    (7, "its 3 values need more blocks than its 7 bytes can hold"),
+                    (9, "its 3 values need more blocks than its 9 bytes can hold"),
+                ] {
+                    says(refused(flat[..cut].to_vec(), 3, delta), what);
                 }
-                let error = refused(vec![0x80; 12], 3, delta);
-                assert!(error.contains("delta"), "v2 {v2} {levels}: {error}");
-                let error = refused(vec![0x81, 0x01, 0x04, 0x03, 0x00], 3, delta);
-                assert!(error.contains("delta"), "a block size that is not a multiple of 128: {error}");
-                // The second stream's count must be the first's.
-                let mut odd = delta_flat(3, 0);
-                odd.extend(delta_flat(2, 4));
-                let error = refused(odd, 3, delta);
-                assert!(error.contains("delta"), "v2 {v2} {levels}: {error}");
-                // Sound pages go through.
-                assert!(checked(page(sound.clone(), 3, delta), None, 1 << 30, true).unwrap().is_some(), "v2 {v2} {levels}");
-                assert!(checked(page(delta_flat(3, 4), 3, lengths), None, 1 << 30, true).unwrap().is_some(), "v2 {v2} {levels}");
+                says(refused(vec![0x80; 12], 3, delta), "a stream header is cut off or malformed");
+                says(
+                    refused(vec![0x81, 0x01, 0x04, 0x03, 0x00], 3, delta),
+                    "its block of 129 values in 4 miniblocks is not one the format allows",
+                );
+                says(
+                    refused(vec![0x80, 0x01, 0x00, 0x03, 0x00], 3, delta),
+                    "its block of 128 values in 0 miniblocks is not one the format allows",
+                );
+                says(
+                    refused(vec![0x80, 0x01, 0x03, 0x03, 0x00], 3, delta),
+                    "its block of 128 values in 3 miniblocks is not one the format allows",
+                );
+                // A width above 32, and packed bytes the page doesn't have.
+                let mut wide_bits = delta_flat(3, 0);
+                wide_bits[6] = 33;
+                says(refused(wide_bits, 3, delta), "a miniblock has a bit width of 33, more than 32");
+                let mut packed = delta_bits(3, 0, [3, 0, 0, 0]);
+                packed.truncate(packed.len() - 1);
+                says(refused(packed, 3, delta), "its 3 values need more bytes than the page's 21 bytes can hold");
+                // The two streams' counts must agree.
+                let odd = [delta_flat(3, 0), delta_flat(2, 4)].concat();
+                says(refused(odd, 3, delta), "it has 3 prefix lengths and 2 suffixes");
+                // Sound pages go through, and so does a column of nothing but nulls.
+                for (values, n) in
+                    [(sound.clone(), 3), (wide.clone(), 300), (delta_bytes(0, [0; 4], b""), 3), (delta_bytes(1, [0; 4], b"a"), 1)]
+                {
+                    assert!(checked(page(values, n, delta), None, 1 << 30, true).unwrap().is_some(), "{at}");
+                }
+                assert!(checked(page(delta_flat(3, 4), 3, lengths), None, 1 << 30, true).unwrap().is_some(), "{at}");
             }
+        }
+    }
+
+    /// Levels in front of a version 1 page's values: an RLE stream with its length, in the order
+    /// the crate reads them, and a page with them cut off or in no encoding a page has is refused.
+    #[test]
+    fn checked_pages_find_the_values_after_a_version_one_pages_levels() {
+        let sound = delta_bytes(300, [3, 0, 5, 7], b"");
+        let rle = |bytes: &[u8]| [u32::try_from(bytes.len()).unwrap().to_le_bytes().to_vec(), bytes.to_vec()].concat();
+        let page = |levels: Vec<u8>, values: Vec<u8>, encoding| delta_page_with_levels(levels, values, 300, encoding);
+        // A definition level stream of 3 bytes, then the values.
+        assert!(checked_in(page(rle(&[1, 2, 3]), sound.clone(), Encoding::RLE), 1, u64::MAX, u64::MAX).unwrap().is_some());
+        assert!(checked_in(page(rle(&[]), sound.clone(), Encoding::RLE), 1, u64::MAX, u64::MAX).unwrap().is_some());
+        let error = checked_in(page(vec![9, 0], vec![], Encoding::RLE), 1, u64::MAX, u64::MAX).unwrap_err().to_string();
+        assert!(error.contains("a delta page is refused: its levels are cut off"), "{error}");
+        let error = checked_in(page(rle(&[1]), sound.clone(), Encoding::PLAIN), 1, u64::MAX, u64::MAX).unwrap_err().to_string();
+        assert!(error.contains("its levels are in the PLAIN encoding, which a page can't have"), "{error}");
+        // A level length that runs past the page.
+        let error = checked_in(page(vec![0xff, 0xff, 0xff, 0x7f], sound, Encoding::RLE), 1, u64::MAX, u64::MAX).unwrap_err().to_string();
+        assert!(error.contains("its levels are longer than the page"), "{error}");
+    }
+
+    /// A stream says it holds more values than the column chunk does: refused, though the page's own
+    /// count allows it; and one the budget left can't hold the arrays of, though the whole limit could.
+    #[test]
+    fn checked_pages_hold_a_delta_count_to_the_chunk_and_the_budget_left() {
+        let values = delta_bytes(300, [3, 0, 5, 7], b"");
+        let page = || delta_page(0, values.clone(), 300, Encoding::DELTA_BYTE_ARRAY, true);
+        assert!(checked_in(page(), 0, 300, 2400).unwrap().is_some());
+        let error = checked_in(page(), 0, 299, u64::MAX).unwrap_err().to_string();
+        assert!(error.contains("more than the column chunk's 299"), "{error}");
+        let error = checked_in(page(), 0, 300, 2399).unwrap_err().to_string();
+        assert!(error.contains("the 2399 bytes the decoded-column budget has left"), "{error}");
+    }
+
+    /// The layout `delta_stream` reads agrees with a real writer's: the count and the end of the
+    /// stream (the page holds nothing else) for many shapes of values, in pages of one stream.
+    #[test]
+    fn delta_stream_ends_where_the_writer_ended_it() {
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field as AField, Schema};
+        use parquet::file::reader::{FileReader as _, SerializedFileReader};
+        let wide: Vec<i32> = (0..5000).map(|i| (i * 7919) % 100_003 - 50_000).collect();
+        let shapes: Vec<Vec<i32>> = vec![
+            vec![5],
+            vec![5, 5],
+            vec![0; 127],
+            vec![3; 128],
+            vec![3; 129],
+            (0..300).collect(),
+            (0..1000).map(|i| i * i % 1009).collect(),
+            wide,
+            (0..4096).map(|i| if i % 2 == 0 { i32::MAX - i } else { i32::MIN + i }).collect(),
+        ];
+        for values in shapes {
+            let schema = Arc::new(Schema::new(vec![AField::new("v", DataType::Int32, false)]));
+            let column: ArrayRef = Arc::new(Int32Array::from(values.clone()));
+            let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+            let props = ::parquet::file::properties::WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::DELTA_BINARY_PACKED)
+                .set_data_page_row_count_limit(usize::MAX)
+                .set_data_page_size_limit(usize::MAX)
+                .build();
+            let mut bytes = Vec::new();
+            let mut writer = ::parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let reader = SerializedFileReader::new(Bytes::from(bytes)).unwrap();
+            let mut pages = reader.get_row_group(0).unwrap().get_column_page_reader(0).unwrap();
+            let mut seen = 0;
+            while let Some(page) = pages.get_next_page().unwrap() {
+                if let Page::DataPage { buf, num_values, .. } | Page::DataPageV2 { buf, num_values, .. } = &page {
+                    let bounds = DeltaBounds { page: u64::MAX, chunk: u64::MAX, left: u64::MAX, per_value: 4 };
+                    let (count, end) = delta_stream(buf, &bounds).unwrap();
+                    assert_eq!((count, end), (u64::from(*num_values), buf.len()), "{} values", values.len());
+                    // With bytes after it the stream still ends in the same place.
+                    let longer = [buf.to_vec(), vec![0xAB; 9]].concat();
+                    assert_eq!(delta_stream(&longer, &bounds).unwrap(), (count, end), "{} values", values.len());
+                    seen += 1;
+                }
+            }
+            assert!(seen > 0);
         }
     }
 
@@ -2829,7 +3027,7 @@ mod tests {
         sound.extend_from_slice(b"ababab");
         let mut buf = vec![0b101u8];
         buf.extend(sound);
-        #[expect(deprecated)]
+        #[expect(deprecated, reason = "BIT_PACKED levels are deprecated but still read")]
         let def_level_encoding = Encoding::BIT_PACKED;
         let page = Page::DataPage {
             buf: Bytes::from(buf),
@@ -2847,6 +3045,7 @@ mod tests {
             delta_declared: true,
             max_def: 1,
             max_rep: 0,
+            chunk_values: u64::MAX,
             note: Arc::new(PageNote::default()),
         };
         assert!(pages.get_next_page().unwrap().is_some());
@@ -2893,6 +3092,7 @@ mod tests {
             delta_declared: true,
             max_def: 0,
             max_rep: 0,
+            chunk_values: u64::MAX,
             note: note.clone(),
         };
         let budget = Budget::new(1 << 20, 0);
@@ -2908,15 +3108,15 @@ mod tests {
         }
         // 2 values of the run are left, the next page holds 4: the skip stops there.
         assert!(pages.peek_next_page().is_err());
-        let (skipped, stopped) = pace.skipped("", Err(parquet::errors::ParquetError::General("stop".into()))).unwrap();
+        let (skipped, stopped) = pace.skipped(None, Err(parquet::errors::ParquetError::General("stop".into()))).unwrap();
         assert_eq!((skipped, stopped), (8, true));
         assert_eq!(note.skip_left.load(Ordering::Relaxed), NOT_SKIPPING);
         assert_eq!(pages.peek_next_page().unwrap().and_then(|m| m.num_rows), Some(4), "nothing was fetched");
         assert_eq!(pace.skip(2), 1, "the page is then taken a value at a time");
         // Another error is the caller's.
         assert_eq!(pace.skip(3), 3);
-        assert!(pace.skipped("", Err(parquet::errors::ParquetError::General("other".into()))).is_err());
-        assert_eq!(pace.skipped("", Ok(3)).unwrap(), (3, false));
+        assert!(pace.skipped(None, Err(parquet::errors::ParquetError::General("other".into()))).is_err());
+        assert_eq!(pace.skipped(None, Ok(3)).unwrap(), (3, false));
     }
 
     /// A DELTA_BYTE_ARRAY column takes one value at a page's start, then no more than its page
