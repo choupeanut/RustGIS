@@ -5338,6 +5338,38 @@ fn parquet_version_two_pages_read_within_the_decoded_budget() {
     }
 }
 
+/// Text that is invalid UTF-8 grows when it is made a `String` (each bad sequence becomes the
+/// three bytes of U+FFFD), so the budget counts the converted length, not the stored one (#2913).
+#[test]
+fn parquet_invalid_text_is_charged_at_its_converted_length() {
+    use ::parquet::data_type::{ByteArray, ByteArrayType};
+    use ::parquet::file::writer::SerializedFileWriter;
+    let schema =
+        ::parquet::schema::parser::parse_message_type("message m { REQUIRED BINARY geometry; OPTIONAL BINARY label (STRING); }").unwrap();
+    let mut bytes = Vec::new();
+    let mut w = SerializedFileWriter::new(&mut bytes, Arc::new(schema), Arc::default()).unwrap();
+    let mut rg = w.next_row_group().unwrap();
+    let geom = ByteArray::from(wkb::encode(&Geometry::Point(Coord::new(0.0, 0.0))));
+    let mut col = rg.next_column().unwrap().unwrap();
+    col.typed::<ByteArrayType>().write_batch(&vec![geom; 20], None, None).unwrap();
+    col.close().unwrap();
+    // 20 values of 256 bytes that are not UTF-8: 5,120 stored, 15,360 once each byte is U+FFFD.
+    let bad = ByteArray::from(vec![0xffu8; 256]);
+    let mut col = rg.next_column().unwrap().unwrap();
+    col.typed::<ByteArrayType>().write_batch(&vec![bad; 20], Some(&[1; 20]), None).unwrap();
+    col.close().unwrap();
+    rg.close().unwrap();
+    w.close().unwrap();
+    let whole = Request { extent: None, limit: 100, own: None };
+    let source = parquet::ParquetSource::open_bytes(bytes.clone(), "m").unwrap().with_decoded_bytes(8 << 10);
+    let error = source.read(&whole).unwrap_err().to_string();
+    assert!(error.contains("decoded-column budget") && error.contains("label"), "{error}");
+    let source = parquet::ParquetSource::open_bytes(bytes, "m").unwrap().with_decoded_bytes(32 << 10);
+    let batch = source.read(&whole).unwrap();
+    assert_eq!(batch.features.len(), 20);
+    assert_eq!(batch.features[0].attrs[0], Value::Text("\u{fffd}".repeat(256)));
+}
+
 /// A page of more than the budget is refused, whatever the rows taken.
 #[test]
 fn parquet_page_over_the_budget_is_refused() {
