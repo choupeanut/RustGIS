@@ -796,6 +796,9 @@ impl FeatureSource for ParquetSource {
                         mine.push(i);
                     }
                 }
+                if mine.is_empty() {
+                    continue;
+                }
                 let attrs: Vec<ColumnValues> =
                     self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &chosen, &budget)).collect::<Result<_>>()?;
                 if attrs.iter().any(|a| a.values.len() != mine.len()) {
@@ -956,14 +959,23 @@ impl FeatureSource for ParquetSource {
                     if let Some(c) = chosen.get_mut(r) {
                         *c = true;
                     }
-                    found.push((r, geometry.map(|p| p.geometry)));
+                    found.push((k, r));
+                }
+                if found.is_empty() {
+                    continue;
                 }
                 let attrs: Vec<ColumnValues> =
                     self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &chosen, &budget)).collect::<Result<_>>()?;
                 if attrs.iter().any(|a| a.values.len() != found.len()) {
                     return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
                 }
-                for (n, (r, geometry)) in found.into_iter().enumerate() {
+                // Decoded again for the rows found, so no decoded geometry outlives the first pass.
+                for (n, (k, r)) in found.into_iter().enumerate() {
+                    let geometry = geoms
+                        .get(k)
+                        .and_then(|b| b.as_deref())
+                        .and_then(|bytes| wkb::decode(bytes).and_then(|geom| self.reproject.place(geom, &req)))
+                        .map(|p| p.geometry);
                     let values = attrs
                         .iter()
                         .enumerate()
@@ -2057,7 +2069,8 @@ fn text_len(bytes: &[u8]) -> usize {
 /// of another type). Only the rows taken count, not the
 /// column chunk's size; a page of more than the budget is refused, as the `parquet` crate makes
 /// room for a whole page. A column with DELTA_BYTE_ARRAY pages, whose values the decoder builds
-/// one by one, or DELTA_LENGTH_BYTE_ARRAY pages, whose length arrays are made as a page is fetched, is read at the [`Pace`] its page size and the budget left allow.
+/// one by one, or DELTA_LENGTH_BYTE_ARRAY pages, whose length arrays are made as a page is
+/// fetched, is read at the [`Pace`] its page size and the budget left allow.
 fn read_binary(
     rg: &dyn RowGroupReader,
     col: usize,

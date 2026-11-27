@@ -5542,7 +5542,7 @@ fn parquet_late_view_charges_only_the_rows_it_keeps() {
     let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("label", FieldType::Text)]);
     for i in 0..20 {
         // Row 7 is the one point in the view (latitude 0); the others are at latitude 40.
-        let (lat, label) = if i == 7 { (0.0, "hit".to_string()) } else { (40.0, "x".repeat(1024)) };
+        let (lat, label) = if i == 7 { (0.0, "hit7".to_string()) } else { (40.0, "x".repeat(1024)) };
         ds.push(Some(Geometry::Point(Coord::new(-81.0, lat))), vec![Value::Text(label)]);
     }
     write_unbounded_view_fixture(&ds, &p);
@@ -5551,7 +5551,7 @@ fn parquet_late_view_charges_only_the_rows_it_keeps() {
     let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_decoded_bytes(8 << 10);
     let batch = source.read(&req).unwrap();
     assert_eq!((batch.matched, batch.features.len()), (1, 1));
-    assert_eq!((batch.features[0].id, &batch.features[0].attrs[0]), (8, &Value::Text("hit".into())));
+    assert_eq!((batch.features[0].id, &batch.features[0].attrs[0]), (8, &Value::Text("hit7".into())));
     let mut seen = Vec::new();
     let batch = source
         .visit_chunks(view, 1 << 20, &mut |chunk| {
@@ -5559,7 +5559,7 @@ fn parquet_late_view_charges_only_the_rows_it_keeps() {
             Ok(())
         })
         .unwrap();
-    assert_eq!((batch.matched, seen), (1, vec![(8, Value::Text("hit".into()))]));
+    assert_eq!((batch.matched, seen), (1, vec![(8, Value::Text("hit7".into()))]));
     // Every row is in the view, and the sample keeps one: only its label is charged, and the read
     // is the one the default budget makes.
     let mut all = Dataset::new("pts", GeometryType::Point, vec![Field::new("label", FieldType::Text)]);
@@ -5577,6 +5577,52 @@ fn parquet_late_view_charges_only_the_rows_it_keeps() {
     // Taking every row still stops at the budget.
     let error = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_decoded_bytes(8 << 10).read(&req).unwrap_err().to_string();
     assert!(error.contains("decoded-column budget"), "{error}");
+}
+
+/// A late-filtered read and traversal pair each kept row with its own label and place, across row
+/// groups, when the sample halves as it goes and when only some rows of a group are hits (#2913).
+#[test]
+fn parquet_late_view_pairs_rows_with_their_attributes_across_row_groups() {
+    let p = dir().join("decoded-late-pairs.parquet");
+    let label = |i: usize| format!("L{i:03}");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("label", FieldType::Text)]);
+    for i in 0..40usize {
+        // Every third row is in the view (latitude 0), the others are at latitude 40.
+        let lat = if i % 3 == 0 { 0.0 } else { 40.0 };
+        ds.push(Some(Geometry::Point(Coord::new(-81.0 + i as f64 * 0.01, lat))), vec![Value::Text(label(i))]);
+    }
+    // Row groups of 10 rows, plain text.
+    write_encoded_parquet_fixture(&ds, &p, 10, false, FixturePages::default());
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_decoded_bytes(1 << 20);
+    let view = Some(Extent::new(-120.0, -30.0, 10.0, 30.0));
+    let hits: Vec<usize> = (0..40).filter(|i| i % 3 == 0).collect();
+    // Every hit is kept: its id is its row's, and its label and place are its row's too.
+    let all = source.read(&Request { extent: view, limit: 100, own: None }).unwrap();
+    assert_eq!(all.matched, hits.len() as u64);
+    let ids: Vec<u64> = all.features.iter().map(|f| f.id).collect();
+    assert_eq!(ids, hits.iter().map(|&i| i as u64 + 1).collect::<Vec<_>>());
+    for f in &all.features {
+        assert_eq!(f.attrs[0], Value::Text(label(f.id as usize - 1)), "id {}", f.id);
+    }
+    // A limit under the hits halves the sample while it crosses groups: what is kept is paired still.
+    for limit in [3, 4, 5] {
+        let sampled = source.read(&Request { extent: view, limit, own: None }).unwrap();
+        assert_eq!(sampled.matched, hits.len() as u64, "limit {limit}");
+        assert!(!sampled.features.is_empty() && sampled.features.len() <= limit, "limit {limit}");
+        for f in &sampled.features {
+            assert_eq!(f.attrs[0], Value::Text(label(f.id as usize - 1)), "limit {limit} id {}", f.id);
+            assert!(hits.contains(&(f.id as usize - 1)), "limit {limit} id {}", f.id);
+        }
+    }
+    let mut seen = Vec::new();
+    let batch = source
+        .visit_chunks(view, 1 << 20, &mut |chunk| {
+            seen.extend(chunk.into_iter().map(|f| (f.id, f.attrs[0].clone())));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(batch.matched, hits.len() as u64);
+    assert_eq!(seen, hits.iter().map(|&i| (i as u64 + 1, Value::Text(label(i)))).collect::<Vec<_>>());
 }
 
 /// The geometry and every text field share one budget: each fits it alone, their sum does not, so
@@ -5623,8 +5669,9 @@ fn parquet_delta_length_pages_are_checked_against_what_the_pages_before_left() {
         write_encoded_parquet_fixture(&ds, &p, 5000, false, pages);
         let encodings = text_encodings(&p, "label");
         assert!(encodings.contains(&::parquet::basic::Encoding::DELTA_LENGTH_BYTE_ARRAY), "{encodings:?}");
-        // After the first value 3,000 bytes are left: less than the 4 bytes a value that the next
-        // page's array takes, though all the values together (4,500 bytes) fit what was left before.
+        // After the first value 3,000 bytes are left, fewer than the 4,000 the next page's array
+        // takes (4 bytes a value), though all the values together (4,500 bytes) fit what was left
+        // before it.
         let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_decoded_bytes(geometry + 6000);
         let error = source.read(&whole).unwrap_err().to_string();
         assert!(error.contains("bytes the decoded-column budget has left") && error.contains("column 'label'"), "v2 {v2}: {error}");
