@@ -5595,6 +5595,11 @@ fn parquet_late_view_pairs_rows_with_their_attributes_across_row_groups() {
     write_encoded_parquet_fixture(&ds, &p, 10, false, FixturePages::default());
     let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_decoded_bytes(1 << 20);
     let view = Some(Extent::new(-120.0, -30.0, 10.0, 30.0));
+    // Row i is at longitude -81 + 0.01 i; the file is projected, so compare in longitude/latitude.
+    let at_row = |g: Option<Geometry>, id: u64| match lonlat_of(&source, g) {
+        Some(Geometry::Point(c)) => assert!((c.x - (-81.0 + 0.01 * (id as f64 - 1.0))).abs() < 1e-4, "id {id}: x {}", c.x),
+        other => panic!("id {id}: {other:?}"),
+    };
     let hits: Vec<usize> = (0..40).filter(|i| i % 3 == 0).collect();
     // Every hit is kept: its id is its row's, and its label and place are its row's too.
     let all = source.read(&Request { extent: view, limit: 100, own: None }).unwrap();
@@ -5603,6 +5608,7 @@ fn parquet_late_view_pairs_rows_with_their_attributes_across_row_groups() {
     assert_eq!(ids, hits.iter().map(|&i| i as u64 + 1).collect::<Vec<_>>());
     for f in &all.features {
         assert_eq!(f.attrs[0], Value::Text(label(f.id as usize - 1)), "id {}", f.id);
+        at_row(f.geometry.clone(), f.id);
     }
     // A limit under the hits halves the sample while it crosses groups: what is kept is paired still.
     for limit in [3, 4, 5] {
@@ -5612,16 +5618,21 @@ fn parquet_late_view_pairs_rows_with_their_attributes_across_row_groups() {
         for f in &sampled.features {
             assert_eq!(f.attrs[0], Value::Text(label(f.id as usize - 1)), "limit {limit} id {}", f.id);
             assert!(hits.contains(&(f.id as usize - 1)), "limit {limit} id {}", f.id);
+            at_row(f.geometry.clone(), f.id);
         }
     }
     let mut seen = Vec::new();
     let batch = source
         .visit_chunks(view, 1 << 20, &mut |chunk| {
-            seen.extend(chunk.into_iter().map(|f| (f.id, f.attrs[0].clone())));
+            seen.extend(chunk.into_iter().map(|f| (f.id, f.attrs[0].clone(), f.geometry)));
             Ok(())
         })
         .unwrap();
     assert_eq!(batch.matched, hits.len() as u64);
+    for (id, _, geometry) in &seen {
+        at_row(geometry.clone(), *id);
+    }
+    let seen: Vec<_> = seen.into_iter().map(|(id, label, _)| (id, label)).collect();
     assert_eq!(seen, hits.iter().map(|&i| (i as u64 + 1, Value::Text(label(i)))).collect::<Vec<_>>());
 }
 
