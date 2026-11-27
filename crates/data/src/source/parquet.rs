@@ -1180,7 +1180,7 @@ fn column_reader_within(rg: &dyn RowGroupReader, col: usize, limit: u64) -> Resu
         limit,
         // A footer that gives no size, or a negative one, bounds a page by the limit alone.
         chunk_bytes: u64::try_from(chunk.uncompressed_size()).ok().filter(|&n| n > 0),
-        delta_declared: chunk.encodings().any(|e| matches!(e, Encoding::DELTA_BYTE_ARRAY | Encoding::DELTA_LENGTH_BYTE_ARRAY)),
+        delta_listed: [Encoding::DELTA_BYTE_ARRAY, Encoding::DELTA_LENGTH_BYTE_ARRAY].map(|listed| chunk.encodings().any(|e| e == listed)),
         max_def: desc.max_def_level(),
         max_rep: desc.max_rep_level(),
         chunk_values: u64::try_from(chunk.num_values()).ok().filter(|&n| n > 0).unwrap_or(u64::MAX),
@@ -1289,7 +1289,7 @@ impl Pace<'_> {
 /// A column's pages, a dictionary page refused when it says it holds more values than its bytes
 /// can: the `parquet` crate makes room for the count it is told before decoding any (a few bytes
 /// of header can ask for tens of gigabytes). A page bigger than the column chunk it belongs to or
-/// than `limit`, and a data page in the DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY encoding that the chunk doesn't list, are
+/// than `limit`, and a data page in the DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY encoding that the chunk doesn't list (each encoding on its own), are
 /// refused too: the pace of [`read_binary`] rests on both. The size is checked once the crate has
 /// the page; a header asking for more than the file holds is still allocated by the crate first.
 struct CheckedPages {
@@ -1300,8 +1300,8 @@ struct CheckedPages {
     limit: u64,
     /// The bytes the column chunk's footer says its pages hold decoded, when it says.
     chunk_bytes: Option<u64>,
-    /// The footer lists the DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY encoding for the chunk.
-    delta_declared: bool,
+    /// Whether the footer lists the DELTA_BYTE_ARRAY, and the DELTA_LENGTH_BYTE_ARRAY, encoding for the chunk.
+    delta_listed: [bool; 2],
     /// The most levels the column's values have, for a version 1 page's level streams.
     max_def: i16,
     max_rep: i16,
@@ -1507,10 +1507,9 @@ impl parquet::column::page::PageReader for CheckedPages {
                     self.limit
                 )));
             }
-            if !self.delta_declared
-                && let parquet::column::page::Page::DataPage { encoding, .. } | parquet::column::page::Page::DataPageV2 { encoding, .. } =
-                    page
-                && matches!(encoding, Encoding::DELTA_BYTE_ARRAY | Encoding::DELTA_LENGTH_BYTE_ARRAY)
+            if let parquet::column::page::Page::DataPage { encoding, .. } | parquet::column::page::Page::DataPageV2 { encoding, .. } = page
+                && let Some(at) = [Encoding::DELTA_BYTE_ARRAY, Encoding::DELTA_LENGTH_BYTE_ARRAY].iter().position(|e| e == encoding)
+                && !self.delta_listed.get(at).copied().unwrap_or(false)
             {
                 return Err(parquet::errors::ParquetError::General(format!(
                     "a page uses the {encoding} encoding, which its column chunk doesn't list"
@@ -1521,7 +1520,7 @@ impl parquet::column::page::PageReader for CheckedPages {
                 page
             {
                 #[cfg(test)]
-                if self.delta_declared {
+                if self.delta_listed.contains(&true) {
                     DELTA_PAGES.with(|pages| pages.set(pages.get() + 1));
                 }
                 self.note.page.store(len, Ordering::Relaxed);
@@ -2756,7 +2755,7 @@ mod tests {
             bits: 32,
             limit,
             chunk_bytes,
-            delta_declared,
+            delta_listed: [delta_declared; 2],
             max_def: 0,
             max_rep: 0,
             chunk_values: u64::MAX,
@@ -2821,6 +2820,47 @@ mod tests {
         }
     }
 
+    /// `page` through [`CheckedPages`] of a chunk whose footer lists exactly `listed` among the encodings.
+    fn checked_listing(page: Page, listed: &[Encoding]) -> parquet::errors::Result<Option<Page>> {
+        CheckedPages {
+            pages: Box::new(Pages(vec![page].into_iter())),
+            bits: 32,
+            limit: u64::MAX,
+            chunk_bytes: Some(100),
+            delta_listed: [Encoding::DELTA_BYTE_ARRAY, Encoding::DELTA_LENGTH_BYTE_ARRAY].map(|e| listed.contains(&e)),
+            max_def: 0,
+            max_rep: 0,
+            chunk_values: u64::MAX,
+            note: Arc::new(PageNote::default()),
+        }
+        .get_next_page()
+    }
+
+    /// The page's own encoding must be in the chunk's list: a chunk that lists one delta encoding
+    /// doesn't make a page in the other one declared.
+    #[test]
+    fn checked_pages_refuse_a_delta_page_of_the_other_delta_encoding() {
+        let mut flat = delta_flat(3, 4);
+        flat.extend_from_slice(b"ababab");
+        let mut both = delta_flat(3, 0);
+        both.extend(delta_flat(3, 4));
+        both.extend_from_slice(b"ababab");
+        for v2 in [false, true] {
+            let length = || delta_page(0, flat.clone(), 3, Encoding::DELTA_LENGTH_BYTE_ARRAY, v2);
+            let prefixed = || delta_page(0, both.clone(), 3, Encoding::DELTA_BYTE_ARRAY, v2);
+            let error = checked_listing(length(), &[Encoding::DELTA_BYTE_ARRAY]).unwrap_err().to_string();
+            assert!(error.contains("the DELTA_LENGTH_BYTE_ARRAY encoding, which its column chunk doesn't list"), "v2 {v2}: {error}");
+            let error = checked_listing(prefixed(), &[Encoding::DELTA_LENGTH_BYTE_ARRAY]).unwrap_err().to_string();
+            assert!(error.contains("the DELTA_BYTE_ARRAY encoding, which its column chunk doesn't list"), "v2 {v2}: {error}");
+            assert!(checked_listing(length(), &[Encoding::DELTA_LENGTH_BYTE_ARRAY]).unwrap().is_some(), "v2 {v2}");
+            assert!(checked_listing(prefixed(), &[Encoding::DELTA_BYTE_ARRAY]).unwrap().is_some(), "v2 {v2}");
+            assert!(
+                checked_listing(length(), &[Encoding::DELTA_BYTE_ARRAY, Encoding::DELTA_LENGTH_BYTE_ARRAY]).unwrap().is_some(),
+                "v2 {v2}"
+            );
+        }
+    }
+
     /// A data page tells the pace its size and its values.
     #[test]
     fn checked_pages_note_the_data_page_they_hand_over() {
@@ -2831,7 +2871,7 @@ mod tests {
                 bits: 32,
                 limit: u64::MAX,
                 chunk_bytes: None,
-                delta_declared: false,
+                delta_listed: [false; 2],
                 max_def: 0,
                 max_rep: 0,
                 chunk_values: u64::MAX,
@@ -2940,7 +2980,7 @@ mod tests {
             bits: 32,
             limit: u64::MAX,
             chunk_bytes: None,
-            delta_declared: true,
+            delta_listed: [true; 2],
             max_def,
             max_rep: 0,
             chunk_values,
@@ -3173,7 +3213,7 @@ mod tests {
             bits: 32,
             limit: u64::MAX,
             chunk_bytes: None,
-            delta_declared: true,
+            delta_listed: [true; 2],
             max_def: 1,
             max_rep: 0,
             chunk_values: u64::MAX,
@@ -3220,7 +3260,7 @@ mod tests {
             bits: 32,
             limit: u64::MAX,
             chunk_bytes: None,
-            delta_declared: true,
+            delta_listed: [true; 2],
             max_def: 0,
             max_rep: 0,
             chunk_values: u64::MAX,
