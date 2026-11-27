@@ -5355,6 +5355,29 @@ fn parquet_sampled_delta_read_does_not_fetch_the_pages_it_skips() {
     }
 }
 
+/// Delta pages of many blocks, with nulls and lengths that need bits, pass the check of the stream
+/// layout that [`CheckedPages`] makes and read back as written (#2913).
+#[test]
+fn parquet_delta_pages_of_many_blocks_read_back() {
+    let p = dir().join("decoded-delta-blocks.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("label", FieldType::Text)]);
+    let text = |i: usize| (!i.is_multiple_of(11)).then(|| format!("{}{i}", "y".repeat(i % 53)));
+    for i in 0..3000usize {
+        ds.push(Some(Geometry::Point(Coord::new(-81.0, 0.0))), vec![text(i).map(Value::Text).unwrap_or(Value::Null)]);
+    }
+    let whole = Request { extent: None, limit: 5000, own: None };
+    for v2 in [false, true] {
+        for page_bytes in [None, Some(4 << 10)] {
+            write_encoded_parquet_fixture(&ds, &p, 3000, false, FixturePages { delta: true, v2, page_bytes });
+            let batch = parquet::ParquetSource::open_path(&p, "pts").unwrap().read(&whole).unwrap();
+            assert_eq!(batch.features.len(), 3000, "v2 {v2} {page_bytes:?}");
+            for (i, f) in batch.features.iter().enumerate() {
+                assert_eq!(f.attrs[0], text(i).map(Value::Text).unwrap_or(Value::Null), "v2 {v2} {page_bytes:?} row {i}");
+            }
+        }
+    }
+}
+
 /// Data pages of version 2 read as version 1 do, with and without a budget that stops them.
 #[test]
 fn parquet_version_two_pages_read_within_the_decoded_budget() {

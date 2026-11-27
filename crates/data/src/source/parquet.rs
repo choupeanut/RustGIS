@@ -1035,6 +1035,11 @@ fn err(e: parquet::errors::ParquetError) -> DataError {
     DataError::Format(format!("GeoParquet: {e}"))
 }
 
+/// [`err`] for an error met in `place` (a row group and column, or `""` when not known).
+fn err_in(place: &str, e: parquet::errors::ParquetError) -> DataError {
+    if place.is_empty() { err(e) } else { DataError::Format(format!("GeoParquet: {place}: {e}")) }
+}
+
 /// The reader of a row group's column, its pages checked by [`CheckedPages`] (a page no bigger
 /// than the column chunk says).
 fn column_reader(rg: &dyn RowGroupReader, col: usize) -> Result<ColumnReader> {
@@ -1061,6 +1066,8 @@ fn column_reader_within(rg: &dyn RowGroupReader, col: usize, limit: u64) -> Resu
         // A footer that gives no size, or a negative one, bounds a page by the limit alone.
         chunk_bytes: u64::try_from(chunk.uncompressed_size()).ok().filter(|&n| n > 0),
         delta_declared: chunk.encodings().any(|e| e == Encoding::DELTA_BYTE_ARRAY),
+        max_def: desc.max_def_level(),
+        max_rep: desc.max_rep_level(),
         note: note.clone(),
     };
     Ok((parquet::column::reader::get_column_reader(desc, Box::new(pages)), note))
@@ -1141,13 +1148,13 @@ impl Pace<'_> {
     /// Ends a skip call that [`skip`](Self::skip) asked for, which `result` is the outcome of: the
     /// values it skipped, whether it was stopped at a page it would only have skipped part of (the
     /// whole pages before that count).
-    fn skipped(&self, result: parquet::errors::Result<usize>) -> Result<(usize, bool)> {
-        let Some((note, _)) = self.watch else { return result.map(|n| (n, false)).map_err(err) };
+    fn skipped(&self, place: &str, result: parquet::errors::Result<usize>) -> Result<(usize, bool)> {
+        let Some((note, _)) = self.watch else { return result.map(|n| (n, false)).map_err(|e| err_in(place, e)) };
         note.skip_left.store(NOT_SKIPPING, Ordering::Relaxed);
         match result {
             Ok(n) => Ok((n, false)),
             Err(_) if note.stopped.load(Ordering::Relaxed) => Ok((note.passed.load(Ordering::Relaxed), true)),
-            Err(e) => Err(err(e)),
+            Err(e) => Err(err_in(place, e)),
         }
     }
 
@@ -1175,6 +1182,9 @@ struct CheckedPages {
     chunk_bytes: Option<u64>,
     /// The footer lists the DELTA_BYTE_ARRAY encoding for the chunk.
     delta_declared: bool,
+    /// The most levels the column's values have, for a version 1 page's level streams.
+    max_def: i16,
+    max_rep: i16,
     note: Arc<PageNote>,
 }
 
@@ -1186,6 +1196,135 @@ impl Iterator for CheckedPages {
         use parquet::column::page::PageReader;
         self.get_next_page().transpose()
     }
+}
+
+impl CheckedPages {
+    /// Refuses a DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY data page whose streams say they hold
+    /// more values than the page does or its bytes can, or can't be read: the crate's decoders make
+    /// an array of that count (4 bytes a value) before decoding a value, and a few bytes can ask for
+    /// gigabytes. See [`delta_stream`] for what is checked.
+    fn check_delta(&self, page: &parquet::column::page::Page) -> parquet::errors::Result<()> {
+        use parquet::column::page::Page;
+        let (buf, num_values, encoding, levels) = match page {
+            Page::DataPage { buf, num_values, encoding, def_level_encoding, rep_level_encoding, .. } => {
+                let mut at = 0usize;
+                for (max, level_encoding) in [(self.max_rep, rep_level_encoding), (self.max_def, def_level_encoding)] {
+                    if max > 0 {
+                        if *level_encoding != Encoding::RLE {
+                            return Err(delta_err("its levels are not RLE, so where its values start can't be told"));
+                        }
+                        let len = buf
+                            .get(at..at.saturating_add(4))
+                            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                            .map(u32::from_le_bytes)
+                            .and_then(|n| usize::try_from(n).ok())
+                            .ok_or_else(|| delta_err("its levels are cut off"))?;
+                        at = at.saturating_add(4).saturating_add(len);
+                    }
+                }
+                (buf, *num_values, *encoding, at)
+            }
+            Page::DataPageV2 { buf, num_values, encoding, def_levels_byte_len, rep_levels_byte_len, .. } => {
+                let at = (*def_levels_byte_len as usize).saturating_add(*rep_levels_byte_len as usize);
+                (buf, *num_values, *encoding, at)
+            }
+            Page::DictionaryPage { .. } => return Ok(()),
+        };
+        if !matches!(encoding, Encoding::DELTA_BYTE_ARRAY | Encoding::DELTA_LENGTH_BYTE_ARRAY) {
+            return Ok(());
+        }
+        let values = buf.get(levels..).ok_or_else(|| delta_err("its levels are longer than the page"))?;
+        let max = u64::from(num_values);
+        let (count, end) = delta_stream(values, max, self.limit)?;
+        if encoding == Encoding::DELTA_BYTE_ARRAY {
+            // The prefix lengths are followed by the suffixes, a DELTA_LENGTH_BYTE_ARRAY stream of as many.
+            let rest = values.get(end..).ok_or_else(|| delta_err("its prefix lengths run past the page"))?;
+            let (suffixes, _) = delta_stream(rest, max, self.limit)?;
+            if suffixes != count {
+                return Err(delta_err(&format!("it has {count} prefix lengths and {suffixes} suffixes")));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn delta_err(what: &str) -> parquet::errors::ParquetError {
+    parquet::errors::ParquetError::General(format!("a delta page is refused: {what}"))
+}
+
+/// One ULEB128 number at `at` of `data`, moving `at` past it (`None` when it is cut off or longer
+/// than the 10 bytes the crate reads: it stops with a panic at an 11th).
+fn uleb(data: &[u8], at: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for i in 0..10u32 {
+        let byte = *data.get(*at)?;
+        *at += 1;
+        value |= u64::from(byte & 0x7f).checked_shl(7 * i)?;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Reads the layout of the DELTA_BINARY_PACKED stream at the start of `data` as the crate's
+/// `DeltaBitPackDecoder` does, without decoding a value: its header (block size, miniblocks per
+/// block, the count of values, the first value), then each block's minimum delta and miniblock bit
+/// widths, to where the stream ends. It returns the count and the end offset. The stream is refused
+/// when the count is more than `max_values` (the page's value count) or more than `limit` bytes
+/// make as 4-byte lengths (what the decoder allocates), when the blocks it needs don't fit in
+/// `data`, or when anything is cut off or the sizes aren't the multiples the format needs. The
+/// crate's decoders trust all of that when they size their arrays, and panic on some of it.
+fn delta_stream(data: &[u8], max_values: u64, limit: u64) -> parquet::errors::Result<(u64, usize)> {
+    let mut at = 0usize;
+    let cut = || delta_err("a stream header is cut off or malformed");
+    let block = uleb(data, &mut at).ok_or_else(cut)?;
+    let mini_blocks = uleb(data, &mut at).ok_or_else(cut)?;
+    let count = uleb(data, &mut at).ok_or_else(cut)?;
+    uleb(data, &mut at).ok_or_else(cut)?;
+    if block == 0
+        || !block.is_multiple_of(128)
+        || mini_blocks == 0
+        || !block.is_multiple_of(mini_blocks)
+        || !(block / mini_blocks).is_multiple_of(32)
+    {
+        return Err(delta_err(&format!("its block of {block} values in {mini_blocks} miniblocks is not one the format allows")));
+    }
+    if count > max_values {
+        return Err(delta_err(&format!("a stream says it holds {count} values, more than the page's {max_values} values")));
+    }
+    if count.saturating_mul(4) > limit {
+        return Err(parquet::errors::ParquetError::General(format!(
+            "a delta page's stream says it holds {count} values, whose lengths are more than the {limit} byte decoded-column budget"
+        )));
+    }
+    let per_mini = block / mini_blocks;
+    let widths = usize::try_from(mini_blocks).map_err(|_| cut())?;
+    let mut left = count.saturating_sub(1);
+    while left > 0 {
+        uleb(data, &mut at)
+            .ok_or_else(|| delta_err(&format!("its {count} values need more blocks than its {} bytes can hold", data.len())))?;
+        let end = at.checked_add(widths).ok_or_else(cut)?;
+        let bits = data
+            .get(at..end)
+            .ok_or_else(|| delta_err(&format!("its {count} values need more blocks than its {} bytes can hold", data.len())))?;
+        at = end;
+        let mut packed = 0u64;
+        for &width in bits {
+            // Miniblocks past the last value have their widths taken as 0, as the crate does.
+            let width = if left == 0 { 0 } else { u64::from(width) };
+            if width > 32 {
+                return Err(delta_err(&format!("a miniblock has a bit width of {width}, more than 32")));
+            }
+            left = left.saturating_sub(per_mini);
+            packed = packed.saturating_add(width.saturating_mul(per_mini) / 8);
+        }
+        at = usize::try_from(packed).ok().and_then(|n| at.checked_add(n)).ok_or_else(cut)?;
+        if at > data.len() {
+            return Err(delta_err(&format!("its {count} values need more bytes than the page's {} bytes can hold", data.len())));
+        }
+    }
+    Ok((count, at))
 }
 
 impl parquet::column::page::PageReader for CheckedPages {
@@ -1223,6 +1362,7 @@ impl parquet::column::page::PageReader for CheckedPages {
                     "a page uses the DELTA_BYTE_ARRAY encoding, which its column chunk doesn't list".into(),
                 ));
             }
+            self.check_delta(page)?;
             if let parquet::column::page::Page::DataPage { num_values, .. } | parquet::column::page::Page::DataPageV2 { num_values, .. } =
                 page
             {
@@ -1482,7 +1622,7 @@ fn field_type(c: &ColumnDescPtr) -> Option<FieldType> {
 /// rows not taken are skipped without being decoded into values, so a sample of a large row
 /// group doesn't hold all of it.
 fn read_column<T: PqType>(r: &mut ColumnReaderImpl<T>, take: &[bool], max_def: i16) -> Result<Vec<Option<T::T>>> {
-    read_column_with(r, take, max_def, &Pace { watch: None }, &mut |_| Ok(()))
+    read_column_with(r, take, max_def, &Pace { watch: None }, "", &mut |_| Ok(()))
 }
 
 /// Forgets the longest skip this thread has made, for tests.
@@ -1518,13 +1658,14 @@ pub(crate) fn delta_pages() -> usize {
     DELTA_PAGES.with(std::cell::Cell::get)
 }
 
-/// [`read_column`] reading as `pace` says and asking `charge` about each value
+/// [`read_column`] reading as `pace` says (an error naming `place`) and asking `charge` about each value
 /// it keeps, before the caller copies any: a read that passes its budget stops there.
 fn read_column_with<T: PqType>(
     r: &mut ColumnReaderImpl<T>,
     take: &[bool],
     max_def: i16,
     pace: &Pace,
+    place: &str,
     charge: &mut dyn FnMut(&T::T) -> Result<()>,
 ) -> Result<Vec<Option<T::T>>> {
     let wanted = take.iter().filter(|&&t| t).count();
@@ -1545,7 +1686,7 @@ fn read_column_with<T: PqType>(
                 let asked = pace.skip(left);
                 #[cfg(test)]
                 LARGEST_SKIP.with(|largest| largest.set(largest.get().max(asked)));
-                let (skipped, stopped) = pace.skipped(r.skip_records(asked))?;
+                let (skipped, stopped) = pace.skipped(place, r.skip_records(asked))?;
                 pace.used(skipped);
                 left = left.saturating_sub(skipped);
                 if skipped < asked && !stopped {
@@ -1557,7 +1698,7 @@ fn read_column_with<T: PqType>(
         while left > 0 {
             defs.clear();
             values.clear();
-            let (records, _, levels) = r.read_records(pace.take(left), Some(&mut defs), None, &mut values).map_err(err)?;
+            let (records, _, levels) = r.read_records(pace.take(left), Some(&mut defs), None, &mut values).map_err(|e| err_in(place, e))?;
             if records == 0 {
                 return Ok(out);
             }
@@ -1792,8 +1933,11 @@ fn read_binary(
     let ColumnReader::ByteArrayColumnReader(mut r) = reader else { return Ok(None) };
     let delta = chunk.encodings().any(|e| e == Encoding::DELTA_BYTE_ARRAY);
     let pace = Pace { watch: delta.then_some((&*note, budget)) };
-    read_column_with(&mut r, take, chunk.column_descr().max_def_level(), &pace, &mut |b: &ByteArray| budget.charge(size(b.data()), &name))
-        .map(Some)
+    let place = format!("row group {}, column '{name}'", budget.group);
+    read_column_with(&mut r, take, chunk.column_descr().max_def_level(), &pace, &place, &mut |b: &ByteArray| {
+        budget.charge(size(b.data()), &name)
+    })
+    .map(Some)
 }
 
 /// Reads every one of `n` rows of a float or double column as doubles (the covering).
@@ -2453,6 +2597,8 @@ mod tests {
             limit,
             chunk_bytes,
             delta_declared,
+            max_def: 0,
+            max_rep: 0,
             note: Arc::new(PageNote::default()),
         }
         .get_next_page()
@@ -2487,10 +2633,14 @@ mod tests {
     /// whichever version of data page it is.
     #[test]
     fn checked_pages_refuse_an_undeclared_delta_page() {
-        for page in [data_page as fn(usize, Encoding) -> Page, data_page_v2] {
+        let mut sound = delta_stream(3, 0, 1);
+        sound.extend(delta_stream(3, 4, 1));
+        sound.extend_from_slice(b"ababab");
+        for (v2, page) in [(false, data_page as fn(usize, Encoding) -> Page), (true, data_page_v2)] {
             let error = checked(page(4, Encoding::DELTA_BYTE_ARRAY), Some(10), u64::MAX, false).unwrap_err().to_string();
             assert!(error.contains("the DELTA_BYTE_ARRAY encoding, which its column chunk doesn't list"), "{error}");
-            assert!(checked(page(4, Encoding::DELTA_BYTE_ARRAY), Some(10), u64::MAX, true).unwrap().is_some());
+            let declared = delta_page(0, sound.clone(), 3, Encoding::DELTA_BYTE_ARRAY, v2);
+            assert!(checked(declared, Some(100), u64::MAX, true).unwrap().is_some());
             assert!(checked(page(4, Encoding::PLAIN), Some(10), u64::MAX, false).unwrap().is_some());
         }
     }
@@ -2506,6 +2656,8 @@ mod tests {
                 limit: u64::MAX,
                 chunk_bytes: None,
                 delta_declared: false,
+                max_def: 0,
+                max_rep: 0,
                 note: note.clone(),
             };
             assert!(pages.get_next_page().unwrap().is_some());
@@ -2598,7 +2750,7 @@ mod tests {
                 assert!(error.contains("more than the page's 3 values"), "v2 {v2} {levels}: {error}");
                 // A count the page's own value count allows, but its few bytes can't hold.
                 let error = refused(delta_stream(1000, 0, 1), 1000, delta);
-                assert!(error.contains("bytes can't hold"), "v2 {v2} {levels}: {error}");
+                assert!(error.contains("need more"), "v2 {v2} {levels}: {error}");
                 // The decoder's array of that count, more than the budget allows.
                 let error = checked(page(delta_stream(1 << 20, 0, 1), 1 << 20, delta), None, 1 << 10, true).unwrap_err().to_string();
                 assert!(error.contains("decoded-column budget"), "v2 {v2} {levels}: {error}");
@@ -2662,6 +2814,8 @@ mod tests {
             limit: u64::MAX,
             chunk_bytes: None,
             delta_declared: true,
+            max_def: 0,
+            max_rep: 0,
             note: note.clone(),
         };
         let budget = Budget::new(1 << 20, 0);
@@ -2677,15 +2831,15 @@ mod tests {
         }
         // 2 values of the run are left, the next page holds 4: the skip stops there.
         assert!(pages.peek_next_page().is_err());
-        let (skipped, stopped) = pace.skipped(Err(parquet::errors::ParquetError::General("stop".into()))).unwrap();
+        let (skipped, stopped) = pace.skipped("", Err(parquet::errors::ParquetError::General("stop".into()))).unwrap();
         assert_eq!((skipped, stopped), (8, true));
         assert_eq!(note.skip_left.load(Ordering::Relaxed), NOT_SKIPPING);
         assert_eq!(pages.peek_next_page().unwrap().and_then(|m| m.num_rows), Some(4), "nothing was fetched");
         assert_eq!(pace.skip(2), 1, "the page is then taken a value at a time");
         // Another error is the caller's.
         assert_eq!(pace.skip(3), 3);
-        assert!(pace.skipped(Err(parquet::errors::ParquetError::General("other".into()))).is_err());
-        assert_eq!(pace.skipped(Ok(3)).unwrap(), (3, false));
+        assert!(pace.skipped("", Err(parquet::errors::ParquetError::General("other".into()))).is_err());
+        assert_eq!(pace.skipped("", Ok(3)).unwrap(), (3, false));
     }
 
     /// A DELTA_BYTE_ARRAY column takes one value at a page's start, then no more than its page
