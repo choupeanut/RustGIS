@@ -1180,7 +1180,7 @@ fn column_reader_within(rg: &dyn RowGroupReader, col: usize, limit: u64) -> Resu
         limit,
         // A footer that gives no size, or a negative one, bounds a page by the limit alone.
         chunk_bytes: u64::try_from(chunk.uncompressed_size()).ok().filter(|&n| n > 0),
-        delta_declared: chunk.encodings().any(|e| e == Encoding::DELTA_BYTE_ARRAY),
+        delta_declared: chunk.encodings().any(|e| matches!(e, Encoding::DELTA_BYTE_ARRAY | Encoding::DELTA_LENGTH_BYTE_ARRAY)),
         max_def: desc.max_def_level(),
         max_rep: desc.max_rep_level(),
         chunk_values: u64::try_from(chunk.num_values()).ok().filter(|&n| n > 0).unwrap_or(u64::MAX),
@@ -1289,7 +1289,7 @@ impl Pace<'_> {
 /// A column's pages, a dictionary page refused when it says it holds more values than its bytes
 /// can: the `parquet` crate makes room for the count it is told before decoding any (a few bytes
 /// of header can ask for tens of gigabytes). A page bigger than the column chunk it belongs to or
-/// than `limit`, and a data page in the DELTA_BYTE_ARRAY encoding that the chunk doesn't list, are
+/// than `limit`, and a data page in the DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY encoding that the chunk doesn't list, are
 /// refused too: the pace of [`read_binary`] rests on both. The size is checked once the crate has
 /// the page; a header asking for more than the file holds is still allocated by the crate first.
 struct CheckedPages {
@@ -1300,7 +1300,7 @@ struct CheckedPages {
     limit: u64,
     /// The bytes the column chunk's footer says its pages hold decoded, when it says.
     chunk_bytes: Option<u64>,
-    /// The footer lists the DELTA_BYTE_ARRAY encoding for the chunk.
+    /// The footer lists the DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY encoding for the chunk.
     delta_declared: bool,
     /// The most levels the column's values have, for a version 1 page's level streams.
     max_def: i16,
@@ -1508,12 +1508,13 @@ impl parquet::column::page::PageReader for CheckedPages {
                 )));
             }
             if !self.delta_declared
-                && let parquet::column::page::Page::DataPage { encoding: Encoding::DELTA_BYTE_ARRAY, .. }
-                | parquet::column::page::Page::DataPageV2 { encoding: Encoding::DELTA_BYTE_ARRAY, .. } = page
+                && let parquet::column::page::Page::DataPage { encoding, .. } | parquet::column::page::Page::DataPageV2 { encoding, .. } =
+                    page
+                && matches!(encoding, Encoding::DELTA_BYTE_ARRAY | Encoding::DELTA_LENGTH_BYTE_ARRAY)
             {
-                return Err(parquet::errors::ParquetError::General(
-                    "a page uses the DELTA_BYTE_ARRAY encoding, which its column chunk doesn't list".into(),
-                ));
+                return Err(parquet::errors::ParquetError::General(format!(
+                    "a page uses the {encoding} encoding, which its column chunk doesn't list"
+                )));
             }
             self.check_delta(page)?;
             if let parquet::column::page::Page::DataPage { num_values, .. } | parquet::column::page::Page::DataPageV2 { num_values, .. } =
@@ -2802,6 +2803,21 @@ mod tests {
             let declared = delta_page(0, sound.clone(), 3, Encoding::DELTA_BYTE_ARRAY, v2);
             assert!(checked(declared, Some(100), u64::MAX, true).unwrap().is_some());
             assert!(checked(page(4, Encoding::PLAIN), Some(10), u64::MAX, false).unwrap().is_some());
+        }
+    }
+
+    /// A DELTA_LENGTH_BYTE_ARRAY page, like a DELTA_BYTE_ARRAY one, must be in the chunk's list: the
+    /// pace is only on for a column that lists one, so an unlisted page would be checked against a
+    /// budget the values before it have not been charged to.
+    #[test]
+    fn checked_pages_refuse_an_undeclared_delta_length_page() {
+        let mut sound = delta_flat(3, 4);
+        sound.extend_from_slice(b"ababab");
+        for v2 in [false, true] {
+            let page = || delta_page(0, sound.clone(), 3, Encoding::DELTA_LENGTH_BYTE_ARRAY, v2);
+            let error = checked(page(), Some(100), u64::MAX, false).unwrap_err().to_string();
+            assert!(error.contains("the DELTA_LENGTH_BYTE_ARRAY encoding, which its column chunk doesn't list"), "v2 {v2}: {error}");
+            assert!(checked(page(), Some(100), u64::MAX, true).unwrap().is_some(), "v2 {v2}");
         }
     }
 
