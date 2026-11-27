@@ -23,11 +23,17 @@ impl Drop for TempDir {
 }
 
 fn cli(dir: &TempDir, args: &[&str]) -> Output {
-    // The settings folder is the test's own, so no installed plugin loads; `--no-plugins` would
-    // sit where `render` and `logo` read their first argument.
+    // The program's settings, plugins, data and cache folders are the test's own, so no installed
+    // plugin or setting of the person running the test is read, and `RUSTGIS_WORLDVIEW` doesn't
+    // choose a view to download. (`--no-plugins` would sit where `render` and `logo` read their
+    // first argument.)
     Command::new(env!("CARGO_BIN_EXE_rustgis-cli"))
         .current_dir(&dir.0)
         .env("RUSTGIS_CONFIG_DIR", dir.0.join("config"))
+        .env("RUSTGIS_PLUGINS_DIR", dir.0.join("plugins"))
+        .env("RUSTGIS_APP_DATA_DIR", dir.0.join("data"))
+        .env("RUSTGIS_CACHE_DIR", dir.0.join("cache"))
+        .env_remove("RUSTGIS_WORLDVIEW")
         .args(args)
         .output()
         .unwrap()
@@ -85,11 +91,11 @@ fn well_formed_flags_render_and_say_nothing() {
         r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
     )
     .unwrap();
-    let out = cli(&dir, &["render", "pt.geojson", "out.png", "--width", "64", "--height", "64", "--dpi", "96"]);
+    let out = cli(&dir, &["render", "pt.geojson", "out.png", "--worldview", "default", "--width", "64", "--height", "64", "--dpi", "96"]);
     let err = said(&out);
     assert!(out.status.success(), "{err}");
     assert!(dir.0.join("out.png").exists());
-    assert!(!err.contains("expected a value") && !err.contains("positive number") && !err.contains("using"), "{err}");
+    assert!(!err.contains("expected a value") && !err.contains("positive number") && !err.contains("a side takes"), "{err}");
 }
 
 #[test]
@@ -101,9 +107,10 @@ fn a_side_past_its_limit_is_said() {
     )
     .unwrap();
     // 100000 pixels wide is limited to 8000, and the program says so; 8 is raised to 16.
-    let out = cli(&dir, &["render", "pt.geojson", "out.png", "--width", "100000", "--height", "8", "--dpi", "48"]);
+    let out =
+        cli(&dir, &["render", "pt.geojson", "out.png", "--worldview", "default", "--width", "100000", "--height", "8", "--dpi", "48"]);
     let err = said(&out);
     assert!(out.status.success(), "{err}");
-    assert!(err.contains("--width 100000: using 8000, the most a side takes (16 to 8000)"), "{err}");
-    assert!(err.contains("--height 8: using 16, the least a side takes (16 to 8000)"), "{err}");
+    assert!(err.contains("rustgis-cli: --width 100000: using 8000 points, the most a side takes (16 to 8000)"), "{err}");
+    assert!(err.contains("rustgis-cli: --height 8: using 16 points, the least a side takes (16 to 8000)"), "{err}");
 }

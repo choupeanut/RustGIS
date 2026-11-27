@@ -265,15 +265,23 @@ fn check_values(cmd: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// A `render` size in pixels: `--width` or `--height`, else `default`, kept within 16 to 8000 and
-/// said when it was moved. [`check_values`] has seen that a given one is a positive number.
-fn side(args: &[String], name: &str, default: f64) -> f64 {
+/// A `render` size in points (pixels at 96 DPI): `--width` or `--height`, else `default`, kept
+/// within 16 to 8000. One moved is said, as a notice that is also printed. [`check_values`] has
+/// seen that a given one is a positive number.
+fn side(s: &mut Session, args: &[String], name: &str, default: f64) -> f64 {
     let (Some(given), Some(text)) = (num(args, name), opt(args, name)) else { return default };
     let kept = given.clamp(16.0, 8000.0);
-    if kept > given {
-        eprintln!("rustgis-cli: {name} {text}: using {kept}, the least a side takes (16 to 8000)");
+    let which = if kept > given {
+        "least"
     } else if kept < given {
-        eprintln!("rustgis-cli: {name} {text}: using {kept}, the most a side takes (16 to 8000)");
+        "most"
+    } else {
+        return kept;
+    };
+    let mark = s.notice_mark();
+    s.notify(format!("{name} {text}: using {kept} points, the {which} a side takes (16 to 8000)"), false);
+    for n in s.notices_since(mark) {
+        eprintln!("rustgis-cli: {}", n.text);
     }
     kept
 }
@@ -300,10 +308,8 @@ fn open_inputs(s: &mut Session, strict: Option<&Strict>, args: &[String]) -> Res
     if let Some(p) = opt(args, "--project") {
         load(s, strict, p)?;
     }
-    for (i, a) in args.iter().enumerate() {
-        if a == "--data"
-            && let Some(p) = args.get(i + 1)
-        {
+    for (a, p) in args.iter().zip(args.iter().skip(1)) {
+        if a == "--data" {
             load(s, strict, p)?;
         }
     }
@@ -924,10 +930,8 @@ fn cli() -> ExitCode {
             eprintln!("rustgis-cli: warning: {e}");
         }
     }
-    for (i, a) in args.iter().enumerate() {
-        if a == "--plugin"
-            && let Some(p) = args.get(i + 1)
-        {
+    for (a, p) in args.iter().zip(args.iter().skip(1)) {
+        if a == "--plugin" {
             let loaded =
                 rustgis_engine::plugins::Package::from_path(std::path::Path::new(p)).and_then(|pkg| rustgis_engine::plugins::load(pkg, p));
             if let Err(e) = loaded {
@@ -1101,8 +1105,8 @@ fn cli() -> ExitCode {
             if let Some(u) = opt(&args, "--tiles") {
                 run(&mut s, "map.addTiles", json!({"url": u}))?;
             }
-            let w = side(&args, "--width", 1600.0);
-            let h = side(&args, "--height", 900.0);
+            let w = side(&mut s, &args, "--width", 1600.0);
+            let h = side(&mut s, &args, "--height", 900.0);
             s.view_size = (w, h);
             if !is_project(input) {
                 run(&mut s, "map.zoomFull", Value::Null)?;
@@ -1137,10 +1141,8 @@ fn cli() -> ExitCode {
             s.stoppable = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
             let strict = strict.as_ref();
             open_inputs(&mut s, strict, &args)?;
-            for (i, a) in args.iter().enumerate() {
-                if a == "--cmd"
-                    && let Some(c) = args.get(i + 1)
-                {
+            for (a, c) in args.iter().zip(args.iter().skip(1)) {
+                if a == "--cmd" {
                     let (id, p) = match c.split_once('=') {
                         Some((id, json)) => (id, serde_json::from_str(json).map_err(|e| format!("{id}: bad JSON: {e}"))?),
                         None => (c.as_str(), Value::Null),

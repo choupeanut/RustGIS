@@ -22,7 +22,7 @@ tools and their parameters. See [Installation](installation.md) for the CLI pack
 
 `render <data|project> <out.png>` opens a data file or saved project and exports its map.
 It defaults to 1600 × 900 pixels at 96 DPI; `--width`, `--height` and `--dpi` change those.
-A `--width` or `--height` outside 16 to 8000 pixels is moved to the nearest limit, and it says so.
+A `--width` or `--height` outside 16 to 8000 points (pixels at 96 DPI; a higher `--dpi` draws more pixels) is moved to the nearest limit, and it says so.
 A data file is zoomed to its full extent; a project keeps its saved view.
 `--tiles` accepts an XYZ template, vector tiles or a MapLibre-style address.
 
