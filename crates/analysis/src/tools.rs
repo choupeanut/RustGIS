@@ -5182,6 +5182,10 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let why = left_out.why();
     let (crs, crs_note) = raster_crs_in(ds, inp.work_crs(), inp.project_crs(), p, "IDW Interpolation")?;
     let (pts, beyond_note) = points_from(inp.work_crs(), crs, pts)?;
+    // Too few points to go on: the error says what was left out of them.
+    if pts.len() < 2 {
+        return Err(with_note(with_note("interpolation needs at least two points with values".into(), &beyond_note), &why));
+    }
     let extent = match s(p, "extent").trim() {
         "" => {
             let mut e = Extent::EMPTY;
@@ -5212,8 +5216,8 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         None => 2.0,
     };
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
-    let r = crate::rasterops::idw(&pts, &extent, cell, power, 0, &name, crs)
-        .map_err(|e| with_note(with_note(with_note(e, &beyond_note), &crs_note), &why))?;
+    let r =
+        crate::rasterops::idw(&pts, &extent, cell, power, 0, &name, crs).map_err(|e| with_note(with_note(e, &beyond_note), &crs_note))?;
     let bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
     let msg = format!("IDW Interpolation: {} × {} cells from {} points", r.width, r.height, pts.len());
     Ok(ToolResult {
@@ -5354,7 +5358,7 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
 
     let name = out_name(p, format!("{}_{field}_kriging", ds.name));
     let r = crate::kriging::kriging(&pts, &extent, cell, &params, neighbours, &name, crs)
-        .map_err(|e| with_note(with_note(with_note(e, &beyond_note), &crs_note), &why))?;
+        .map_err(|e| with_note(with_note(e, &beyond_note), &crs_note))?;
     let pred_bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
     let var_bytes = rustgis_data::raster::geotiff::write(&r, 1).map_err(|e| e.to_string())?;
     let var_name = format!("{name}_variance");
@@ -5411,7 +5415,7 @@ impl PointsLeftOut {
         if self.no_place > 0 {
             losses.push(LossMessage {
                 code: LossCode::DroppedGeometry,
-                text: format!("{tool}: {} point(s) left out: {place}", self.no_place),
+                text: format!("{tool}: {} coordinate(s) left out: {place}", self.no_place),
             });
         }
         losses
@@ -5422,7 +5426,7 @@ impl PointsLeftOut {
         let parts: Vec<String> = [
             (self.no_geometry, "with no geometry"),
             (self.no_value, "whose value isn't a number"),
-            (self.no_place, "with a coordinate that isn't a number"),
+            (self.no_place, "coordinate(s) that aren't numbers"),
         ]
         .into_iter()
         .filter(|(n, _)| *n > 0)
@@ -12368,7 +12372,7 @@ mod tests {
             let want = vec![
                 (DroppedFeature, format!("{name}: 1 of 6 feature(s) left out: they have no geometry, or an empty one")),
                 (DroppedFeature, format!("{name}: 1 of 6 feature(s) left out: their v value is empty or not a finite number")),
-                (DroppedGeometry, format!("{name}: 1 point(s) left out: {place}")),
+                (DroppedGeometry, format!("{name}: 1 coordinate(s) left out: {place}")),
             ];
             assert_eq!(got, want, "{tool}");
         }
@@ -12405,20 +12409,24 @@ mod tests {
     }
 
     /// IDW looks at Cancel while it reads its points, as Kriging does, not only once its grid is
-    /// being made.
+    /// being made: the same run over more features looks once more for each 4096 of them.
     #[test]
     fn idw_interpolation_looks_at_cancel_while_it_reads_its_points() {
-        let mut pts = Dataset::new("many", GeometryType::Point, vec![Field::new("v", FieldType::Double)]);
-        for i in 0..(2 * LOOK_EVERY + 1) {
-            let (x, y) = ((i % 100) as f64 / 100.0, (i / 100 % 100) as f64 / 100.0);
-            pts.push(Some(Geometry::Point(Coord::new(x, y))), vec![Value::Float(i as f64)]);
-        }
-        let m = Map(HashMap::from([("many".to_string(), pts)]));
-        let control = crate::control::Control::cancelled_at_look(u64::MAX);
-        let p = serde_json::json!({"input": "many", "field": "v", "extent": "0,0,1,1", "pixelSize": 1});
-        crate::run_with("idwInterpolation", &m, &p, &control).unwrap_or_else(|e| panic!("{e}"));
-        // Three looks while reading (features 0, 4096, 8192), then the grid's one row.
-        assert!(control.looked() >= 4, "looked {} times", control.looked());
+        let looks = |features: usize| {
+            let mut pts = Dataset::new("many", GeometryType::Point, vec![Field::new("v", FieldType::Double)]);
+            for i in 0..features {
+                let (x, y) = ((i % 100) as f64 / 100.0, (i / 100 % 100) as f64 / 100.0);
+                pts.push(Some(Geometry::Point(Coord::new(x, y))), vec![Value::Float(i as f64)]);
+            }
+            let m = Map(HashMap::from([("many".to_string(), pts)]));
+            let control = crate::control::Control::cancelled_at_look(u64::MAX);
+            let p = serde_json::json!({"input": "many", "field": "v", "extent": "0,0,1,1", "pixelSize": 1});
+            crate::run_with("idwInterpolation", &m, &p, &control).unwrap_or_else(|e| panic!("{e}"));
+            control.looked()
+        };
+        // Features 0, 4096 and 8192 are looked at, against feature 0 alone.
+        let (few, many) = (looks(2), looks(2 * LOOK_EVERY + 1));
+        assert!(many >= few + 2, "{few} looks over 2 features, {many} over {}", 2 * LOOK_EVERY + 1);
     }
 
     #[test]

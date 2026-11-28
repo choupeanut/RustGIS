@@ -855,9 +855,10 @@ fn aggregated(
         return canvas.finish(r, g, bands, if mode { Method::Mode } else { Method::Average }, name);
     }
     let x_at = |i: usize| g.min_x + i as f64 * g.cell_x;
-    // A source that spans the globe wraps at ±180°: its width in pixels is one turn of longitude.
+    // A source that spans -180° to 180° wraps at ±180°: its width in pixels is one turn of longitude.
     let pixel = r.transform.pixel_width.abs();
-    let wrap = (r.crs.is_geographic() && (w as f64 * pixel - 360.0).abs() <= pixel).then_some(w as f64);
+    let (west, east) = (r.transform.origin_x, r.transform.origin_x + w as f64 * r.transform.pixel_width);
+    let wrap = (r.crs.is_geographic() && pixel > 0.0 && (west + 180.0).abs() <= pixel && (east - 180.0).abs() <= pixel).then_some(w as f64);
     let each = Aggregate { r, canvas: &canvas, nearest, mode, round, wrap };
     // A cell's work in `MIN_ROW_WORK`'s units (some 30 ns): its corners, and the pixels it takes
     // per band (the source's pixels, shared among the cells that cover them).
@@ -937,11 +938,20 @@ impl Aggregate<'_> {
             let (Some(Some(tl)), Some(Some(tr)), Some(Some(br)), Some(Some(bl))) = corners else { continue };
             let mut quad = [*tl, *tr, *br, *bl];
             let mut span = quad.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
-            // A cell across ±180° has corners at columns near both ends of the image: the pixels
-            // between are the far side of the globe. Its corners in the west go on past the east
-            // edge instead, and the pixels past it are the west's again (`i % w`).
+            // A cell across ±180° has its west corners at columns near the east end of the image
+            // and its east corners near the west end: going east along an edge, the column drops by
+            // more than half the image. The pixels between are the far side of the globe. Its
+            // corners in the west go on past the east edge instead, and the pixels past it are the
+            // west's again (`i % w`). A cell wide enough to take in the whole image, or one whose
+            // columns grow eastward as they do in an ordinary cell, is not across the seam. (An
+            // output that runs east to west, or a cell over half the globe wide in one, cannot be
+            // told from one across it and is read as before.)
             let mut wrapped = false;
-            if let Some(turn) = self.wrap.filter(|turn| span.1 - span.0 > turn / 2.0) {
+            let drop = |from: &(f64, f64), to: &(f64, f64)| from.0 - to.0;
+            if let Some(turn) = self.wrap.filter(|turn| {
+                let whole = span.0 <= 0.0 && span.1 >= *turn;
+                !whole && (drop(tl, tr) > turn / 2.0 || drop(bl, br) > turn / 2.0)
+            }) {
                 let shifted = quad.map(|p| if p.0 < turn / 2.0 { (p.0 + turn, p.1) } else { p });
                 let moved = shifted.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
                 if moved.1 - moved.0 < span.1 - span.0 {
@@ -1795,6 +1805,19 @@ mod tests {
         assert_eq!(one_cell(&part, 135.0, 225.0, false, &none), Some(100.0));
     }
 
+    /// A cell that is wide but not across the seam keeps the pixels between its corners: the whole
+    /// globe in one cell (corners at columns 0 and 8), or three fifths of it.
+    #[test]
+    fn a_wide_cell_that_is_not_across_the_antimeridian_keeps_its_pixels() {
+        let r = globe(360.0);
+        let plain = |x: f64, y: f64| Some((((x + 180.0) / 360.0) * 8.0, (90.0 - y) / 90.0));
+        // Every column: (1 + 6 × 100 + 3) / 8.
+        assert_eq!(one_cell(&r, -180.0, 180.0, false, &plain), Some(75.5));
+        // Columns 2.8 to 7.6: the centres of 3 to 7 are 100, 100, 100, 100 and 3.
+        let wide = one_cell(&r, -54.0, 162.0, false, &plain).unwrap();
+        assert!((wide - 80.6).abs() < 1e-4, "{wide}");
+    }
+
     /// The same through `project`: a global image into UTM zone 60, whose grid runs on past 180°.
     #[test]
     fn project_averages_and_takes_the_mode_across_the_antimeridian() {
@@ -1802,12 +1825,28 @@ mod tests {
         let gt = GeoTransform { origin_x: -180.0, origin_y: 90.0, pixel_width: 0.5, pixel_height: -0.5 };
         let v: Vec<f32> = (0..720 * 360).map(|i| if !(120..600).contains(&(i % 720)) { 10.0 } else { 1000.0 }).collect();
         let r = Raster::new("globe", 720, 360, vec![v], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
-        // Fiji: 177.5°E to about 186°E, at 10°N.
+        // Fiji, at 10°N: eastings of 700 to 900 km are 178.8°E to 180.7°E.
         let crs = Crs::from_epsg(32660).unwrap();
         let g = Grid::snapped(crs, [700_000.0, 1_050_000.0, 900_000.0, 1_150_000.0], (50_000.0, 50_000.0), (0.0, 0.0)).unwrap();
         for method in [Method::Average, Method::Mode] {
             let out = project(&r, &g, method, "fiji".into()).unwrap();
             assert!(values(&out).iter().all(|v| *v == Some(10.0)), "{method:?}: {:?}", values(&out));
         }
+    }
+    /// A cell that takes millions of pixels looks at Cancel as it goes: one cancelled at its second
+    /// look (the row's was the first) is left empty, not computed.
+    #[test]
+    fn a_cell_of_millions_of_pixels_looks_at_cancel() {
+        let n = 2100;
+        let gt = GeoTransform { origin_x: 0.0, origin_y: f64::from(n), pixel_width: 1.0, pixel_height: -1.0 };
+        let r =
+            Raster::new("big", n, n, vec![vec![100.0; (n * n) as usize]], gt, Crs::Epsg(32613), None, ColorHint::Gray, "Float32").unwrap();
+        let g = Grid { crs: r.crs, min_x: 0.0, max_y: f64::from(n), cell_x: f64::from(n), cell_y: f64::from(n), width: 1, height: 1 };
+        let source = |x: f64, y: f64| Some((x, f64::from(n) - y));
+        let run = crate::control::Control::cancelled_at_look(2);
+        let _installed = crate::control::install(Some(run.clone()));
+        let out = aggregated(Some(1), &r, &g, Canvas::of(&r, false), false, &source, "big".into()).unwrap();
+        assert_eq!(out.value(0, 0, 0), None);
+        assert_eq!(run.looked(), 2);
     }
 }

@@ -794,8 +794,9 @@ third of the extent's diagonal. `range`, `extent` and `pixelSize` are in the uni
 in degrees without it (see above). Points at the same location are averaged; multipoints
 contribute their points, while lines and polygons contribute their bounding-box centres. At least
 two distinct locations with numeric values are needed. Features with no geometry or no numeric
-value, and points that aren't finite numbers, are left out and said, as for IDW Interpolation. It adds **two separate Float32 GeoTIFF
-layers**: the prediction, named by `output`, and `<output>_variance`.
+value, and coordinates that aren't finite numbers, are left out and said, as for IDW
+Interpolation. It adds **two separate Float32 GeoTIFF layers**: the prediction, named by
+`output`, and `<output>_variance`.
 
 **Clip** (`clip`) keeps the parts of `input` inside the `clip` polygons. It gives one notice with
 the count of output polygon features whose total area is less than one millionth (`1e-6`) of
@@ -2161,8 +2162,11 @@ commands described here aren't on the tab or part of the extension, and run whet
     value (of those tied, the one that reaches the top count first, the pixels taken row by row, as
     in GDAL), which is what a coarser grid of elevation or land-cover classes should hold. A
     cell no pixel centre falls in, on a grid finer than the raster, takes the pixel under its
-    centre. A cell across the antimeridian of a source that spans the globe takes the pixels on both
-    sides of it. Classes take `nearest` or `mode`, continuous values `bilinear` or `cubic`, or `average`
+    centre. A cell across the antimeridian of a source that spans -180° to 180° takes the pixels on
+    both sides of it (in an output whose x grows eastward; a cell over half the globe wide in one
+    that runs east to west can't be told from one across it). A source that runs from 0° to 360°
+    is not wrapped, and `bilinear` and `cubic` still clamp at the seam instead of reading across
+    it. Classes take `nearest` or `mode`, continuous values `bilinear` or `cubic`, or `average`
     going coarser. A whole-number pixel type keeps its type, so its mean is rounded. On a colour
     image the colours count as much as their pixels are opaque, and `mode` is taken band by band
     (each channel's most frequent value among the pixels that show). Class names are kept with
