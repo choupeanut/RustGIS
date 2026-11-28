@@ -202,7 +202,8 @@ cargo build --release --target wasm32-unknown-unknown
   with ` › `: `1. Grid and isolines › Variograms` makes a **1. Grid and isolines** group with a
   **Variograms** group in it, up to eight levels counting **Plugins**. A tool with no toolbox sits
   in a group named after the plugin. Groups are listed alphabetically, in whatever order the tools
-  come in `plugin.json`; empty levels are skipped.
+  come in `plugin.json`; empty levels are skipped. Numbered groups sort as text, so write the
+  numbers with leading zeros (`01.`, `02.`, … `10.`) to keep their order.
 - `commands[].icon`: the name of one of RustGIS's own icons (`stats`, `zoom_full`, `bookmark`,
   `buffer`…), or a puzzle piece when it isn't one.
 - `commands[].form` (optional) gives the command a dialog of its own: its ribbon button (tab

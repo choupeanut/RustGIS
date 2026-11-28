@@ -3024,15 +3024,17 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
 /// every level filters its tools again. Tools below it are listed in their last group.
 const MAX_TOOLBOX_LEVELS: usize = 8;
 
-/// The parts of a tool's toolbox (`Plugins › 1. Grid › Variograms`), without empty ones, down to
-/// [`MAX_TOOLBOX_LEVELS`].
+/// The parts of a tool's toolbox (`Plugins › 1. Grid › Variograms`), trimmed and without empty
+/// ones, down to [`MAX_TOOLBOX_LEVELS`].
 fn toolbox_parts(toolbox: &str) -> impl Iterator<Item = &str> {
-    toolbox.split(" › ").filter(|s| !s.trim().is_empty()).take(MAX_TOOLBOX_LEVELS)
+    toolbox.split(" › ").map(str::trim).filter(|s| !s.is_empty()).take(MAX_TOOLBOX_LEVELS)
 }
 
 /// `tools` grouped by the `depth`-th part of their toolbox (`GeoLibre › Raster › General`), one
-/// header per group (open when `open`) and nested again below it; tools whose toolbox stops here
-/// are listed.
+/// header per group (open at first when `open`) and nested again below it; tools whose toolbox
+/// stops here are listed. `open` is in the headers' identity, so the groups drawn while browsing
+/// (closed) and while searching (open) keep their own state: a header only reads `default_open`
+/// the first time it is drawn.
 fn toolbox_levels(
     app: &mut RustGisApp,
     ui: &mut Ui,
@@ -3048,7 +3050,7 @@ fn toolbox_levels(
     for g in groups {
         let inside: Vec<_> = tools.iter().copied().filter(|x| part(x) == Some(g)).collect();
         let path: Vec<&str> = inside.first().map(|x| toolbox_parts(x.toolbox).take(depth + 1).collect()).unwrap_or_default();
-        egui::CollapsingHeader::new(crate::i18n::location(g)).id_salt(("toolbox", path)).default_open(open).show(ui, |ui| {
+        egui::CollapsingHeader::new(crate::i18n::location(g)).id_salt(("toolbox", path, open)).default_open(open).show(ui, |ui| {
             toolbox_levels(app, ui, &inside, depth + 1, open, link);
         });
     }
@@ -8020,6 +8022,7 @@ pub(crate) mod tests {
         }
         assert_eq!(parts("Plugins › 1. Grid › Variograms"), ["Plugins", "1. Grid", "Variograms"]);
         assert_eq!(parts("Plugins ›  › Grid ›  › Examples › "), ["Plugins", "Grid", "Examples"]);
+        assert_eq!(parts("Plugins › A › B"), parts("Plugins › A  ›  B "), "a part's own spaces are not part of its name");
         assert!(parts("").is_empty() && parts(" ›  › ").is_empty());
         let deep = vec!["a"; 300].join(" › ");
         assert!(deep.len() < 2_000);
