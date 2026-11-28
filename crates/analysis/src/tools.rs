@@ -5153,7 +5153,8 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let mut pts: Vec<(Coord, f64)> = Vec::new();
     let mut left_out = PointsLeftOut::default();
     let picked = rows(inp, p, "input", ds);
-    // A single geometry's coordinates are walked without a look at Cancel: one feature is short next to the features.
+    // Cancel is looked at between features; one feature with millions of vertices is read through
+    // `for_each_coord` without a look inside it.
     for (n, r) in picked.iter().copied().enumerate() {
         if n % LOOK_EVERY == 0 {
             crate::control::check()?;

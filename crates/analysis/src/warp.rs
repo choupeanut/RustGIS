@@ -1833,6 +1833,7 @@ mod tests {
             assert!(values(&out).iter().all(|v| *v == Some(10.0)), "{method:?}: {:?}", values(&out));
         }
     }
+
     /// A cell that takes millions of pixels looks at Cancel as it goes: one cancelled at its second
     /// look (the row's was the first) is left empty, not computed.
     #[test]
