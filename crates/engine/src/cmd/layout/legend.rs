@@ -120,7 +120,7 @@ pub(in crate::cmd::layout) fn tells_legend_fit(kind: &ElementKind, p: &Value) ->
     let ElementKind::Legend { columns, text_size, fit, .. } = kind else { return false };
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
     let watched = *columns > 1 || *text_size != rustgis_map::layout::LEGEND_TEXT_PT || fit.kept() != LegendFit::Manual;
-    let refitted = ["w", "h", "title", "allClasses", "hideOther", "exclude", "labels"].iter().any(|k| given(k));
+    let refitted = ["w", "h", "allClasses", "hideOther", "exclude", "labels"].iter().any(|k| given(k));
     ["columns", "showNoData", "labels", "fit", "showLayerNames", "title"].iter().any(|k| given(k))
         || p.get("textSize").is_some()
         || (watched && refitted)

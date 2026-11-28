@@ -3599,8 +3599,8 @@ fn the_cut_off_notice_suggests_wrapping_a_text_not_wrapped() {
         assert_eq!(note.contains("add line breaks"), !wrap, "{note}");
         assert!(note.contains("reduce its size"), "{note}");
     }
-    // An element gone since has no wrap to turn on: line breaks, as before. A legend's title is
-    // wrapped to its box (#3129): the size and the box, as for any wrapped text.
+    // An element gone since has no wrap to turn on: line breaks, as before. (A legend's title
+    // wraps to its box, and gets the wrapped text's advice: `a_legends_title_lines_past_its_box_are_left_out_and_said`.)
     let l = note_page(NOTE, true, TextAlign::Left, 0.0);
     let note = clipped_text_notice(&l, &[(999, "Gone".into())]).unwrap();
     assert!(note.ends_with("resize or move the text, reduce its size, or add line breaks"), "{note}");

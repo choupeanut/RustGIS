@@ -664,8 +664,6 @@ pub(super) const LEGEND_TITLE_PT: f32 = 12.0;
 pub(super) const LEGEND_NAME_PT: f32 = 9.0;
 pub(super) const LEGEND_LABEL_PT: f32 = 8.5;
 pub(super) const LEGEND_TITLE_ROWS: f32 = 1.3;
-/// The spacing of a legend's title's lines, times its size: the usual line pitch.
-const LEGEND_TITLE_LINE_SPACING: f32 = 1.25;
 pub(super) const LEGEND_INDENT: f32 = 6.0;
 pub(super) const LEGEND_LABEL_INDENT: f32 = 12.0;
 /// A legend swatch's width, in points.
@@ -1343,7 +1341,7 @@ pub fn legend_title_mm(text_size: f64) -> f64 {
 /// The distance between two lines of a legend's title, in pixels at `ppp`, for a legend `size`
 /// times the default ([`line_pitch_mm`]'s, at the title's size).
 fn title_pitch(size: f32, ppp: f32) -> f32 {
-    LEGEND_TITLE_PT * size * 1.33 * LEGEND_TITLE_LINE_SPACING * ppp
+    (line_pitch_mm(f64::from(LEGEND_TITLE_PT * size)) * PT_PER_MM) as f32 * ppp
 }
 
 /// The room in pixels a title of `lines` lines takes above a legend's rows: [`LEGEND_TITLE_ROWS`]
