@@ -764,7 +764,10 @@ gp.run={"tool":"pointsAlongLines","params":{"input":"Rivers","distance":500,"uni
 cell by 1/distanceᴾ, where P is the distance coefficient (2 by default). Lines and polygons
 contribute their vertices. Leave the extent empty to use the input's, or give it as
 `xmin,ymin,xmax,ymax`. `pixelSize` sets the cell size; when omitted it starts at 300 cells
-across the extent and coarsens for large inputs. The result is a Float32 GeoTIFF layer. The
+across the extent and coarsens for large inputs. The result is a Float32 GeoTIFF layer. Features
+with no geometry, or whose field isn't a finite number, and coordinates that aren't finite numbers,
+are left out and said, once for each kind with its count (`dropped.feature`, `dropped.geometry`);
+when fewer than two points are left, the error says how many were left out. The
 **Geostatistical Wizard** is a separate IDW workflow, with its coordinate system from Environments
 (below): it uses 12 nearest neighbours by default (`neighbors`), rather than every point.
 
@@ -790,7 +793,8 @@ override the defaults: zero nugget, the sample variance (1 for near-constant val
 third of the extent's diagonal. `range`, `extent` and `pixelSize` are in the units of `crs`, or
 in degrees without it (see above). Points at the same location are averaged; multipoints
 contribute their points, while lines and polygons contribute their bounding-box centres. At least
-two distinct locations with numeric values are needed. It adds **two separate Float32 GeoTIFF
+two distinct locations with numeric values are needed. Features with no geometry or no numeric
+value, and points that aren't finite numbers, are left out and said, as for IDW Interpolation. It adds **two separate Float32 GeoTIFF
 layers**: the prediction, named by `output`, and `<output>_variance`.
 
 **Clip** (`clip`) keeps the parts of `input` inside the `clip` polygons. It gives one notice with
