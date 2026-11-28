@@ -786,16 +786,7 @@ impl FeatureSource for ParquetSource {
                     });
                 }
                 // The rows of this group the sample still holds, in order (it may have dropped some).
-                let mut chosen = vec![false; take.len()];
-                let mut mine = Vec::new();
-                for (i, f) in sample.items.iter().enumerate() {
-                    if let Some(r) = f.id.checked_sub(base.saturating_add(1)).and_then(|r| usize::try_from(r).ok())
-                        && let Some(c) = chosen.get_mut(r)
-                    {
-                        *c = true;
-                        mine.push(i);
-                    }
-                }
+                let (chosen, mine) = rows_held(&sample.items, |f| f.id, base, take.len());
                 if mine.is_empty() {
                     continue;
                 }
@@ -2693,6 +2684,23 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
     Ok((w.into_inner().map_err(err)?, unfit_counts, layout.notes(fields, "")))
 }
 
+/// The rows of a group (ids from `base + 1`, `rows` of them) that the sample still holds, and
+/// where in the sample each one sits. The sample is in id order (groups are read in order and
+/// the sampler keeps order), so the search starts at the group's first possible id and stops at its last.
+fn rows_held<T>(items: &[T], id: impl Fn(&T) -> u64, base: u64, rows: usize) -> (Vec<bool>, Vec<usize>) {
+    let mut chosen = vec![false; rows];
+    let mut mine = Vec::new();
+    let first = base.saturating_add(1);
+    let from = items.partition_point(|f| id(f) < first);
+    for (i, f) in items.iter().enumerate().skip(from) {
+        let Some(r) = id(f).checked_sub(first).and_then(|r| usize::try_from(r).ok()) else { continue };
+        let Some(c) = chosen.get_mut(r) else { break };
+        *c = true;
+        mine.push(i);
+    }
+    (chosen, mine)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2834,6 +2842,34 @@ mod tests {
             note: Arc::new(PageNote::default()),
         }
         .get_next_page()
+    }
+
+    /// A late-filtered read looks only at the sample's rows from the current group on, not at every
+    /// row kept from earlier groups: the work stays linear in the groups.
+    #[test]
+    fn rows_held_inspects_only_the_current_groups_suffix() {
+        use std::cell::Cell;
+        let groups = 2_000u64;
+        let per = 4u64;
+        let mut items: Vec<u64> = Vec::new();
+        let looked = Cell::new(0u64);
+        for g in 0..groups {
+            let base = g * per;
+            items.extend((1..=per).map(|r| base + r));
+            let (chosen, mine) = rows_held(
+                &items,
+                |&id| {
+                    looked.set(looked.get() + 1);
+                    id
+                },
+                base,
+                per as usize,
+            );
+            assert_eq!(chosen, vec![true; per as usize]);
+            assert_eq!(mine, (items.len() - per as usize..items.len()).collect::<Vec<_>>());
+        }
+        // Binary search plus the suffix: far below the quadratic groups * rows / 2 of a full scan.
+        assert!(looked.get() < groups * (per + 16), "inspected {} entries", looked.get());
     }
 
     /// The page's own encoding must be in the chunk's list: a chunk that lists one delta encoding
