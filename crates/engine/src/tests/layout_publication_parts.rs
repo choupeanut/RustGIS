@@ -468,6 +468,23 @@ fn a_publication_legend_title_wrapped_in_its_box_says_the_rows_it_loses() {
     assert!(!r["warnings"].to_string().contains("legend lists more"), "{}", r["warnings"]);
 }
 
+/// A title line the box has no height to draw is left out (#3129), so it takes no room from the
+/// rows: with one row and a two-line title in a box that holds the first line and the row, every
+/// row is drawn and the sheet doesn't say rows are lost.
+#[test]
+fn a_publication_legend_title_line_left_out_does_not_say_a_drawn_row_is_lost() {
+    // One layer drawn in one plain colour: a single row.
+    let mut w = world();
+    w.map_mut().layers.retain(|l| l.name == "Rivers");
+    let (s, r) = {
+        let r = publish(&mut w, json!({"legend": {"title": "A legend title ".repeat(2), "columns": 1}, "style": "panel"})).unwrap();
+        (w, r)
+    };
+    let said = r["warnings"].to_string();
+    assert!(find(&s, "Legend").is_some(), "{said}");
+    assert!(!said.contains("the legend lists more than fits its box"), "{said}");
+}
+
 #[test]
 fn a_publication_legend_title_wider_than_its_box_is_named() {
     let long = "A very long legend title ".repeat(8);
