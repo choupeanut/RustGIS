@@ -855,7 +855,10 @@ fn aggregated(
         return canvas.finish(r, g, bands, if mode { Method::Mode } else { Method::Average }, name);
     }
     let x_at = |i: usize| g.min_x + i as f64 * g.cell_x;
-    let each = Aggregate { r, canvas: &canvas, nearest, mode, round };
+    // A source that spans the globe wraps at ±180°: its width in pixels is one turn of longitude.
+    let pixel = r.transform.pixel_width.abs();
+    let wrap = (r.crs.is_geographic() && (w as f64 * pixel - 360.0).abs() <= pixel).then_some(w as f64);
+    let each = Aggregate { r, canvas: &canvas, nearest, mode, round, wrap };
     // A cell's work in `MIN_ROW_WORK`'s units (some 30 ns): its corners, and the pixels it takes
     // per band (the source's pixels, shared among the cells that cover them).
     let work = ow.saturating_mul(oh).saturating_add(w.saturating_mul(h)).saturating_mul(canvas.nb.saturating_add(1));
@@ -874,6 +877,7 @@ fn aggregated(
             weights: vec![Vec::new(); canvas.nb],
             sums: vec![(0.0, 0.0); canvas.nb],
             cell: vec![f32::NAN; canvas.nb],
+            pace: crate::control::Pace::default(),
         },
         |s, oy, mut line| {
             let Corners { last, top, bottom, nodes, .. } = &mut *s;
@@ -904,6 +908,8 @@ struct Corners {
     weights: Vec<Vec<f32>>,
     sums: Vec<(f64, f64)>,
     cell: Vec<f32>,
+    /// Looks at Cancel within a row of cells that take many pixels.
+    pace: crate::control::Pace,
 }
 
 /// What each row of [`aggregated`] takes from the source.
@@ -914,6 +920,8 @@ struct Aggregate<'a> {
     nearest: Sampler<'a>,
     mode: bool,
     round: bool,
+    /// The width in pixels of a source that spans the globe, where a cell across ±180° wraps.
+    wrap: Option<f64>,
 }
 
 impl Aggregate<'_> {
@@ -922,21 +930,37 @@ impl Aggregate<'_> {
         let (r, canvas, nearest, mode, round) = (self.r, self.canvas, &self.nearest, self.mode, self.round);
         let (w, h) = (r.width as usize, r.height as usize);
         let alpha = canvas.alpha_src;
-        let Corners { top, bottom, values, weights, sums, cell, .. } = s;
+        let Corners { top, bottom, values, weights, sums, cell, pace, .. } = s;
         let ow = top.len().saturating_sub(1);
         for ox in 0..ow {
             let corners = (top.get(ox), top.get(ox + 1), bottom.get(ox + 1), bottom.get(ox));
             let (Some(Some(tl)), Some(Some(tr)), Some(Some(br)), Some(Some(bl))) = corners else { continue };
-            let quad = [*tl, *tr, *br, *bl];
-            let (c0, c1) = quad.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+            let mut quad = [*tl, *tr, *br, *bl];
+            let mut span = quad.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+            // A cell across ±180° has corners at columns near both ends of the image: the pixels
+            // between are the far side of the globe. Its corners in the west go on past the east
+            // edge instead, and the pixels past it are the west's again (`i % w`).
+            let mut wrapped = false;
+            if let Some(turn) = self.wrap.filter(|turn| span.1 - span.0 > turn / 2.0) {
+                let shifted = quad.map(|p| if p.0 < turn / 2.0 { (p.0 + turn, p.1) } else { p });
+                let moved = shifted.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+                if moved.1 - moved.0 < span.1 - span.0 {
+                    (quad, span, wrapped) = (shifted, moved, true);
+                }
+            }
+            let (c0, c1) = span;
             let (r0, r1) = quad.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
-            if c1 <= 0.0 || r1 <= 0.0 || c0 >= w as f64 || r0 >= h as f64 {
+            if c1 <= 0.0 || r1 <= 0.0 || c0 >= if wrapped { 2.0 } else { 1.0 } * w as f64 || r0 >= h as f64 {
                 continue;
             }
             // The pixels whose centres (at half integers) may be inside.
             let first = |lo: f64| (lo - 0.5).ceil().max(0.0) as usize;
             let past = |hi: f64, n: usize| ((hi - 0.5).floor() + 1.0).clamp(0.0, n as f64) as usize;
-            let (i0, i1, j0, j1) = (first(c0), past(c1, w), first(r0), past(r1, h));
+            let (i0, i1, j0, j1) = (first(c0), past(c1, if wrapped { 2 * w } else { w }), first(r0), past(r1, h));
+            // The pixels of a wide cell take long on their own: Cancel is looked at between cells.
+            if pace.stop(i1.saturating_sub(i0).saturating_mul(j1.saturating_sub(j0))) {
+                return;
+            }
             values.iter_mut().for_each(Vec::clear);
             weights.iter_mut().for_each(Vec::clear);
             // The mean is summed as the pixels come (no copy of the cell's values); mode keeps them.
@@ -948,7 +972,7 @@ impl Aggregate<'_> {
                         continue;
                     }
                     inside = true;
-                    let idx = j * w + i;
+                    let idx = j * w + i % w;
                     // An alpha with no value (the raster's no-data) or below 0 weighs nothing.
                     let opacity = alpha
                         .and_then(|a| r.bands.get(a))
@@ -991,6 +1015,7 @@ impl Aggregate<'_> {
             } else {
                 // A grid finer than the raster: the pixel under the cell's centre.
                 let (cx, cy) = (quad.iter().map(|p| p.0).sum::<f64>() / 4.0, quad.iter().map(|p| p.1).sum::<f64>() / 4.0);
+                let cx = if wrapped && cx >= w as f64 { cx - w as f64 } else { cx };
                 if !(cx >= 0.0 && cy >= 0.0 && cx < w as f64 && cy < h as f64) {
                     continue;
                 }
@@ -1725,5 +1750,64 @@ mod tests {
         run.cancel();
         let _installed = crate::control::install(Some(run));
         assert_eq!(rasterize(&g, &shapes, -1.0).unwrap_err(), crate::control::CANCELLED);
+    }
+
+    /// A global source of 8 × 2 pixels (45° across): column 7 holds 3, column 0 holds 1, the rest 100.
+    fn globe(width_deg: f64) -> Raster {
+        let gt = GeoTransform { origin_x: -180.0, origin_y: 90.0, pixel_width: width_deg / 8.0, pixel_height: -90.0 };
+        let column = |c: usize| match c {
+            0 => 1.0,
+            7 => 3.0,
+            _ => 100.0,
+        };
+        let v: Vec<f32> = (0..16).map(|i| column(i % 8)).collect();
+        Raster::new("globe", 8, 2, vec![v], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap()
+    }
+
+    /// One output cell from `x0` to `x1` whose corners the `source` places on the 8 × 2 image.
+    fn one_cell(r: &Raster, x0: f64, x1: f64, mode: bool, source: &Source) -> Option<f32> {
+        let g = Grid { crs: Crs::LonLat, min_x: x0, max_y: 90.0, cell_x: x1 - x0, cell_y: 180.0, width: 1, height: 1 };
+        let out = aggregated(Some(1), r, &g, Canvas::of(r, false), mode, source, "seam".into()).unwrap();
+        out.value(0, 0, 0)
+    }
+
+    /// An output cell across ±180° of a source that spans the globe takes the pixels either side of
+    /// the seam, not the far side of the globe its corners' columns (7 and 1) span.
+    #[test]
+    fn average_and_mode_across_the_antimeridian_take_the_pixels_on_both_sides() {
+        let r = globe(360.0);
+        // Output longitudes (0..360 east of Greenwich) folded into the source's -180..180, as an
+        // output system centred on 180° gives them back.
+        let folded = |x: f64, y: f64| Some((((x + 180.0).rem_euclid(360.0)) / 360.0 * 8.0, (90.0 - y) / 90.0));
+        // 135°..225°: the centres of column 7 (3) and column 0 (1).
+        assert_eq!(one_cell(&r, 135.0, 225.0, false, &folded), Some(2.0));
+        // Of the two tied values, the one that reaches the top count first, the pixels taken in order.
+        assert_eq!(one_cell(&r, 135.0, 225.0, true, &folded), Some(3.0));
+        // A corner placed at column 8 (exactly 180°) rather than column 0 wraps the same way.
+        let at_eight = |x: f64, y: f64| if x == 180.0 { Some((8.0, (90.0 - y) / 90.0)) } else { folded(x, y) };
+        assert_eq!(one_cell(&r, 180.0, 270.0, false, &at_eight), Some(50.5));
+        assert_eq!(one_cell(&r, 180.0, 270.0, false, &folded), Some(50.5));
+        // No seam: columns 6 and 7 (180° is column 8, both corners in the image).
+        assert_eq!(one_cell(&r, 90.0, 180.0, false, &at_eight), Some(51.5));
+        // A source that doesn't span the globe has no seam to wrap: the quad keeps its columns.
+        let part = globe(180.0);
+        let none = |x: f64, y: f64| Some((if x < 180.0 { 7.0 } else { 1.0 }, (90.0 - y) / 90.0));
+        assert_eq!(one_cell(&part, 135.0, 225.0, false, &none), Some(100.0));
+    }
+
+    /// The same through `project`: a global image into UTM zone 60, whose grid runs on past 180°.
+    #[test]
+    fn project_averages_and_takes_the_mode_across_the_antimeridian() {
+        // 720 × 360 pixels of 0.5°: 10 in the 60° either side of ±180°, 1000 elsewhere.
+        let gt = GeoTransform { origin_x: -180.0, origin_y: 90.0, pixel_width: 0.5, pixel_height: -0.5 };
+        let v: Vec<f32> = (0..720 * 360).map(|i| if !(120..600).contains(&(i % 720)) { 10.0 } else { 1000.0 }).collect();
+        let r = Raster::new("globe", 720, 360, vec![v], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        // Fiji: 177.5°E to about 186°E, at 10°N.
+        let crs = Crs::from_epsg(32660).unwrap();
+        let g = Grid::snapped(crs, [700_000.0, 1_050_000.0, 900_000.0, 1_150_000.0], (50_000.0, 50_000.0), (0.0, 0.0)).unwrap();
+        for method in [Method::Average, Method::Mode] {
+            let out = project(&r, &g, method, "fiji".into()).unwrap();
+            assert!(values(&out).iter().all(|v| *v == Some(10.0)), "{method:?}: {:?}", values(&out));
+        }
     }
 }

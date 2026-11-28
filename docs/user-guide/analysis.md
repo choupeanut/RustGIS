@@ -2161,7 +2161,8 @@ commands described here aren't on the tab or part of the extension, and run whet
     value (of those tied, the one that reaches the top count first, the pixels taken row by row, as
     in GDAL), which is what a coarser grid of elevation or land-cover classes should hold. A
     cell no pixel centre falls in, on a grid finer than the raster, takes the pixel under its
-    centre. Classes take `nearest` or `mode`, continuous values `bilinear` or `cubic`, or `average`
+    centre. A cell across the antimeridian of a source that spans the globe takes the pixels on both
+    sides of it. Classes take `nearest` or `mode`, continuous values `bilinear` or `cubic`, or `average`
     going coarser. A whole-number pixel type keeps its type, so its mean is rounded. On a colour
     image the colours count as much as their pixels are opaque, and `mode` is taken band by band
     (each channel's most frequent value among the pixels that show). Class names are kept with
